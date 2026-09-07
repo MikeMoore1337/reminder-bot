@@ -4,14 +4,20 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
-from app.db.models import Reminder
+from app.callbacks import CallbackOrigin
+from app.db.models import OccurrenceState, Reminder, User
 from app.keyboards.reply import get_main_keyboard, get_timezone_keyboard
-from app.services.reminder_service import format_reminder_for_user, list_pending_reminders
+from app.services.reminder_service import (
+    format_reminder_for_user,
+    get_latest_occurrence,
+    list_active_reminders,
+)
 from app.services.timezone_service import (
     get_or_create_user,
     get_user_timezone,
     set_user_timezone,
 )
+from app.workers.reminder_worker import reminder_actions_kb
 
 router = Router()
 
@@ -43,7 +49,7 @@ HELP_TEXT = (
     "- напомни каждый месяц в 1 оплатить сервер\n\n"
     "📋 <b>Команды</b>\n"
     "/list - список активных напоминаний\n"
-    "/cancel ID - удалить напоминание\n"
+    "/cancel ID - удалить напоминание; /cancel - отменить действие\n"
     "/timezone Europe/Moscow - установить часовой пояс\n"
     "/mytimezone - показать текущий часовой пояс\n\n"
     "💡 <b>Подсказка</b>\n"
@@ -81,6 +87,58 @@ def _render_reminders(reminders: list[Reminder], timezone_name: str) -> str:
     if len(reminders) > 20:
         rendered += f"\n\nПоказаны первые 20 из {len(reminders)}"
     return rendered
+
+
+async def _send_actionable_reminders(
+    message: Message,
+    user: User,
+    reminders: list[Reminder],
+    timezone_name: str,
+) -> None:
+    for reminder in reminders[:20]:
+        occurrence = None
+        latest_occurrence = await get_latest_occurrence(user, reminder.id)
+        if (
+            latest_occurrence is not None
+            and latest_occurrence.status == OccurrenceState.DELIVERED.value
+            and latest_occurrence.message_id is not None
+            and latest_occurrence.message_id == reminder.last_message_id
+            and reminder.last_delivery_occurrence_utc is not None
+            and (
+                reminder.state == "delivered"
+                or (
+                    reminder.recurrence_type != "none"
+                    and reminder.state in {"scheduled", "snoozed"}
+                )
+            )
+        ):
+            occurrence = latest_occurrence
+        display_state = (
+            OccurrenceState.DELIVERED.value if occurrence is not None else reminder.state
+        )
+        await message.answer(
+            format_reminder_for_user(
+                reminder,
+                timezone_name,
+                display_state=display_state,
+                display_at_utc=occurrence.delivery_at_utc if occurrence is not None else None,
+            ),
+            reply_markup=reminder_actions_kb(
+                reminder.id,
+                occurrence_id=occurrence.id if occurrence is not None else None,
+                revision=(
+                    occurrence.action_revision
+                    if occurrence is not None
+                    else reminder.action_revision
+                ),
+                state=display_state,
+                recurrence_type=reminder.recurrence_type,
+                origin=CallbackOrigin.LIST,
+            ),
+            parse_mode="HTML",
+        )
+    if len(reminders) > 20:
+        await message.answer(f"Показаны первые 20 из {len(reminders)}")
 
 
 @router.message(Command("start"))
@@ -154,7 +212,7 @@ async def cmd_timezone(message: Message, command: CommandObject) -> None:
 async def cmd_list(message: Message) -> None:
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
-    reminders = await list_pending_reminders(user)
+    reminders = await list_active_reminders(user)
 
     if not reminders:
         await message.answer(
@@ -165,12 +223,11 @@ async def cmd_list(message: Message) -> None:
         return
 
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
-    rendered = _render_reminders(reminders, timezone_name)
-
+    await message.answer("📋 <b>Твои активные напоминания:</b>", parse_mode="HTML")
+    await _send_actionable_reminders(message, user, reminders, timezone_name)
     await message.answer(
-        f"📋 <b>Твои активные напоминания:</b>\n\n{rendered}",
+        "Выбери действие кнопкой выше или обнови список командой /list.",
         reply_markup=get_main_keyboard(),
-        parse_mode="HTML",
     )
 
 
@@ -187,7 +244,7 @@ async def btn_create_reminder(message: Message) -> None:
 async def btn_list(message: Message) -> None:
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
-    reminders = await list_pending_reminders(user)
+    reminders = await list_active_reminders(user)
 
     if not reminders:
         await message.answer(
@@ -197,12 +254,11 @@ async def btn_list(message: Message) -> None:
         return
 
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
-    rendered = _render_reminders(reminders, timezone_name)
-
+    await message.answer("📋 <b>Твои активные напоминания:</b>", parse_mode="HTML")
+    await _send_actionable_reminders(message, user, reminders, timezone_name)
     await message.answer(
-        f"📋 <b>Твои активные напоминания:</b>\n\n{rendered}",
+        "Выбери действие кнопкой выше или обнови список командой /list.",
         reply_markup=get_main_keyboard(),
-        parse_mode="HTML",
     )
 
 

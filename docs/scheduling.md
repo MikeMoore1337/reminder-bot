@@ -14,9 +14,11 @@
   so a January 31 schedule returns to March 31 after a clamped February occurrence.
 
 The worker queries the effective delivery time, sends the current occurrence, then
-advances the canonical occurrence and resets the delivery override. This keeps a
-snooze local to one occurrence and makes the next occurrence reconstructable after
-restart from PostgreSQL alone.
+advances the canonical occurrence and resets the delivery override. Each delivery
+also has a persisted `ReminderOccurrence` identity. A snooze of an already delivered
+recurring occurrence uses a linked one-off child delivery; it never rewrites the
+canonical series. This keeps a snooze local to one occurrence and makes the next
+occurrence reconstructable after restart from PostgreSQL alone.
 
 ## Input semantics
 

@@ -24,7 +24,7 @@ class LoggingMiddleware(BaseMiddleware):
                     "extra_data": (
                         f"user_id={event.from_user.id if event.from_user else 'unknown'} "
                         f"chat_id={event.chat.id if event.chat else 'unknown'} "
-                        f"text={event.text!r}"
+                        f"text_length={len(event.text or '')}"
                     )
                 },
             )
@@ -36,7 +36,7 @@ class LoggingMiddleware(BaseMiddleware):
                     "extra_data": (
                         f"user_id={event.from_user.id if event.from_user else 'unknown'} "
                         f"chat_id={event.message.chat.id if event.message else 'unknown'} "
-                        f"data={event.data!r}"
+                        f"data_length={len(event.data or '')}"
                     )
                 },
             )
