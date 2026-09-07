@@ -8,7 +8,13 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from app.callbacks import CallbackAction, CallbackTarget, ReminderCallback, parse_callback
+from app.callbacks import (
+    CallbackAction,
+    CallbackOrigin,
+    CallbackTarget,
+    ReminderCallback,
+    parse_callback,
+)
 from app.db.models import User
 from app.services import reminder_service
 from app.services.reminder_parser import parse_reminder_input
@@ -222,6 +228,23 @@ async def _resolve_callback_target(
     return reminder_id, parsed.target_id, occurrence_at_utc, message_id
 
 
+def _expected_delivery_message_id(
+    parsed: ReminderCallback,
+    occurrence_id: int | None,
+    callback_message_id: int,
+) -> int | None:
+    """Use Telegram message identity only for controls on delivery messages.
+
+    ``/list`` renders a new control message for an existing occurrence. Its
+    message id is not part of the persisted delivery identity and must not be
+    compared with the original delivery message.
+    """
+
+    if occurrence_id is None or parsed.origin != CallbackOrigin.DELIVERY:
+        return None
+    return callback_message_id
+
+
 @router.callback_query(F.data)
 async def reminder_callback(callback: CallbackQuery) -> None:
     parsed = parse_callback(callback.data)
@@ -245,7 +268,11 @@ async def reminder_callback(callback: CallbackQuery) -> None:
         await callback.answer(STALE_FEEDBACK, show_alert=False)
         return
     reminder_id, occurrence_id, occurrence_at_utc, _stored_message_id = target
-    expected_message_id = callback_message.message_id if occurrence_id is not None else None
+    expected_message_id = _expected_delivery_message_id(
+        parsed,
+        occurrence_id,
+        callback_message.message_id,
+    )
 
     if parsed.action == CallbackAction.SNOOZE:
         if not await reminder_service.validate_action_target(
@@ -265,6 +292,7 @@ async def reminder_callback(callback: CallbackQuery) -> None:
                 reminder_id,
                 occurrence_id=occurrence_id,
                 revision=parsed.revision,
+                origin=parsed.origin,
             )
         )
         return
@@ -337,7 +365,7 @@ async def reminder_callback(callback: CallbackQuery) -> None:
             reminder_id,
             expected_revision=parsed.revision,
             expected_occurrence_id=occurrence_id,
-            expected_message_id=callback_message.message_id,
+            expected_message_id=expected_message_id,
         )
         await callback.answer("Готово" if completed else STALE_FEEDBACK, show_alert=False)
         if completed:

@@ -205,6 +205,12 @@ def upgrade() -> None:
         ),
     )
     op.create_index(
+        "uq_action_drafts_user_chat",
+        "action_drafts",
+        ["user_id", "chat_id"],
+        unique=True,
+    )
+    op.create_index(
         "ix_action_drafts_user_id",
         "action_drafts",
         ["user_id"],
@@ -242,6 +248,7 @@ def downgrade() -> None:
     op.drop_index("ix_action_drafts_expected_occurrence_id", table_name="action_drafts")
     op.drop_index("ix_action_drafts_reminder_id", table_name="action_drafts")
     op.drop_index("ix_action_drafts_user_id", table_name="action_drafts")
+    op.drop_index("uq_action_drafts_user_chat", table_name="action_drafts")
     op.drop_table("action_drafts")
 
     op.drop_index(

@@ -208,6 +208,7 @@ class ActionDraft(Base):
 
     __tablename__ = "action_drafts"
     __table_args__ = (
+        Index("uq_action_drafts_user_chat", "user_id", "chat_id", unique=True),
         Index("ix_action_drafts_owner_chat_type", "user_id", "chat_id", "action_type"),
         Index("ix_action_drafts_expires_at", "expires_at"),
     )

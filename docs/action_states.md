@@ -38,14 +38,18 @@ under the same lease.
 New callback data uses the compact versioned format:
 
 ```text
-r1:<action>:<target kind>:<target id>:<revision>
+r1:<action>:<target kind>:<target id>:<revision>:<origin>
 ```
 
 `target kind` is `r` for a reminder card from `/list` or `o` for a persisted
-occurrence. The server checks owner, chat, resource, exact revision, current
-state, and (for occurrence actions) the callback message ID. Legacy
-`reminder:*` payloads are rejected as stale and are never applied to a newer
-revision.
+occurrence. `origin` is `d` for the canonical delivery message and `l` for a
+new control card rendered by `/list`. The server checks owner, chat, resource,
+exact occurrence/timestamp, revision, and current state. Only `d` callbacks
+also bind occurrence actions to the persisted delivery message ID; `l`
+callbacks deliberately bind to occurrence identity rather than the new list
+card message ID. Legacy five-field `r1` callbacks are treated as delivery
+callbacks for compatibility; `reminder:*` payloads are rejected as stale and
+are never applied to a newer revision.
 
 Every successful state-changing action increments the relevant reminder and/or
 occurrence revision. The old Telegram keyboard is removed when Telegram still
@@ -72,7 +76,13 @@ action type, reminder ID, expected revision/message/occurrence ID and timestamp,
 current step, minimal JSON payload, timestamps, and expiry. Drafts are
 restart-safe, expire after a bounded TTL, cannot cross users/chats, and are
 cancelled by `/cancel` without storing a Telegram update or private message
-history.
+history. A PostgreSQL unique owner/chat index plus a user-row lock ensures
+that starting a new interactive flow atomically replaces every older draft;
+at most one flow can exist for a user/chat.
+
+Custom Snooze preserves parser datetime semantics. Absolute values use
+`wall_clock` localization in the user's timezone; relative values such as
+`через 2 часа` use `instant` elapsed-time resolution, including DST transitions.
 
 ## Cancellation and retention
 

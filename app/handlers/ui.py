@@ -4,6 +4,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from app.callbacks import CallbackOrigin
 from app.db.models import OccurrenceState, Reminder, User
 from app.keyboards.reply import get_main_keyboard, get_timezone_keyboard
 from app.services.reminder_service import (
@@ -132,6 +133,7 @@ async def _send_actionable_reminders(
                 ),
                 state=display_state,
                 recurrence_type=reminder.recurrence_type,
+                origin=CallbackOrigin.LIST,
             ),
             parse_mode="HTML",
         )

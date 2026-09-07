@@ -89,6 +89,12 @@ class ParsedEditSchedule:
     datetime_semantics: DatetimeSemantics = "wall_clock"
 
 
+@dataclass(frozen=True, slots=True)
+class ParsedCustomDatetime:
+    local_dt: datetime
+    datetime_semantics: DatetimeSemantics = "wall_clock"
+
+
 def get_action_metrics() -> dict[str, int]:
     return action_metrics.snapshot()
 
@@ -273,17 +279,24 @@ def calculate_snooze_target(
     raise ValueError("Неизвестный вариант откладывания")
 
 
-def parse_custom_datetime(raw_value: str, *, now_local: datetime) -> datetime | None:
+def parse_custom_datetime(
+    raw_value: str,
+    *,
+    now_local: datetime,
+) -> ParsedCustomDatetime | None:
     value = raw_value.strip()
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d.%m.%Y %H:%M"):
         try:
-            return datetime.strptime(value, fmt)
+            return ParsedCustomDatetime(local_dt=datetime.strptime(value, fmt))
         except ValueError:
             continue
 
     parsed = parse_reminder_input(f"напомни {value} custom", now_local=now_local)
     if parsed is not None and parsed.text == "custom":
-        return parsed.local_dt
+        return ParsedCustomDatetime(
+            local_dt=parsed.local_dt,
+            datetime_semantics=parsed.datetime_semantics,
+        )
     return None
 
 
@@ -1421,6 +1434,12 @@ async def create_action_draft(
     current_time = _as_utc(now_utc or utc_now())
     expiry = _as_utc(expires_at or (current_time + FLOW_TTL))
     async with SessionLocal() as session, session.begin():
+        owner = await session.scalar(
+            select(User).where(User.id == user.id, User.chat_id == user.chat_id).with_for_update()
+        )
+        if owner is None:
+            _invalid_action("draft", reminder_id=reminder_id, reason="owner")
+            return None
         reminder = await _load_owned_reminder(session, user, reminder_id)
         if reminder is None or reminder.action_revision != expected_action_revision:
             _invalid_action("draft", reminder_id=reminder_id, reason="stale")
@@ -1457,7 +1476,6 @@ async def create_action_draft(
             delete(ActionDraft).where(
                 ActionDraft.user_id == user.id,
                 ActionDraft.chat_id == user.chat_id,
-                ActionDraft.action_type == action_type,
             )
         )
         draft = ActionDraft(
@@ -1577,10 +1595,14 @@ async def apply_custom_snooze_draft(
 ) -> Reminder | None:
     now_utc = utc_now()
     now_local = from_utc_to_user(now_utc, user.timezone)
-    local_dt = parse_custom_datetime(raw_value, now_local=now_local)
-    if local_dt is None:
+    parsed_datetime = parse_custom_datetime(raw_value, now_local=now_local)
+    if parsed_datetime is None:
         raise ValueError("Не понял дату. Используй: 2026-09-08 18:00 или «завтра в 9»")
-    target = resolve_schedule_datetime(local_dt, user.timezone, semantics="wall_clock")
+    target = resolve_schedule_datetime(
+        parsed_datetime.local_dt,
+        user.timezone,
+        semantics=parsed_datetime.datetime_semantics,
+    )
     payload = _payload_dict(draft.payload)
     expected_occurrence_id = draft.expected_occurrence_id
     if expected_occurrence_id is None:

@@ -22,7 +22,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 
-from app.callbacks import CallbackAction, CallbackTarget, encode_callback
+from app.callbacks import CallbackAction, CallbackOrigin, CallbackTarget, encode_callback
 from app.config import get_settings
 from app.db.models import (
     OccurrenceState,
@@ -89,6 +89,7 @@ def reminder_actions_kb(
     state: str = ReminderState.DELIVERED.value,
     recurrence_type: str = RecurrenceType.NONE.value,
     include_snooze: bool = True,
+    origin: CallbackOrigin | str = CallbackOrigin.DELIVERY,
 ) -> InlineKeyboardMarkup:
     # Keep the old helper call useful for callers that only want a compact
     # cancellation button. Real delivery cards always pass an occurrence id.
@@ -103,6 +104,7 @@ def reminder_actions_kb(
                             CallbackTarget.REMINDER,
                             reminder_id,
                             revision,
+                            origin=origin,
                         ),
                     )
                 ]
@@ -115,7 +117,13 @@ def reminder_actions_kb(
     def button(text: str, action: CallbackAction) -> InlineKeyboardButton:
         return InlineKeyboardButton(
             text=text,
-            callback_data=encode_callback(action, target, target_id, revision),
+            callback_data=encode_callback(
+                action,
+                target,
+                target_id,
+                revision,
+                origin=origin,
+            ),
         )
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -148,6 +156,7 @@ def snooze_presets_kb(
     *,
     occurrence_id: int | None,
     revision: int,
+    origin: CallbackOrigin | str = CallbackOrigin.DELIVERY,
 ) -> InlineKeyboardMarkup:
     target = CallbackTarget.OCCURRENCE if occurrence_id is not None else CallbackTarget.REMINDER
     target_id = occurrence_id or reminder_id
@@ -157,13 +166,21 @@ def snooze_presets_kb(
                 InlineKeyboardButton(
                     text="10 минут",
                     callback_data=encode_callback(
-                        CallbackAction.SNOOZE_10, target, target_id, revision
+                        CallbackAction.SNOOZE_10,
+                        target,
+                        target_id,
+                        revision,
+                        origin=origin,
                     ),
                 ),
                 InlineKeyboardButton(
                     text="1 час",
                     callback_data=encode_callback(
-                        CallbackAction.SNOOZE_1H, target, target_id, revision
+                        CallbackAction.SNOOZE_1H,
+                        target,
+                        target_id,
+                        revision,
+                        origin=origin,
                     ),
                 ),
             ],
@@ -171,13 +188,21 @@ def snooze_presets_kb(
                 InlineKeyboardButton(
                     text="Вечером",
                     callback_data=encode_callback(
-                        CallbackAction.SNOOZE_EVENING, target, target_id, revision
+                        CallbackAction.SNOOZE_EVENING,
+                        target,
+                        target_id,
+                        revision,
+                        origin=origin,
                     ),
                 ),
                 InlineKeyboardButton(
                     text="Завтра",
                     callback_data=encode_callback(
-                        CallbackAction.SNOOZE_TOMORROW, target, target_id, revision
+                        CallbackAction.SNOOZE_TOMORROW,
+                        target,
+                        target_id,
+                        revision,
+                        origin=origin,
                     ),
                 ),
             ],
@@ -185,7 +210,11 @@ def snooze_presets_kb(
                 InlineKeyboardButton(
                     text="Своё время",
                     callback_data=encode_callback(
-                        CallbackAction.SNOOZE_CUSTOM, target, target_id, revision
+                        CallbackAction.SNOOZE_CUSTOM,
+                        target,
+                        target_id,
+                        revision,
+                        origin=origin,
                     ),
                 )
             ],

@@ -13,6 +13,13 @@ class CallbackTarget(StrEnum):
     OCCURRENCE = "o"
 
 
+class CallbackOrigin(StrEnum):
+    """Telegram surface that rendered the controls."""
+
+    DELIVERY = "d"
+    LIST = "l"
+
+
 class CallbackAction(StrEnum):
     DONE = "done"
     SNOOZE = "snooze"
@@ -34,6 +41,7 @@ class ReminderCallback:
     target: CallbackTarget
     target_id: int
     revision: int
+    origin: CallbackOrigin
 
 
 _ID_RE = re.compile(r"[1-9][0-9]*\Z")
@@ -45,17 +53,23 @@ def encode_callback(
     target: CallbackTarget | str,
     target_id: int,
     revision: int,
+    *,
+    origin: CallbackOrigin | str = CallbackOrigin.DELIVERY,
 ) -> str:
     try:
         action_value = CallbackAction(action)
         target_value = CallbackTarget(target)
+        origin_value = CallbackOrigin(origin)
     except ValueError as exc:
-        raise ValueError("Unsupported callback action or target") from exc
+        raise ValueError("Unsupported callback action, target, or origin") from exc
 
     if target_id < 1 or revision < 0:
         raise ValueError("Callback identifiers must be positive and revision non-negative")
 
-    payload = f"{CALLBACK_VERSION}:{action_value.value}:{target_value.value}:{target_id}:{revision}"
+    payload = (
+        f"{CALLBACK_VERSION}:{action_value.value}:{target_value.value}:"
+        f"{target_id}:{revision}:{origin_value.value}"
+    )
     if len(payload.encode("utf-8")) > CALLBACK_MAX_BYTES:
         raise ValueError("Callback data exceeds Telegram's callback_data limit")
     return payload
@@ -66,10 +80,11 @@ def parse_callback(data: str | None) -> ReminderCallback | None:
         return None
 
     parts = data.split(":")
-    if len(parts) != 5 or parts[0] != CALLBACK_VERSION:
+    if len(parts) not in {5, 6} or parts[0] != CALLBACK_VERSION:
         return None
 
-    _, action_raw, target_raw, target_id_raw, revision_raw = parts
+    _, action_raw, target_raw, target_id_raw, revision_raw = parts[:5]
+    origin_raw = parts[5] if len(parts) == 6 else CallbackOrigin.DELIVERY.value
     if not _ID_RE.fullmatch(target_id_raw) or not _REVISION_RE.fullmatch(revision_raw):
         return None
 
@@ -78,6 +93,7 @@ def parse_callback(data: str | None) -> ReminderCallback | None:
         target = CallbackTarget(target_raw)
         target_id = int(target_id_raw)
         revision = int(revision_raw)
+        origin = CallbackOrigin(origin_raw)
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -93,4 +109,5 @@ def parse_callback(data: str | None) -> ReminderCallback | None:
         target=target,
         target_id=target_id,
         revision=revision,
+        origin=origin,
     )
