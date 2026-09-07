@@ -12,6 +12,10 @@
 - `snoozed_until_utc` records the active snooze override, when present.
 - `recurrence_day_of_month` preserves the original monthly anchor (for example, 31),
   so a January 31 schedule returns to March 31 after a clamped February occurrence.
+- `recurrence_rule` stores the versioned canonical rule as bounded JSON. The rule,
+  rather than only the next UTC timestamp, is the source needed to reconstruct and
+  edit a series after restart. Legacy scalar recurrence columns remain populated
+  for compatibility.
 
 The worker queries the effective delivery time, sends the current occurrence, then
 advances the canonical occurrence and resets the delivery override. Each delivery
@@ -69,3 +73,43 @@ New users default to `Europe/Moscow`. A validated explicit timezone choice is st
 `users.timezone` and is read back from PostgreSQL on later sessions/restarts. New
 reminders capture that currently persisted value in `schedule_timezone`; existing
 recurring reminders keep their captured value even if the profile timezone changes.
+
+## Canonical rule model
+
+Version 1 stores a bounded JSON rule alongside the current UTC occurrence:
+
+```json
+{"version":1,"kind":"weekly_days","weekdays":[0,3],"interval":1,
+ "time":"09:00","anchor_week":"2026-09-07"}
+```
+
+`weekly_days` and `weekdays` represent selected weekdays (`0` is Monday),
+`monthly_nth` and `monthly_last` represent calendar weekdays, `yearly` represents a
+month/day wall-clock date, and `completion_relative` stores the number of calendar
+days after the user's actual `Done` action. Optional `until` is an inclusive local
+calendar date. Rules are validated and size-bounded before persistence.
+
+Selected weekday sets, workdays, nth/last weekdays of a month, yearly dates, and
+repeat-until boundaries use the same local calendar policy. A completion-relative
+series keeps its delivered occurrence actionable until `Done`; only then is the next
+occurrence calculated from the persisted completion timestamp. Snoozing such an
+occurrence keeps the same anchor and schedules the next series occurrence when the
+snoozed child is completed.
+
+An inclusive `until` date is terminal: a matching occurrence on that local date is
+allowed, and no later occurrence is generated. If the first possible occurrence is
+already beyond `until`, creation rejects the dead schedule instead of persisting it.
+
+## Clarification flow
+
+Ambiguous or unsupported reminder text never creates a row. The parser returns a
+bounded clarification request, and the bot stores only the owner/chat scope, raw
+input, safe category, prompt, and a 15-minute expiry in PostgreSQL. A restart can
+resume the prompt; `/cancel` removes it. Invalid replies keep the same prompt, while
+an explicit date/time or full command creates the reminder through the normal service
+validation path.
+
+Existing recurring reminders are migrated deterministically to a version 1 `legacy`
+rule from their scalar `recurrence_type`, `recurrence_interval`, and
+`recurrence_day_of_month` values. No existing schedule is reinterpreted; the scalar
+columns remain available for rollback inspection and compatibility.

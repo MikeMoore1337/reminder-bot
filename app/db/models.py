@@ -26,6 +26,7 @@ class RecurrenceType(StrEnum):
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
+    ADVANCED = "advanced"
 
 
 class ReminderState(StrEnum):
@@ -72,6 +73,9 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     action_drafts: Mapped[list[ActionDraft]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    reminder_clarifications: Mapped[list[ReminderClarification]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -130,6 +134,7 @@ class Reminder(Base):
     )
     recurrence_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     recurrence_day_of_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recurrence_rule: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     last_delivery_occurrence_utc: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -244,3 +249,31 @@ class ActionDraft(Base):
 
     user: Mapped[User] = relationship(back_populates="action_drafts")
     reminder: Mapped[Reminder] = relationship()
+
+
+class ReminderClarification(Base):
+    """Bounded, restart-safe state for an ambiguous reminder input."""
+
+    __tablename__ = "reminder_clarifications"
+    __table_args__ = (
+        Index("uq_reminder_clarifications_user_chat", "user_id", "chat_id", unique=True),
+        Index("ix_reminder_clarifications_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    clarification_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    user: Mapped[User] = relationship(back_populates="reminder_clarifications")

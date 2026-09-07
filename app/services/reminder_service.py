@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import calendar
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from html import escape
@@ -21,7 +21,15 @@ from app.db.models import (
     User,
 )
 from app.db.session import SessionLocal
-from app.services.reminder_parser import parse_reminder_input
+from app.services.recurrence import (
+    advance_until_future,
+    decode_rule,
+    encode_rule,
+    is_completion_relative,
+    legacy_rule,
+    next_occurrence,
+)
+from app.services.reminder_parser import ParsedReminder, parse_reminder_input
 from app.utils.datetime_utils import (
     DatetimeSemantics,
     from_utc_to_user,
@@ -87,6 +95,8 @@ class ParsedEditSchedule:
     recurrence_type: str = RecurrenceType.NONE.value
     recurrence_interval: int = 1
     datetime_semantics: DatetimeSemantics = "wall_clock"
+    recurrence_rule: dict[str, Any] | None = None
+    recurrence_day_of_month: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,13 +159,6 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _next_month(dt: datetime, day_of_month: int | None = None) -> datetime:
-    year = dt.year + (1 if dt.month == 12 else 0)
-    month = 1 if dt.month == 12 else dt.month + 1
-    day = min(day_of_month or dt.day, calendar.monthrange(year, month)[1])
-    return dt.replace(year=year, month=month, day=day)
-
-
 def validate_recurrence(recurrence_type: str, recurrence_interval: int) -> None:
     if recurrence_interval < 1:
         raise ValueError("Интервал повторения должен быть больше 0")
@@ -182,33 +185,24 @@ def calculate_next_occurrence(
     recurrence_interval: int,
     timezone_name: str = "UTC",
     recurrence_day_of_month: int | None = None,
+    recurrence_rule: Mapping[str, Any] | str | None = None,
+    completion_at_utc: datetime | None = None,
 ) -> datetime | None:
-    if recurrence_type == RecurrenceType.NONE.value:
-        return None
-
-    if recurrence_type == RecurrenceType.MINUTES.value:
-        return remind_at_utc + timedelta(minutes=recurrence_interval)
-
-    if recurrence_type == RecurrenceType.HOURLY.value:
-        return remind_at_utc + timedelta(hours=recurrence_interval)
-
-    local_dt = from_utc_to_user(remind_at_utc, timezone_name).replace(tzinfo=None)
-
-    if recurrence_type == RecurrenceType.DAILY.value:
-        next_local_dt = local_dt + timedelta(days=recurrence_interval)
-        return to_utc(next_local_dt, timezone_name)
-
-    if recurrence_type == RecurrenceType.WEEKLY.value:
-        next_local_dt = local_dt + timedelta(weeks=recurrence_interval)
-        return to_utc(next_local_dt, timezone_name)
-
-    if recurrence_type == RecurrenceType.MONTHLY.value:
-        next_dt = local_dt
-        for _ in range(recurrence_interval):
-            next_dt = _next_month(next_dt, recurrence_day_of_month)
-        return to_utc(next_dt, timezone_name)
-
-    raise ValueError(f"Unsupported recurrence_type: {recurrence_type}")
+    if recurrence_rule is None:
+        if recurrence_type == RecurrenceType.ADVANCED.value:
+            raise ValueError("Для advanced recurrence требуется каноническое правило")
+        rule = legacy_rule(recurrence_type, recurrence_interval, recurrence_day_of_month)
+    else:
+        decoded_rule = decode_rule(recurrence_rule)
+        if decoded_rule is None:
+            return None
+        rule = decoded_rule
+    return next_occurrence(
+        remind_at_utc,
+        rule,
+        timezone_name,
+        completion_at_utc=completion_at_utc,
+    )
 
 
 def advance_occurrence_until_future(
@@ -218,23 +212,47 @@ def advance_occurrence_until_future(
     timezone_name: str,
     recurrence_day_of_month: int | None,
     now_utc: datetime,
+    recurrence_rule: Mapping[str, Any] | str | None = None,
 ) -> datetime | None:
-    next_occurrence = calculate_next_occurrence(
-        remind_at_utc,
-        recurrence_type,
-        recurrence_interval,
-        timezone_name=timezone_name,
-        recurrence_day_of_month=recurrence_day_of_month,
+    if recurrence_rule is None:
+        if recurrence_type == RecurrenceType.ADVANCED.value:
+            raise ValueError("Для advanced recurrence требуется каноническое правило")
+        rule = legacy_rule(recurrence_type, recurrence_interval, recurrence_day_of_month)
+    else:
+        decoded_rule = decode_rule(recurrence_rule)
+        if decoded_rule is None:
+            return None
+        rule = decoded_rule
+    return advance_until_future(remind_at_utc, rule, timezone_name, now_utc)
+
+
+def get_recurrence_rule(reminder: Reminder) -> dict[str, Any]:
+    """Return a canonical rule, reconstructing the legacy path when needed."""
+
+    if reminder.recurrence_rule:
+        decoded = decode_rule(reminder.recurrence_rule)
+        if decoded is None:
+            raise ValueError("У напоминания отсутствует recurrence rule")
+        return decoded
+    if reminder.recurrence_type == RecurrenceType.ADVANCED.value:
+        raise ValueError("У advanced reminder отсутствует recurrence rule")
+    return legacy_rule(
+        str(reminder.recurrence_type),
+        int(reminder.recurrence_interval),
+        reminder.recurrence_day_of_month,
     )
-    while next_occurrence is not None and next_occurrence <= now_utc:
-        next_occurrence = calculate_next_occurrence(
-            next_occurrence,
-            recurrence_type,
-            recurrence_interval,
-            timezone_name=timezone_name,
-            recurrence_day_of_month=recurrence_day_of_month,
-        )
-    return next_occurrence
+
+
+def _validate_initial_rule_date(
+    remind_at_utc: datetime,
+    rule: Mapping[str, Any] | None,
+    timezone_name: str,
+) -> None:
+    if rule is None or rule.get("until") is None:
+        return
+    local_date = from_utc_to_user(remind_at_utc, timezone_name).date().isoformat()
+    if local_date > str(rule["until"]):
+        raise ValueError("Первое повторение должно быть не позже даты окончания")
 
 
 def build_snooze_state(
@@ -292,7 +310,7 @@ def parse_custom_datetime(
             continue
 
     parsed = parse_reminder_input(f"напомни {value} custom", now_local=now_local)
-    if parsed is not None and parsed.text == "custom":
+    if isinstance(parsed, ParsedReminder) and parsed.text == "custom":
         return ParsedCustomDatetime(
             local_dt=parsed.local_dt,
             datetime_semantics=parsed.datetime_semantics,
@@ -317,13 +335,15 @@ def parse_edit_schedule(
             continue
 
     parsed = parse_reminder_input(f"напомни {value} edited", now_local=now_local)
-    if parsed is None or parsed.text != "edited":
+    if not isinstance(parsed, ParsedReminder) or parsed.text != "edited":
         return None
     return ParsedEditSchedule(
         local_dt=parsed.local_dt,
         recurrence_type=parsed.recurrence_type,
         recurrence_interval=parsed.recurrence_interval,
         datetime_semantics=parsed.datetime_semantics,
+        recurrence_rule=parsed.recurrence_rule,
+        recurrence_day_of_month=parsed.recurrence_day_of_month,
     )
 
 
@@ -334,7 +354,26 @@ async def create_reminder(
     recurrence_type: str = "none",
     recurrence_interval: int = 1,
     datetime_semantics: DatetimeSemantics = "wall_clock",
+    recurrence_rule: Mapping[str, Any] | str | None = None,
+    recurrence_day_of_month: int | None = None,
 ) -> Reminder:
+    canonical_rule: dict[str, Any] | None = None
+    if recurrence_rule is not None:
+        canonical_rule = decode_rule(recurrence_rule)
+        if canonical_rule is None:
+            raise ValueError("Правило повторения отсутствует")
+        if canonical_rule["kind"] == "legacy":
+            recurrence_type = str(canonical_rule["recurrence_type"])
+            recurrence_interval = int(canonical_rule["interval"])
+            if recurrence_day_of_month is None:
+                recurrence_day_of_month = canonical_rule.get("day_of_month")
+        else:
+            recurrence_type = RecurrenceType.ADVANCED.value
+            recurrence_interval = int(canonical_rule.get("interval", 1))
+            recurrence_day_of_month = None
+    elif recurrence_type == RecurrenceType.ADVANCED.value:
+        raise ValueError("Для advanced recurrence требуется каноническое правило")
+
     validate_recurrence(recurrence_type, recurrence_interval)
     if not text.strip() or len(text) > MAX_REMINDER_TEXT_LENGTH:
         raise ValueError("Текст напоминания должен содержать от 1 до 4096 символов")
@@ -344,10 +383,16 @@ async def create_reminder(
         user.timezone,
         semantics=datetime_semantics,
     )
+    _validate_initial_rule_date(remind_at_utc, canonical_rule, user.timezone)
     now_utc = utc_now()
-    recurrence_day_of_month = (
-        local_dt.day if recurrence_type == RecurrenceType.MONTHLY.value else None
-    )
+    if recurrence_day_of_month is None and recurrence_type == RecurrenceType.MONTHLY.value:
+        recurrence_day_of_month = local_dt.day
+    if canonical_rule is None and recurrence_type != RecurrenceType.NONE.value:
+        canonical_rule = legacy_rule(
+            recurrence_type,
+            recurrence_interval,
+            recurrence_day_of_month,
+        )
 
     if recurrence_type == RecurrenceType.NONE.value and remind_at_utc <= now_utc:
         raise ValueError("Время напоминания уже прошло")
@@ -360,10 +405,13 @@ async def create_reminder(
                 recurrence_interval,
                 timezone_name=user.timezone,
                 recurrence_day_of_month=recurrence_day_of_month,
+                recurrence_rule=canonical_rule,
             )
             if next_dt is None:
                 break
             remind_at_utc = next_dt
+        if remind_at_utc <= now_utc:
+            raise ValueError("Первое повторение должно быть в будущем и попадать в правило")
 
     async with SessionLocal() as session:
         reminder = Reminder(
@@ -379,6 +427,7 @@ async def create_reminder(
             recurrence_type=recurrence_type,
             recurrence_interval=recurrence_interval,
             recurrence_day_of_month=recurrence_day_of_month,
+            recurrence_rule=encode_rule(canonical_rule) if canonical_rule is not None else None,
         )
         session.add(reminder)
         await session.commit()
@@ -636,6 +685,23 @@ async def _load_occurrence(
             ReminderOccurrence.id == occurrence_id,
             ReminderOccurrence.reminder_id == reminder_id,
         )
+        .with_for_update()
+    )
+    return cast(ReminderOccurrence | None, result.scalar_one_or_none())
+
+
+async def _load_latest_delivered_occurrence(
+    session: Any,
+    reminder_id: int,
+) -> ReminderOccurrence | None:
+    result = await session.execute(
+        select(ReminderOccurrence)
+        .where(
+            ReminderOccurrence.reminder_id == reminder_id,
+            ReminderOccurrence.status == OccurrenceState.DELIVERED.value,
+        )
+        .order_by(ReminderOccurrence.occurrence_at_utc.desc())
+        .limit(1)
         .with_for_update()
     )
     return cast(ReminderOccurrence | None, result.scalar_one_or_none())
@@ -1155,9 +1221,35 @@ async def complete_reminder(
         reminder.action_revision += 1
 
         if reminder.parent_reminder_id is None:
+            recurrence_rule = get_recurrence_rule(reminder)
             if reminder.recurrence_type == RecurrenceType.NONE.value:
                 reminder.state = ReminderState.COMPLETED.value
                 reminder.completed_at = now_utc
+            elif is_completion_relative(recurrence_rule):
+                next_occurrence = calculate_next_occurrence(
+                    reminder.remind_at_utc,
+                    reminder.recurrence_type,
+                    reminder.recurrence_interval,
+                    timezone_name=reminder.schedule_timezone,
+                    recurrence_day_of_month=reminder.recurrence_day_of_month,
+                    recurrence_rule=recurrence_rule,
+                    completion_at_utc=now_utc,
+                )
+                if next_occurrence is None:
+                    reminder.state = ReminderState.COMPLETED.value
+                    reminder.completed_at = now_utc
+                    reminder.status = "sent"
+                    reminder.delivery_at_utc = None
+                    reminder.snoozed_until_utc = None
+                else:
+                    reminder.remind_at_utc = next_occurrence
+                    reminder.delivery_at_utc = next_occurrence
+                    reminder.snoozed_until_utc = None
+                    reminder.state = ReminderState.SCHEDULED.value
+                    reminder.status = "pending"
+                    reminder.completed_at = None
+                    _reset_delivery_retry(reminder)
+                    _clear_delivery_identity(reminder)
             else:
                 reminder.state = ReminderState.SCHEDULED.value
         else:
@@ -1181,6 +1273,32 @@ async def complete_reminder(
                     source.completed_at = now_utc
                     source.action_revision += 1
                 parent.action_revision += 1
+                parent_rule = get_recurrence_rule(parent)
+                if is_completion_relative(parent_rule):
+                    next_occurrence = calculate_next_occurrence(
+                        parent.remind_at_utc,
+                        parent.recurrence_type,
+                        parent.recurrence_interval,
+                        timezone_name=parent.schedule_timezone,
+                        recurrence_day_of_month=parent.recurrence_day_of_month,
+                        recurrence_rule=parent_rule,
+                        completion_at_utc=now_utc,
+                    )
+                    if next_occurrence is None:
+                        parent.state = ReminderState.COMPLETED.value
+                        parent.completed_at = now_utc
+                        parent.status = "sent"
+                        parent.delivery_at_utc = None
+                        parent.snoozed_until_utc = None
+                    else:
+                        parent.remind_at_utc = next_occurrence
+                        parent.delivery_at_utc = next_occurrence
+                        parent.snoozed_until_utc = None
+                        parent.state = ReminderState.SCHEDULED.value
+                        parent.status = "pending"
+                        parent.completed_at = None
+                        _reset_delivery_retry(parent)
+                        _clear_delivery_identity(parent)
 
         _record_action("completed", action="done", reminder_id=reminder.id)
         _record_action("action_success", action="done", reminder_id=reminder.id)
@@ -1259,14 +1377,43 @@ async def resume_reminder(user: User, reminder_id: int, *, expected_revision: in
             return False
 
         now_utc = utc_now()
-        next_occurrence = advance_occurrence_until_future(
-            reminder.remind_at_utc,
-            reminder.recurrence_type,
-            reminder.recurrence_interval,
-            reminder.schedule_timezone,
-            reminder.recurrence_day_of_month,
-            now_utc,
-        )
+        recurrence_rule = get_recurrence_rule(reminder)
+        next_occurrence: datetime | None
+        if is_completion_relative(recurrence_rule):
+            delivered_occurrence = await _load_latest_delivered_occurrence(session, reminder.id)
+            if (
+                delivered_occurrence is not None
+                and reminder.last_delivery_occurrence_utc is not None
+                and _as_utc(delivered_occurrence.occurrence_at_utc)
+                == _as_utc(reminder.last_delivery_occurrence_utc)
+                and reminder.last_message_id == delivered_occurrence.message_id
+            ):
+                # A completion-relative series is paused between delivery and
+                # Done. Resuming restores the same actionable occurrence;
+                # calculating a future occurrence would lose its completion anchor.
+                reminder.state = ReminderState.DELIVERED.value
+                reminder.status = "sent"
+                reminder.delivery_at_utc = None
+                reminder.snoozed_until_utc = None
+                reminder.paused_at = None
+                reminder.action_revision += 1
+                delivered_occurrence.action_revision = reminder.action_revision
+                _record_action("resumed", action="resume", reminder_id=reminder.id)
+                _record_action("action_success", action="resume", reminder_id=reminder.id)
+                return True
+            next_occurrence = reminder.remind_at_utc
+            if _as_utc(next_occurrence) <= _as_utc(now_utc):
+                next_occurrence = _as_utc(now_utc)
+        else:
+            next_occurrence = advance_occurrence_until_future(
+                reminder.remind_at_utc,
+                reminder.recurrence_type,
+                reminder.recurrence_interval,
+                reminder.schedule_timezone,
+                reminder.recurrence_day_of_month,
+                now_utc,
+                recurrence_rule=recurrence_rule,
+            )
         if next_occurrence is None:
             _invalid_action("resume", reminder_id=reminder_id, reason="schedule")
             return False
@@ -1294,6 +1441,8 @@ async def edit_reminder(
     recurrence_type: str | None = None,
     recurrence_interval: int | None = None,
     datetime_semantics: DatetimeSemantics = "wall_clock",
+    recurrence_rule: Mapping[str, Any] | str | None = None,
+    recurrence_day_of_month: int | None = None,
     expected_occurrence_id: int | None = None,
     expected_occurrence_at_utc: datetime | None = None,
     expected_message_id: int | None = None,
@@ -1345,10 +1494,29 @@ async def edit_reminder(
         if text is not None:
             reminder.text = text.strip()
 
-        schedule_changed = local_dt is not None or recurrence_type is not None
+        schedule_changed = (
+            local_dt is not None or recurrence_type is not None or recurrence_rule is not None
+        )
         if schedule_changed:
-            new_recurrence = recurrence_type or RecurrenceType.NONE.value
-            new_interval = recurrence_interval or 1
+            canonical_rule: dict[str, Any] | None = None
+            if recurrence_rule is not None:
+                canonical_rule = decode_rule(recurrence_rule)
+                if canonical_rule is None:
+                    raise ValueError("Правило повторения отсутствует")
+                if canonical_rule["kind"] == "legacy":
+                    new_recurrence = str(canonical_rule["recurrence_type"])
+                    new_interval = int(canonical_rule["interval"])
+                    if recurrence_day_of_month is None:
+                        recurrence_day_of_month = canonical_rule.get("day_of_month")
+                else:
+                    new_recurrence = RecurrenceType.ADVANCED.value
+                    new_interval = int(canonical_rule.get("interval", 1))
+                    recurrence_day_of_month = None
+            else:
+                new_recurrence = recurrence_type or RecurrenceType.NONE.value
+                if new_recurrence == RecurrenceType.ADVANCED.value:
+                    raise ValueError("Для advanced recurrence требуется каноническое правило")
+                new_interval = recurrence_interval or 1
             validate_recurrence(new_recurrence, new_interval)
             if local_dt is None:
                 raise ValueError("Для изменения расписания укажи дату и время")
@@ -1358,8 +1526,17 @@ async def edit_reminder(
                 schedule_timezone,
                 semantics=datetime_semantics,
             )
+            _validate_initial_rule_date(remind_at_utc, canonical_rule, schedule_timezone)
             now_utc = utc_now()
-            day_of_month = local_dt.day if new_recurrence == RecurrenceType.MONTHLY.value else None
+            day_of_month = (
+                recurrence_day_of_month
+                if recurrence_day_of_month is not None
+                else local_dt.day
+                if new_recurrence == RecurrenceType.MONTHLY.value
+                else None
+            )
+            if canonical_rule is None and new_recurrence != RecurrenceType.NONE.value:
+                canonical_rule = legacy_rule(new_recurrence, new_interval, day_of_month)
             if new_recurrence == RecurrenceType.NONE.value:
                 if remind_at_utc <= now_utc:
                     raise ValueError("Время напоминания уже прошло")
@@ -1371,16 +1548,22 @@ async def edit_reminder(
                         new_interval,
                         timezone_name=schedule_timezone,
                         recurrence_day_of_month=day_of_month,
+                        recurrence_rule=canonical_rule,
                     )
                     if next_dt is None:
                         break
                     remind_at_utc = next_dt
+                if remind_at_utc <= now_utc:
+                    raise ValueError("Первое повторение должно быть в будущем и попадать в правило")
             reminder.schedule_timezone = schedule_timezone
             reminder.remind_at_utc = remind_at_utc
             reminder.delivery_at_utc = remind_at_utc
             reminder.recurrence_type = new_recurrence
             reminder.recurrence_interval = new_interval
             reminder.recurrence_day_of_month = day_of_month
+            reminder.recurrence_rule = (
+                encode_rule(canonical_rule) if canonical_rule is not None else None
+            )
 
         if schedule_changed:
             reminder.state = ReminderState.SCHEDULED.value
@@ -1630,6 +1813,8 @@ async def apply_edit_draft(
     recurrence_type: str | None = None,
     recurrence_interval: int | None = None,
     datetime_semantics: DatetimeSemantics = "wall_clock",
+    recurrence_rule: Mapping[str, Any] | str | None = None,
+    recurrence_day_of_month: int | None = None,
 ) -> Reminder | None:
     payload = _payload_dict(draft.payload)
     new_text = payload.get("text")
@@ -1649,6 +1834,8 @@ async def apply_edit_draft(
         recurrence_type=recurrence_type,
         recurrence_interval=recurrence_interval,
         datetime_semantics=datetime_semantics,
+        recurrence_rule=recurrence_rule,
+        recurrence_day_of_month=recurrence_day_of_month,
         expected_occurrence_id=expected_occurrence_id,
         expected_occurrence_at_utc=draft.expected_occurrence_at_utc,
         expected_message_id=draft.expected_message_id,
@@ -1711,21 +1898,56 @@ async def get_failed_reminders(limit: int = 20) -> list[Reminder]:
 
 
 def format_recurrence(reminder: Reminder) -> str:
-    recurrence_type = str(reminder.recurrence_type)
-    interval = int(reminder.recurrence_interval)
-    if recurrence_type == RecurrenceType.NONE.value:
+    rule = get_recurrence_rule(reminder)
+    kind = rule["kind"]
+    if kind == "none":
         return "нет"
-    if recurrence_type == RecurrenceType.MINUTES.value:
-        return "каждые 1 минуту" if interval == 1 else f"каждые {interval} минут"
-    if recurrence_type == RecurrenceType.HOURLY.value:
-        return "каждый час" if interval == 1 else f"каждые {interval} часов"
-    if recurrence_type == RecurrenceType.DAILY.value:
-        return "каждый день" if interval == 1 else f"каждые {interval} дней"
-    if recurrence_type == RecurrenceType.WEEKLY.value:
-        return "каждую неделю" if interval == 1 else f"каждые {interval} недель"
-    if recurrence_type == RecurrenceType.MONTHLY.value:
-        return "каждый месяц" if interval == 1 else f"каждые {interval} месяцев"
-    return recurrence_type
+
+    until = rule.get("until")
+    suffix = f" до {until}" if until else ""
+    if kind == "legacy":
+        recurrence_type = str(rule["recurrence_type"])
+        interval = int(rule["interval"])
+        if recurrence_type == RecurrenceType.MINUTES.value:
+            label = "каждые 1 минуту" if interval == 1 else f"каждые {interval} минут"
+        elif recurrence_type == RecurrenceType.HOURLY.value:
+            label = "каждый час" if interval == 1 else f"каждые {interval} часов"
+        elif recurrence_type == RecurrenceType.DAILY.value:
+            label = "каждый день" if interval == 1 else f"каждые {interval} дней"
+        elif recurrence_type == RecurrenceType.WEEKLY.value:
+            label = "каждую неделю" if interval == 1 else f"каждые {interval} недель"
+        elif recurrence_type == RecurrenceType.MONTHLY.value:
+            label = "каждый месяц" if interval == 1 else f"каждые {interval} месяцев"
+        else:
+            return recurrence_type
+        return f"{label}{suffix}"
+
+    weekday_names = (
+        "понедельник",
+        "вторник",
+        "среду",
+        "четверг",
+        "пятницу",
+        "субботу",
+        "воскресенье",
+    )
+    if kind in {"weekly_days", "weekdays"}:
+        names = ", ".join(weekday_names[int(day)] for day in rule["weekdays"])
+        interval = int(rule["interval"])
+        every = "каждую неделю" if interval == 1 else f"каждые {interval} недель"
+        return f"{every}: {names} в {rule['time']}{suffix}"
+    if kind == "monthly_nth":
+        return (
+            f"{rule['ordinal']}-й {weekday_names[int(rule['weekday'])]} месяца в "
+            f"{rule['time']}{suffix}"
+        )
+    if kind == "monthly_last":
+        return f"последний {weekday_names[int(rule['weekday'])]} месяца в {rule['time']}{suffix}"
+    if kind == "yearly":
+        return f"ежегодно {int(rule['day']):02d}.{int(rule['month']):02d} в {rule['time']}{suffix}"
+    if kind == "completion_relative":
+        return f"через {rule['after_days']} дн. после выполнения{suffix}"
+    return str(reminder.recurrence_type)
 
 
 def format_state(state: str) -> str:

@@ -26,6 +26,13 @@ canonical occurrence and therefore remains `scheduled`. While the latest
 occurrence is still `delivered`, `/list` renders that occurrence as the action
 card; acknowledging it does not stop the next canonical delivery.
 
+Completion-relative series are the deliberate exception: the parent remains
+`delivered` after send because its next occurrence depends on the actual completion
+timestamp. `Done` (on the parent or its snooze child) records that timestamp and
+then schedules the next occurrence; if an inclusive `until` bound has expired, the
+series becomes `completed`. Pause/resume preserves the same delivered actionable
+occurrence for this rule type instead of attempting to invent a next timestamp.
+
 ## Persisted identity and revisions
 
 `ReminderOccurrence` is the immutable identity boundary for a delivered
@@ -83,6 +90,11 @@ at most one flow can exist for a user/chat.
 Custom Snooze preserves parser datetime semantics. Absolute values use
 `wall_clock` localization in the user's timezone; relative values such as
 `через 2 часа` use `instant` elapsed-time resolution, including DST transitions.
+
+Ambiguous reminder input uses a separate `ReminderClarification` row. It is scoped
+to one user/chat, expires after 15 minutes, stores no Telegram update history, and
+is resolved only by an explicit command or date/time answer. `/cancel` clears both
+clarifications and action drafts.
 
 ## Cancellation and retention
 
