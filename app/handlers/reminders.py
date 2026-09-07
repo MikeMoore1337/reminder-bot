@@ -128,13 +128,22 @@ async def reminder_callback(callback: CallbackQuery) -> None:
     )
 
     if action == "delete":
-        deleted = await cancel_reminder(user=user, reminder_id=reminder_id)
+        deleted = await cancel_reminder(
+            user=user,
+            reminder_id=reminder_id,
+            expected_message_id=callback_message.message_id,
+        )
         await callback.answer("Удалено" if deleted else "Уже удалено", show_alert=False)
         await callback_message.edit_reply_markup(reply_markup=None)
         return
 
     if action == "snooze":
-        reminder = await snooze_reminder(user=user, reminder_id=reminder_id, minutes=10)
+        reminder = await snooze_reminder(
+            user=user,
+            reminder_id=reminder_id,
+            minutes=10,
+            expected_message_id=callback_message.message_id,
+        )
         if reminder is None:
             await callback.answer("Напоминание не найдено", show_alert=True)
             return

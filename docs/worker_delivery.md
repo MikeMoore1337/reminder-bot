@@ -1,0 +1,89 @@
+# Worker delivery reliability contract
+
+## Persisted ownership state
+
+The worker owns a reminder only while its row is `processing` and contains a
+unique `lease_token`. A claim records:
+
+- `processing_started_at` - when this ownership attempt began;
+- `lease_until` - the UTC deadline after which another worker may reclaim it;
+- `lease_token` - the ownership generation used by every metadata and finalization update;
+- `attempt_count` - the number of claims for the current occurrence;
+- `retry_count` - the number of finalized delivery failures for the current occurrence;
+- `next_retry_at` - the earliest UTC time for the next transient retry.
+
+`pending` rows are claimable when their effective delivery time and
+`next_retry_at` are due. `processing` rows with a missing or expired lease are
+also claimable. The PostgreSQL claim uses `FOR UPDATE SKIP LOCKED`, so concurrent
+workers cannot claim the same row at the same time.
+
+An update that finalizes a delivery must match the reminder ID, `processing`
+status, and exact lease token. A stale worker therefore becomes a no-op after a
+lease is reclaimed. Recurring advancement and state transition happen in one
+transaction, so a successful occurrence advances at most once.
+
+## Retry and failure policy
+
+The following bounded settings are configurable through environment variables:
+
+- `WORKER_LEASE_DURATION_SECONDS` (1-86400, default 60);
+- `WORKER_SEND_TIMEOUT_SECONDS` (1-300, default 30);
+- `WORKER_RETRY_BASE_SECONDS` (1-3600, default 10);
+- `WORKER_RETRY_MAX_SECONDS` (1-86400, default 300);
+- `WORKER_MAX_ATTEMPTS` (1-20, default 3).
+
+Network errors, timeouts, server errors, `429` responses, and unknown provider
+errors are transient. Retry delay is exponential and capped by
+`WORKER_RETRY_MAX_SECONDS`; Telegram `retry_after` is respected up to that cap.
+Bad requests, blocked/deactivated chats, unauthorized/not-found delivery, and
+other explicitly terminal Telegram failures become `failed` without resurrection.
+When the claim count reaches `WORKER_MAX_ATTEMPTS`, the occurrence becomes
+`failed` even if the worker crashed before it could report an error.
+
+Failure text stored in PostgreSQL and transition logs contain only a bounded
+exception type/classification and retry metadata. Reminder text, bot tokens,
+raw callback payloads, and provider secrets are never logged.
+
+## External-send idempotency boundary
+
+Database transitions are idempotent and ownership-guarded:
+
+- duplicate success/failure finalization with the same token is a no-op after the
+  first transition;
+- stale workers cannot overwrite `last_message_id`, recurrence, or failure state;
+- a cancelled, sent, failed, or newer occurrence cannot be resurrected by a stale
+  callback;
+- a crash after claim is recoverable when the lease expires;
+- a crash after Telegram accepts the message but before PostgreSQL finalization
+  can result in one duplicate after lease recovery. Telegram send and database
+  commit are separate systems, so this at-least-once boundary is unavoidable
+  without an external idempotency broker/provider contract and is intentionally
+  documented rather than hidden.
+
+`last_delivery_occurrence_utc` binds the stored message ID to the occurrence that
+was sent. Existing callback buttons pass the Telegram message ID and are accepted
+only for a still-pending row whose canonical occurrence is the same occurrence;
+stale or duplicate callbacks are otherwise no-ops. Full acknowledgement/action
+UX remains outside Issue #9.
+
+## Migration and pre-lease rows
+
+Migration `20260907_0004` adds lease/retry columns and due/retry/lease indexes.
+Existing `attempt_count` values are backfilled to zero. Existing rows in the old
+token-less `processing` state are deterministically reset to `pending` with
+cleared lease fields, preserving their canonical delivery time and retry count.
+The old worker must be stopped while this migration runs; this prevents a
+pre-migration worker without a token from finalizing a row that the new worker
+has reclaimed. After deployment, no manual SQL edit is required for recovery.
+
+## Shutdown and observability
+
+The worker accepts an `asyncio.Event` stop signal. `SIGINT` and `SIGTERM` set the
+signal in the worker process. Once set, no new batch is claimed; an item already
+being sent is allowed to finish within the configured send timeout, while other
+claimed rows retain a bounded lease and are recoverable after restart. Task
+cancellation also leaves active rows lease-recoverable.
+
+The worker exposes in-process counters for claimed, recovered, retried, delivered,
+failed, and expired leases, plus a processing-age gauge. Structured logs include
+only reminder ID, attempt, state/error classification, counts, and processing age.

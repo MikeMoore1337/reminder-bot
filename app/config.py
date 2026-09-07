@@ -19,8 +19,13 @@ class Settings(BaseSettings):
     webhook_path: str = "/telegram/webhook"
     webhook_secret_token: str | None = None
 
-    worker_batch_size: int = 100
-    worker_poll_interval_seconds: int = 2
+    worker_batch_size: int = Field(default=100, ge=1, le=1000)
+    worker_poll_interval_seconds: float = Field(default=2.0, gt=0, le=3600)
+    worker_lease_duration_seconds: int = Field(default=60, ge=1, le=86400)
+    worker_send_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    worker_retry_base_seconds: int = Field(default=10, ge=1, le=3600)
+    worker_retry_max_seconds: int = Field(default=300, ge=1, le=86400)
+    worker_max_attempts: int = Field(default=3, ge=1, le=20)
     admin_ids_raw: str = Field(
         default="",
         validation_alias=AliasChoices("ADMIN_IDS", "ADMIN_IDS_RAW"),
