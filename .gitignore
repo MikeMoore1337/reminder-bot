@@ -50,6 +50,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
 cover/
 
 # Translations
@@ -61,6 +62,11 @@ cover/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.log
 
 # Flask stuff:
 instance/
@@ -161,3 +167,14 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
+
+# Local test and runtime artifacts
+test-results/
+test-artifacts/
+audio/
+media/
+stt-models/
+*.wav
+*.mp3
+*.ogg
+*.flac

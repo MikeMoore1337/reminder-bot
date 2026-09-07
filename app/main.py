@@ -30,7 +30,7 @@ async def run_polling() -> None:
         logger.info("Bot application stopped")
 
 
-async def run_webhook() -> None:
+async def run_webhook(stop_event: asyncio.Event | None = None) -> None:
     logger.info(
         "Starting bot application in webhook mode",
         extra={
@@ -62,8 +62,11 @@ async def run_webhook() -> None:
     try:
         await site.start()
         logger.info("Webhook server started")
-        while True:
-            await asyncio.sleep(3600)
+        if stop_event is None:
+            while True:
+                await asyncio.sleep(3600)
+        else:
+            await stop_event.wait()
     finally:
         await bot.delete_webhook(drop_pending_updates=False)
         await runner.cleanup()

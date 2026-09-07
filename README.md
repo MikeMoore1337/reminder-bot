@@ -116,6 +116,15 @@ DEFAULT_TIMEZONE=Europe/Moscow
 POLLING_ALLOWED_UPDATES=message,edited_message,callback_query  
 ADMIN_IDS=123456789  
 
+Для локальной разработки установи dev lock без production-секретов:
+
+```bash
+python -m venv .venv
+python -m pip install -r requirements-dev.txt
+```
+
+Production Docker image устанавливает только `requirements.txt`.
+
 ---
 
 ### 3. Запуск
@@ -154,6 +163,50 @@ docker compose up -d
 - пользователю показывается локальное время  
 - повторения обновляются без создания новых записей  
 - worker обрабатывает задачи через БД  
+- `/healthz` — liveness процесса и не зависит от PostgreSQL
+- `/readyz` — bounded PostgreSQL readiness: `200` при `SELECT 1`, `503` при недоступной БД
+
+## 🔒 Зависимости и lockfiles
+
+`pyproject.toml` — canonical source прямых runtime-зависимостей и `dev` extra. Для обновления
+lockfiles используется `pip-tools`; `requirements.in` не нужен и не дублирует `pyproject.toml`:
+
+```bash
+python -m pip install --upgrade pip-tools
+pip-compile --index-url https://pypi.org/simple --no-emit-index-url --strip-extras --output-file requirements.txt pyproject.toml
+pip-compile --index-url https://pypi.org/simple --no-emit-index-url --strip-extras --extra dev --output-file requirements-dev.txt pyproject.toml
+```
+
+В рамках этого baseline оставлен `pip-tools`, а не `uv`: текущий pip/Docker workflow уже работает,
+и compiled runtime/dev lockfiles дают воспроизводимость с меньшим migration risk. Переход на uv
+возможен отдельной задачей только при измеримой выгоде.
+
+## ✅ Проверки и CI
+
+GitHub Actions запускается для PR в `master` и push в `master` и содержит стабильные jobs:
+
+- `quality` — Python 3.12, dev lock, Ruff check/format и mypy;
+- `tests-postgres` — Python 3.12, PostgreSQL 16 service, полный pytest, миграционный upgrade/
+  downgrade/re-upgrade и PostgreSQL concurrency tests;
+- `docker-smoke` — production image build, Compose config/migration validation и проверка
+  отсутствия dev tools в runtime image без Telegram API.
+
+Lock freshness проверяется пересборкой обоих lockfiles и `git diff --exit-code`. CI не использует
+production secrets или production database.
+
+## 🗃️ Миграции и merge policy
+
+Проверить цепочку локально:
+
+```bash
+alembic heads
+alembic history
+alembic upgrade head
+```
+
+После Issue #13 self-merge допускается только для внешне одобренного exact head при зелёных
+`quality`, `tests-postgres` и `docker-smoke`, mergeable PR и отсутствии blocking review. Auto-merge
+предпочтителен, если branch rules и exact-head guards сохранены.
 
 ---
 

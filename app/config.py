@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     webhook_base_url: str | None = None
     webhook_path: str = "/telegram/webhook"
     webhook_secret_token: str | None = None
+    readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
 
     worker_batch_size: int = Field(default=100, ge=1, le=1000)
     worker_poll_interval_seconds: float = Field(default=2.0, gt=0, le=3600)
