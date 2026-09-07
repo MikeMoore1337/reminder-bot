@@ -10,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy-production.yml"
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy_production.sh"
+DOCKERIGNORE = ROOT / ".dockerignore"
 
 
 def _run(
@@ -63,11 +64,36 @@ def test_production_workflow_is_fail_closed_and_disabled_by_default() -> None:
     assert "DEPLOY_ENABLED == 'false'" not in workflow
 
 
+def test_docker_context_excludes_gitignored_runtime_artifacts() -> None:
+    dockerignore = DOCKERIGNORE.read_text(encoding="utf-8")
+
+    for pattern in (
+        ".env",
+        ".idea/",
+        ".ruff_cache/",
+        "*.sqlite",
+        "*.sqlite3",
+        "*.db",
+        "*.db-journal",
+        "test-results/",
+        "test-artifacts/",
+        "audio/",
+        "media/",
+        "stt-models/",
+        "*.wav",
+        "*.mp3",
+        "*.ogg",
+        "*.flac",
+    ):
+        assert pattern in dockerignore
+
+
 def test_remote_deploy_script_excludes_destructive_shortcuts() -> None:
     script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
     required_fragments = (
         "git status --porcelain --untracked-files=all",
+        "assert_current_master()",
         "git fetch --no-tags --prune origin master",
         'origin_master_sha="$(git rev-parse origin/master)"',
         "git checkout --detach --quiet",
@@ -82,6 +108,9 @@ def test_remote_deploy_script_excludes_destructive_shortcuts() -> None:
     )
     for fragment in required_fragments:
         assert fragment in script
+
+    # Initial guard plus rechecks before live service/migration/application changes.
+    assert script.count("assert_current_master") >= 5
 
     forbidden_fragments = (
         "docker compose down",
@@ -135,6 +164,12 @@ def test_remote_deploy_script_rejects_dirty_and_stale_state_and_runs_exact_sha(
         """#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' \"$*\" >> \"${DOCKER_CALLS}\"
+if [[ \"${ADVANCE_ORIGIN_ON_BUILD:-0}\" == \"1\" && \"${1:-}\" == \"compose\" && \"${2:-}\" == \"build\" ]]; then
+  printf 'version-2\\n' > \"${ADVANCE_SEED}/tracked.txt\"
+  git -C \"${ADVANCE_SEED}\" add tracked.txt
+  git -C \"${ADVANCE_SEED}\" commit -m 'advance master during build' >/dev/null
+  git -C \"${ADVANCE_SEED}\" push origin master >/dev/null
+fi
 if [[ \"${1:-}\" == \"compose\" && \"${2:-}\" == \"ps\" && \"${3:-}\" == \"-q\" && \"${4:-}\" == \"worker\" ]]; then
   printf 'fake-worker-id\\n'
 fi
@@ -173,6 +208,24 @@ fi
         next_cursor = calls.find(command, cursor + 1)
         assert next_cursor > cursor, calls
         cursor = next_cursor
+
+    # Advance master from inside the fake image build. The post-build master
+    # recheck must reject the stale SHA before touching live Compose services.
+    docker_calls.write_text("", encoding="utf-8")
+    race_env = env.copy()
+    race_env["ADVANCE_ORIGIN_ON_BUILD"] = "1"
+    race_env["ADVANCE_SEED"] = str(seed)
+    raced = _run(
+        ["bash", str(DEPLOY_SCRIPT), str(app), exact_sha],
+        env=race_env,
+        check=False,
+    )
+    assert raced.returncode != 0
+    assert "stale deploy target" in raced.stderr
+    race_calls = docker_calls.read_text(encoding="utf-8")
+    assert "compose build" in race_calls
+    assert "compose up -d db" not in race_calls
+    assert "compose --profile tools run --rm migrate" not in race_calls
 
     docker_calls.write_text("", encoding="utf-8")
     stale = _run(
