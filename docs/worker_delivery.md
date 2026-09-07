@@ -75,15 +75,18 @@ Database transitions are idempotent and ownership-guarded:
 was sent. One-off successful deliveries retain the latest message identity while
 in `sent`, so Snooze and Delete callbacks are accepted only for the owning user,
 the expected Telegram message ID, and that exact occurrence. Snooze atomically
-clears the consumed identity and reschedules the one-off reminder; Delete removes
-it. Repeated or stale callbacks therefore become no-ops. Recurring deliveries
-expose Delete only: the latest delivered message identity can safely cancel the
-whole recurring reminder after canonical advancement, while occurrence-scoped
-recurring Snooze remains outside Issue #9 and is intentionally not shown.
+clears the consumed identity and reschedules the one-off reminder; Delete records
+cancellation rather than removing the row. Repeated or stale callbacks therefore
+become no-ops. Recurring deliveries may expose occurrence actions: Done is
+occurrence-scoped, while Delete cancels the series. A recurring Snooze creates
+one linked one-off child for the exact source occurrence, leaving the canonical
+series and its worker lease untouched.
 
 ## Migration and pre-lease rows
 
-Migration `20260907_0004` adds lease/retry columns and due/retry/lease indexes.
+Migration `20260907_0004` adds lease/retry columns and due/retry/lease indexes;
+`20260907_0005` adds persisted user-facing states, occurrence identities, and
+restart-safe action drafts.
 Existing `attempt_count` values are backfilled from the existing `retry_count`
 budget. Existing rows in the old token-less `processing` state are then
 deterministically reset to `pending` with cleared lease fields, preserving their

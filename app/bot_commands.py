@@ -14,7 +14,7 @@ PUBLIC_COMMANDS = [
     BotCommand(command="mytimezone", description="Показать мой часовой пояс"),
     BotCommand(command="remind", description="Создать напоминание"),
     BotCommand(command="list", description="Мои активные напоминания"),
-    BotCommand(command="cancel", description="Удалить напоминание по ID"),
+    BotCommand(command="cancel", description="Удалить напоминание или отменить действие"),
 ]
 
 ADMIN_COMMANDS = [
@@ -24,7 +24,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="mytimezone", description="Показать мой часовой пояс"),
     BotCommand(command="remind", description="Создать напоминание"),
     BotCommand(command="list", description="Мои активные напоминания"),
-    BotCommand(command="cancel", description="Удалить напоминание по ID"),
+    BotCommand(command="cancel", description="Удалить напоминание или отменить действие"),
     BotCommand(command="stats", description="Статистика бота"),
     BotCommand(command="failed", description="Ошибки отправки"),
 ]

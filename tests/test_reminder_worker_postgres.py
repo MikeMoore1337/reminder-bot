@@ -4,11 +4,18 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.base import Base
-from app.db.models import RecurrenceType, Reminder, User
+from app.db.models import (
+    OccurrenceState,
+    RecurrenceType,
+    Reminder,
+    ReminderOccurrence,
+    ReminderState,
+    User,
+)
 from app.services import reminder_service
 from app.workers import reminder_worker as worker
 
@@ -143,6 +150,121 @@ def test_postgres_workers_cannot_claim_one_occurrence_concurrently(monkeypatch) 
     asyncio.run(_with_postgres(monkeypatch, scenario))
 
 
+def test_postgres_double_done_acknowledges_one_delivery(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
+        reminder_id = await _insert_reminder(session_factory, now)
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            assert reminder is not None
+            reminder.status = "sent"
+            reminder.state = ReminderState.DELIVERED.value
+            reminder.action_revision = 5
+            reminder.last_message_id = 7101
+            reminder.last_delivery_occurrence_utc = now
+            occurrence = ReminderOccurrence(
+                reminder_id=reminder_id,
+                occurrence_at_utc=now,
+                delivery_at_utc=now,
+                status=OccurrenceState.DELIVERED.value,
+                action_revision=5,
+                message_id=7101,
+                delivered_at=now,
+            )
+            session.add(occurrence)
+            user = await session.get(User, reminder.user_id)
+            assert user is not None
+            await session.commit()
+
+        results = await asyncio.gather(
+            reminder_service.complete_reminder(
+                user,
+                reminder_id,
+                expected_revision=5,
+                expected_occurrence_id=occurrence.id,
+                expected_message_id=7101,
+            ),
+            reminder_service.complete_reminder(
+                user,
+                reminder_id,
+                expected_revision=5,
+                expected_occurrence_id=occurrence.id,
+                expected_message_id=7101,
+            ),
+        )
+
+        assert sorted(results) == [False, True]
+        saved = await _get_reminder(session_factory, reminder_id)
+        assert saved.state == ReminderState.COMPLETED.value
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
+
+
+def test_postgres_double_recurring_snooze_creates_one_child(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
+        source_at = now - timedelta(hours=1)
+        reminder_id = await _insert_reminder(
+            session_factory,
+            now + timedelta(hours=1),
+            recurrence_type=RecurrenceType.HOURLY.value,
+        )
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            assert reminder is not None
+            reminder.action_revision = 4
+            reminder.last_message_id = 7201
+            reminder.last_delivery_occurrence_utc = source_at
+            occurrence = ReminderOccurrence(
+                reminder_id=reminder_id,
+                occurrence_at_utc=source_at,
+                delivery_at_utc=source_at,
+                status=OccurrenceState.DELIVERED.value,
+                action_revision=4,
+                message_id=7201,
+                delivered_at=now,
+            )
+            session.add(occurrence)
+            user = await session.get(User, reminder.user_id)
+            assert user is not None
+            await session.commit()
+
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: now)
+        target = now + timedelta(minutes=20)
+        results = await asyncio.gather(
+            reminder_service.snooze_reminder(
+                user,
+                reminder_id,
+                expected_revision=4,
+                expected_occurrence_id=occurrence.id,
+                expected_message_id=7201,
+                target_at_utc=target,
+            ),
+            reminder_service.snooze_reminder(
+                user,
+                reminder_id,
+                expected_revision=4,
+                expected_occurrence_id=occurrence.id,
+                expected_message_id=7201,
+                target_at_utc=target,
+            ),
+        )
+
+        assert sorted(result is not None for result in results) == [False, True]
+        async with session_factory() as session:
+            children = list(
+                (
+                    await session.scalars(
+                        select(Reminder).where(Reminder.parent_reminder_id == reminder_id)
+                    )
+                ).all()
+            )
+            assert len(children) == 1
+            assert children[0].state == ReminderState.SNOOZED.value
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
+
+
 def test_postgres_expired_lease_recovery_rejects_stale_owner(monkeypatch) -> None:
     async def scenario(session_factory) -> None:
         now = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
@@ -232,7 +354,10 @@ def test_postgres_duplicate_callback_cancel_is_idempotent(monkeypatch) -> None:
 
         assert sorted(results) == [False, True]
         async with session_factory() as session:
-            assert await session.get(Reminder, reminder_id) is None
+            saved = await session.get(Reminder, reminder_id)
+            assert saved is not None
+            assert saved.state == "cancelled"
+            assert saved.status == "sent"
 
     asyncio.run(_with_postgres(monkeypatch, scenario))
 

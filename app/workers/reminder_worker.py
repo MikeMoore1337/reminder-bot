@@ -22,10 +22,22 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 
+from app.callbacks import CallbackAction, CallbackTarget, encode_callback
 from app.config import get_settings
-from app.db.models import RecurrenceType, Reminder
+from app.db.models import (
+    OccurrenceState,
+    RecurrenceType,
+    Reminder,
+    ReminderOccurrence,
+    ReminderState,
+)
 from app.db.session import SessionLocal
-from app.services.reminder_service import advance_occurrence_until_future, set_last_message_id
+from app.services.reminder_service import (
+    advance_occurrence_until_future,
+    delivery_at_utc,
+    prepare_delivery_occurrence,
+    set_last_message_id,
+)
 from app.utils.datetime_utils import utc_now
 
 logger = logging.getLogger(__name__)
@@ -72,19 +84,113 @@ worker_metrics = WorkerMetrics()
 def reminder_actions_kb(
     reminder_id: int,
     *,
+    occurrence_id: int | None = None,
+    revision: int = 0,
+    state: str = ReminderState.DELIVERED.value,
+    recurrence_type: str = RecurrenceType.NONE.value,
     include_snooze: bool = True,
 ) -> InlineKeyboardMarkup:
-    buttons = []
-    if include_snooze:
-        buttons.append(
-            InlineKeyboardButton(
-                text="Отложить на 10 минут", callback_data=f"reminder:snooze:{reminder_id}"
-            )
+    # Keep the old helper call useful for callers that only want a compact
+    # cancellation button. Real delivery cards always pass an occurrence id.
+    if occurrence_id is None and not include_snooze and state == ReminderState.DELIVERED.value:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Удалить",
+                        callback_data=encode_callback(
+                            CallbackAction.DELETE,
+                            CallbackTarget.REMINDER,
+                            reminder_id,
+                            revision,
+                        ),
+                    )
+                ]
+            ]
         )
-    buttons.append(
-        InlineKeyboardButton(text="Удалить", callback_data=f"reminder:delete:{reminder_id}")
+
+    target = CallbackTarget.OCCURRENCE if occurrence_id is not None else CallbackTarget.REMINDER
+    target_id = occurrence_id or reminder_id
+
+    def button(text: str, action: CallbackAction) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            text=text,
+            callback_data=encode_callback(action, target, target_id, revision),
+        )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if state == ReminderState.DELIVERED.value:
+        rows.append([button("✅ Готово", CallbackAction.DONE)])
+        if include_snooze:
+            rows.append([button("⏰ Отложить", CallbackAction.SNOOZE)])
+        rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
+        if recurrence_type != RecurrenceType.NONE.value:
+            rows.append([button("⏸ Пауза", CallbackAction.PAUSE)])
+        rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
+    elif state == ReminderState.PAUSED.value:
+        rows.append([button("▶️ Продолжить", CallbackAction.RESUME)])
+        rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
+        rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
+    elif state in {ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value}:
+        if include_snooze:
+            rows.append([button("⏰ Отложить", CallbackAction.SNOOZE)])
+        rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
+        if recurrence_type != RecurrenceType.NONE.value:
+            rows.append([button("⏸ Пауза", CallbackAction.PAUSE)])
+        rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
+    else:
+        rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def snooze_presets_kb(
+    reminder_id: int,
+    *,
+    occurrence_id: int | None,
+    revision: int,
+) -> InlineKeyboardMarkup:
+    target = CallbackTarget.OCCURRENCE if occurrence_id is not None else CallbackTarget.REMINDER
+    target_id = occurrence_id or reminder_id
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="10 минут",
+                    callback_data=encode_callback(
+                        CallbackAction.SNOOZE_10, target, target_id, revision
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="1 час",
+                    callback_data=encode_callback(
+                        CallbackAction.SNOOZE_1H, target, target_id, revision
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Вечером",
+                    callback_data=encode_callback(
+                        CallbackAction.SNOOZE_EVENING, target, target_id, revision
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="Завтра",
+                    callback_data=encode_callback(
+                        CallbackAction.SNOOZE_TOMORROW, target, target_id, revision
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Своё время",
+                    callback_data=encode_callback(
+                        CallbackAction.SNOOZE_CUSTOM, target, target_id, revision
+                    ),
+                )
+            ],
+        ]
     )
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 def classify_delivery_error(exc: BaseException) -> DeliveryFailure:
@@ -184,11 +290,13 @@ async def claim_due_reminders(
     delivery_at = func.coalesce(Reminder.delivery_at_utc, Reminder.remind_at_utc)
     pending_due = and_(
         Reminder.status == "pending",
+        Reminder.state.in_((ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value)),
         delivery_at <= current_time,
         or_(Reminder.next_retry_at.is_(None), Reminder.next_retry_at <= current_time),
     )
     recoverable_processing = and_(
         Reminder.status == "processing",
+        Reminder.state.in_((ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value)),
         or_(Reminder.lease_until.is_(None), Reminder.lease_until <= current_time),
     )
 
@@ -210,9 +318,34 @@ async def claim_due_reminders(
         candidates = list(result.scalars().all())
 
         for reminder in candidates:
+            if (
+                reminder.parent_reminder_id is not None
+                and reminder.source_occurrence_at_utc is not None
+            ):
+                source = await session.scalar(
+                    select(ReminderOccurrence)
+                    .where(
+                        ReminderOccurrence.reminder_id == reminder.parent_reminder_id,
+                        ReminderOccurrence.occurrence_at_utc == reminder.source_occurrence_at_utc,
+                    )
+                    .with_for_update()
+                )
+                if source is not None and source.status in {
+                    OccurrenceState.COMPLETED.value,
+                    OccurrenceState.CANCELLED.value,
+                }:
+                    reminder.status = "sent"
+                    reminder.state = ReminderState.CANCELLED.value
+                    reminder.cancelled_at = current_time
+                    reminder.action_revision += 1
+                    reminder.delivery_at_utc = None
+                    reminder.snoozed_until_utc = None
+                    continue
+
             was_recovery = reminder.status == "processing"
             if reminder.attempt_count >= settings.worker_max_attempts:
                 reminder.status = "failed"
+                reminder.state = ReminderState.FAILED.value
                 reminder.retry_count = max(reminder.retry_count, reminder.attempt_count)
                 reminder.error_text = "delivery attempt limit exhausted"
                 reminder.last_message_id = None
@@ -238,6 +371,7 @@ async def claim_due_reminders(
             reminder.next_retry_at = None
             reminder.last_message_id = None
             reminder.last_delivery_occurrence_utc = None
+            reminder.action_revision += 1
             reminder.attempt_count += 1
             claimed.append(reminder)
 
@@ -306,6 +440,9 @@ async def renew_claim_before_send(
                 .where(
                     Reminder.id == reminder_id,
                     Reminder.status == "processing",
+                    Reminder.state.in_(
+                        (ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value)
+                    ),
                     Reminder.lease_token == lease_token,
                     Reminder.lease_until > current_time,
                 )
@@ -331,6 +468,7 @@ async def finalize_delivery_success(
             .where(
                 Reminder.id == reminder_id,
                 Reminder.status == "processing",
+                Reminder.state.in_((ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value)),
                 Reminder.lease_token == lease_token,
                 Reminder.lease_until > current_time,
             )
@@ -341,6 +479,30 @@ async def finalize_delivery_success(
             return False
 
         current_occurrence = reminder.remind_at_utc
+        occurrence = await session.scalar(
+            select(ReminderOccurrence)
+            .where(
+                ReminderOccurrence.reminder_id == reminder.id,
+                ReminderOccurrence.occurrence_at_utc == current_occurrence,
+            )
+            .with_for_update()
+        )
+        if occurrence is None:
+            occurrence = ReminderOccurrence(
+                reminder_id=reminder.id,
+                occurrence_at_utc=current_occurrence,
+                delivery_at_utc=delivery_at_utc(reminder),
+                status=OccurrenceState.DELIVERED.value,
+                action_revision=reminder.action_revision,
+                message_id=reminder.last_message_id,
+                delivered_at=current_time,
+            )
+            session.add(occurrence)
+        else:
+            occurrence.status = OccurrenceState.DELIVERED.value
+            occurrence.action_revision = reminder.action_revision
+            occurrence.delivered_at = current_time
+            occurrence.snoozed_until_utc = None
         reminder.sent_at = current_time
         reminder.error_text = None
         reminder.retry_count = 0
@@ -350,6 +512,7 @@ async def finalize_delivery_success(
 
         if reminder.recurrence_type == RecurrenceType.NONE.value:
             reminder.status = "sent"
+            reminder.state = ReminderState.DELIVERED.value
             reminder.delivery_at_utc = None
             reminder.snoozed_until_utc = None
             _clear_processing_state(reminder)
@@ -365,6 +528,7 @@ async def finalize_delivery_success(
         )
         if next_occurrence is None:
             reminder.status = "sent"
+            reminder.state = ReminderState.DELIVERED.value
             reminder.delivery_at_utc = None
             reminder.snoozed_until_utc = None
             _clear_processing_state(reminder)
@@ -374,6 +538,7 @@ async def finalize_delivery_success(
         reminder.delivery_at_utc = next_occurrence
         reminder.snoozed_until_utc = None
         reminder.status = "pending"
+        reminder.state = ReminderState.SCHEDULED.value
         _clear_processing_state(reminder)
         return True
 
@@ -397,6 +562,7 @@ async def finalize_delivery_failure(
             .where(
                 Reminder.id == reminder_id,
                 Reminder.status == "processing",
+                Reminder.state.in_((ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value)),
                 Reminder.lease_token == lease_token,
                 Reminder.lease_until > current_time,
             )
@@ -415,8 +581,29 @@ async def finalize_delivery_failure(
             failure.kind == DeliveryErrorKind.TERMINAL
             or reminder.attempt_count >= settings.worker_max_attempts
         )
+        occurrence = await session.scalar(
+            select(ReminderOccurrence)
+            .where(
+                ReminderOccurrence.reminder_id == reminder.id,
+                ReminderOccurrence.occurrence_at_utc == reminder.remind_at_utc,
+            )
+            .with_for_update()
+        )
+        if occurrence is None:
+            occurrence = ReminderOccurrence(
+                reminder_id=reminder.id,
+                occurrence_at_utc=reminder.remind_at_utc,
+                delivery_at_utc=delivery_at_utc(reminder),
+                status=OccurrenceState.FAILED.value,
+                action_revision=reminder.action_revision,
+            )
+            session.add(occurrence)
+        else:
+            occurrence.status = OccurrenceState.FAILED.value
+            occurrence.message_id = None
         if terminal:
             reminder.status = "failed"
+            reminder.state = ReminderState.FAILED.value
         else:
             delay = retry_delay_seconds(
                 reminder.retry_count,
@@ -425,6 +612,7 @@ async def finalize_delivery_failure(
                 retry_after_seconds=failure.retry_after_seconds,
             )
             reminder.status = "pending"
+            reminder.state = ReminderState.SCHEDULED.value
             reminder.next_retry_at = current_time + timedelta(seconds=delay)
             retried = True
 
@@ -506,6 +694,17 @@ async def process_claimed_reminder(
             extra={"extra_data": f"reminder_id={reminder.id}"},
         )
         return False
+    occurrence_id = await prepare_delivery_occurrence(
+        reminder.id,
+        lease_token,
+        now_utc=utc_now(),
+    )
+    if occurrence_id is None:
+        logger.info(
+            "Skipped delivery because occurrence ownership is stale",
+            extra={"extra_data": f"reminder_id={reminder.id}"},
+        )
+        return False
     if stop_event is not None and stop_event.is_set():
         return False
 
@@ -517,7 +716,11 @@ async def process_claimed_reminder(
                 text=f"⏰ Напоминание\n\n{escape(reminder.text)}",
                 reply_markup=reminder_actions_kb(
                     reminder.id,
-                    include_snooze=reminder.recurrence_type == RecurrenceType.NONE.value,
+                    occurrence_id=occurrence_id,
+                    revision=reminder.action_revision,
+                    state=ReminderState.DELIVERED.value,
+                    recurrence_type=reminder.recurrence_type,
+                    include_snooze=True,
                 ),
             ),
             timeout=settings.worker_send_timeout_seconds,

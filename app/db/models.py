@@ -3,7 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -16,6 +26,27 @@ class RecurrenceType(StrEnum):
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
+
+
+class ReminderState(StrEnum):
+    """User-facing state; ``Reminder.status`` remains the worker lifecycle."""
+
+    SCHEDULED = "scheduled"
+    DELIVERED = "delivered"
+    COMPLETED = "completed"
+    SNOOZED = "snoozed"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class OccurrenceState(StrEnum):
+    PROCESSING = "processing"
+    DELIVERED = "delivered"
+    COMPLETED = "completed"
+    SNOOZED = "snoozed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 class User(Base):
@@ -40,6 +71,9 @@ class User(Base):
     reminders: Mapped[list[Reminder]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    action_drafts: Mapped[list[ActionDraft]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Reminder(Base):
@@ -53,6 +87,13 @@ class Reminder(Base):
             "ix_reminders_status_processing_started_at",
             "status",
             "processing_started_at",
+        ),
+        Index("ix_reminders_state_delivery_at_utc", "state", "delivery_at_utc"),
+        Index(
+            "uq_reminders_parent_source_occurrence",
+            "parent_reminder_id",
+            "source_occurrence_at_utc",
+            unique=True,
         ),
     )
 
@@ -93,5 +134,112 @@ class Reminder(Base):
     last_delivery_occurrence_utc: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    state: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=ReminderState.SCHEDULED.value
+    )
+    action_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    parent_reminder_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    source_occurrence_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     user: Mapped[User] = relationship(back_populates="reminders")
+    parent_reminder: Mapped[Reminder | None] = relationship(
+        "Reminder",
+        remote_side="Reminder.id",
+        back_populates="snooze_children",
+        foreign_keys=[parent_reminder_id],
+    )
+    snooze_children: Mapped[list[Reminder]] = relationship(
+        "Reminder",
+        back_populates="parent_reminder",
+        foreign_keys=[parent_reminder_id],
+    )
+    occurrences: Mapped[list[ReminderOccurrence]] = relationship(
+        back_populates="reminder", cascade="all, delete-orphan"
+    )
+
+
+class ReminderOccurrence(Base):
+    """Persisted identity for one canonical occurrence and its deliveries."""
+
+    __tablename__ = "reminder_occurrences"
+    __table_args__ = (
+        UniqueConstraint(
+            "reminder_id",
+            "occurrence_at_utc",
+            name="uq_reminder_occurrences_reminder_occurrence",
+        ),
+        Index("ix_reminder_occurrences_reminder_status", "reminder_id", "status"),
+        Index("ix_reminder_occurrences_status_delivery_at", "status", "delivery_at_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    occurrence_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    delivery_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=OccurrenceState.PROCESSING.value
+    )
+    action_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    snoozed_until_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    reminder: Mapped[Reminder] = relationship(back_populates="occurrences")
+
+
+class ActionDraft(Base):
+    """Small restart-safe state holder for Edit and Custom Snooze flows."""
+
+    __tablename__ = "action_drafts"
+    __table_args__ = (
+        Index("ix_action_drafts_owner_chat_type", "user_id", "chat_id", "action_type"),
+        Index("ix_action_drafts_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    action_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    expected_action_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_occurrence_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reminder_occurrences.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    expected_occurrence_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expected_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    current_step: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    user: Mapped[User] = relationship(back_populates="action_drafts")
+    reminder: Mapped[Reminder] = relationship()
