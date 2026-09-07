@@ -22,16 +22,22 @@ command -v docker >/dev/null 2>&1 || fail "docker is required"
 
 cd "${repo_dir}"
 
-# Ignored files such as .env are allowed, but any tracked or ordinary untracked
-# worktree change can alter the Docker build context and therefore fails closed.
+# Ignored production .env is allowed. Other ignored local/runtime artifacts are
+# excluded from Docker context by .dockerignore; ordinary untracked or tracked
+# worktree changes still fail closed here.
 if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
   fail "production repository has local worktree changes"
 fi
 
-git fetch --no-tags --prune origin master
-origin_master_sha="$(git rev-parse origin/master)"
-[[ "${origin_master_sha}" == "${expected_sha}" ]] || fail \
-  "stale deploy target: origin/master=${origin_master_sha}, expected=${expected_sha}"
+assert_current_master() {
+  git fetch --no-tags --prune origin master
+  local origin_master_sha
+  origin_master_sha="$(git rev-parse origin/master)"
+  [[ "${origin_master_sha}" == "${expected_sha}" ]] || fail \
+    "stale deploy target: origin/master=${origin_master_sha}, expected=${expected_sha}"
+}
+
+assert_current_master
 
 git cat-file -e "${expected_sha}^{commit}" 2>/dev/null || fail "expected commit is unavailable"
 git checkout --detach --quiet "${expected_sha}"
@@ -43,12 +49,22 @@ docker compose config --quiet
 
 docker compose build
 
+# Building is side-effect-free for the running application. Re-fetch immediately
+# before touching live Compose services so a target made stale while building is
+# rejected before database/application mutation.
+assert_current_master
 docker compose up -d db
+
+# Tighten the stale-target boundary again immediately before the DB migration.
+assert_current_master
 
 # Migration must succeed before bot/worker rollout. No destructive downgrade,
 # volume removal, or compose-wide shutdown is performed here.
 docker compose --profile tools run --rm migrate
 
+# If master advanced while migration was running, do not replace application
+# containers with a now-stale build; the newer master deployment will follow.
+assert_current_master
 docker compose up -d bot worker
 
 # /readyz is intentionally stronger than the container liveness check: it
