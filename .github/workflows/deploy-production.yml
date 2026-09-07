@@ -1,0 +1,172 @@
+name: Deploy production
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: reminder-bot-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy-production
+    if: >-
+      ${{
+        vars.DEPLOY_ENABLED == 'true' &&
+        (
+          (
+            github.event_name == 'workflow_run' &&
+            github.event.workflow_run.event == 'push' &&
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'master'
+          ) ||
+          (
+            github.event_name == 'workflow_dispatch' &&
+            github.ref == 'refs/heads/master'
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Resolve exact deploy SHA
+        id: target
+        shell: bash
+        env:
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            target_sha="${WORKFLOW_RUN_SHA}"
+          else
+            target_sha="${DISPATCH_SHA}"
+          fi
+          if [[ ! "${target_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid deploy SHA" >&2
+            exit 1
+          fi
+          echo "sha=${target_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out exact deploy SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reject stale master target
+        shell: bash
+        env:
+          DEPLOY_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          current_master_sha="$(git rev-parse origin/master)"
+          if [[ "${current_master_sha}" != "${DEPLOY_SHA}" ]]; then
+            echo "Refusing stale deploy: origin/master=${current_master_sha}, target=${DEPLOY_SHA}" >&2
+            exit 1
+          fi
+
+      - name: Validate successful master CI
+        shell: bash
+        env:
+          DEPLOY_SHA: ${{ steps.target.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${DEPLOY_SHA}&event=push&status=success&per_page=10" \
+            > "${RUNNER_TEMP}/ci-runs.json"
+          python - "${RUNNER_TEMP}/ci-runs.json" "${DEPLOY_SHA}" <<'PY'
+          import json
+          import sys
+
+          path, expected_sha = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              payload = json.load(handle)
+          valid = any(
+              run.get("head_sha") == expected_sha
+              and run.get("head_branch") == "master"
+              and run.get("event") == "push"
+              and run.get("conclusion") == "success"
+              for run in payload.get("workflow_runs", [])
+          )
+          if not valid:
+              raise SystemExit("No successful master push CI found for exact deploy SHA")
+          PY
+          rm -f "${RUNNER_TEMP}/ci-runs.json"
+
+      - name: Validate production deployment configuration
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ vars.PROD_SSH_HOST }}
+          PROD_SSH_PORT: ${{ vars.PROD_SSH_PORT }}
+          PROD_SSH_USER: ${{ vars.PROD_SSH_USER }}
+          PROD_APP_DIR: ${{ vars.PROD_APP_DIR }}
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${PROD_SSH_HOST:?PROD_SSH_HOST is required}"
+          : "${PROD_SSH_PORT:?PROD_SSH_PORT is required}"
+          : "${PROD_SSH_USER:?PROD_SSH_USER is required}"
+          : "${PROD_APP_DIR:?PROD_APP_DIR is required}"
+          : "${PROD_SSH_PRIVATE_KEY:?PROD_SSH_PRIVATE_KEY is required}"
+          : "${PROD_SSH_KNOWN_HOSTS:?PROD_SSH_KNOWN_HOSTS is required}"
+          [[ "${PROD_SSH_PORT}" =~ ^[0-9]{1,5}$ ]] || { echo "Invalid SSH port" >&2; exit 1; }
+          (( PROD_SSH_PORT >= 1 && PROD_SSH_PORT <= 65535 )) || { echo "Invalid SSH port" >&2; exit 1; }
+          [[ "${PROD_SSH_USER}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || { echo "Invalid SSH user" >&2; exit 1; }
+          [[ "${PROD_APP_DIR}" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "Invalid PROD_APP_DIR" >&2; exit 1; }
+
+      - name: Configure pinned SSH trust
+        shell: bash
+        env:
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "${HOME}/.ssh"
+          printf '%s\n' "${PROD_SSH_PRIVATE_KEY}" > "${HOME}/.ssh/reminder_bot_deploy"
+          chmod 600 "${HOME}/.ssh/reminder_bot_deploy"
+          printf '%s\n' "${PROD_SSH_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/known_hosts"
+
+      - name: Deploy exact protected master SHA
+        shell: bash
+        env:
+          DEPLOY_SHA: ${{ steps.target.outputs.sha }}
+          PROD_SSH_HOST: ${{ vars.PROD_SSH_HOST }}
+          PROD_SSH_PORT: ${{ vars.PROD_SSH_PORT }}
+          PROD_SSH_USER: ${{ vars.PROD_SSH_USER }}
+          PROD_APP_DIR: ${{ vars.PROD_APP_DIR }}
+        run: |
+          set -euo pipefail
+          printf -v remote_command 'bash -s -- %q %q' "${PROD_APP_DIR}" "${DEPLOY_SHA}"
+          ssh \
+            -i "${HOME}/.ssh/reminder_bot_deploy" \
+            -p "${PROD_SSH_PORT}" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+            -o ConnectTimeout=10 \
+            "${PROD_SSH_USER}@${PROD_SSH_HOST}" \
+            "${remote_command}" \
+            < scripts/deploy_production.sh
+
+      - name: Remove ephemeral SSH material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f "${HOME}/.ssh/reminder_bot_deploy" "${HOME}/.ssh/known_hosts"
