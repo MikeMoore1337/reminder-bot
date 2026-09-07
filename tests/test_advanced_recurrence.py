@@ -282,13 +282,14 @@ def test_after_lunch_answer_creates_reminder_through_handler(monkeypatch) -> Non
 
 
 def test_weekly_interval_above_bound_returns_bounded_feedback() -> None:
-    result = parse_reminder_input(
-        "напомни каждые 53 недели по понедельникам в 09:00 отчёт",
-        MOSCOW_NOW,
-    )
+    for interval in (53, 999_999_999_999):
+        result = parse_reminder_input(
+            f"напомни каждые {interval} недели по понедельникам в 09:00 отчёт",
+            MOSCOW_NOW,
+        )
 
-    assert isinstance(result, ClarificationRequest)
-    assert "от 1 до 52" in result.prompt
+        assert isinstance(result, ClarificationRequest)
+        assert "от 1 до 52" in result.prompt
 
 
 def test_calendar_rules_handle_dst_month_end_and_leap_year() -> None:
@@ -655,6 +656,87 @@ def test_completion_relative_snooze_child_advances_parent_from_done(monkeypatch)
                 assert restored_parent.status == "pending"
                 assert restored_parent.remind_at_utc.replace(tzinfo=UTC) == expected_next
                 assert restored_child.state == ReminderState.COMPLETED.value
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_done_preserves_due_successor_from_post_worker_state(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
+            user = User(
+                telegram_user_id=507,
+                chat_id=607,
+                timezone="Europe/Moscow",
+            )
+            occurrence_a = to_utc(datetime(2026, 9, 14, 9, 0), user.timezone)
+            successor_b = to_utc(datetime(2026, 9, 21, 9, 0), user.timezone)
+            done_at = to_utc(datetime(2026, 9, 21, 10, 0), user.timezone)
+            rule = weekly_rule(
+                [0],
+                time(9),
+                anchor_week=date(2026, 9, 7),
+            )
+            async with session_factory() as session:
+                session.add(user)
+                await session.flush()
+                reminder = Reminder(
+                    user_id=user.id,
+                    chat_id=user.chat_id,
+                    text="post-worker report",
+                    # This is the worker's post-send state: B is already
+                    # persisted as the next target while A is still actionable.
+                    remind_at_utc=successor_b,
+                    delivery_at_utc=successor_b,
+                    schedule_timezone=user.timezone,
+                    status="pending",
+                    state=ReminderState.SCHEDULED.value,
+                    action_revision=4,
+                    recurrence_type="advanced",
+                    recurrence_interval=1,
+                    recurrence_rule=json.dumps(rule),
+                    last_message_id=82,
+                    last_delivery_occurrence_utc=occurrence_a,
+                )
+                session.add(reminder)
+                await session.flush()
+                occurrence = ReminderOccurrence(
+                    reminder_id=reminder.id,
+                    occurrence_at_utc=occurrence_a,
+                    delivery_at_utc=occurrence_a,
+                    status=OccurrenceState.DELIVERED.value,
+                    action_revision=4,
+                    message_id=82,
+                    delivered_at=occurrence_a,
+                )
+                session.add(occurrence)
+                await session.commit()
+                reminder_id = reminder.id
+                occurrence_id = occurrence.id
+
+            monkeypatch.setattr(reminder_service, "utc_now", lambda: done_at)
+            assert await reminder_service.complete_reminder(
+                user,
+                reminder_id,
+                expected_revision=4,
+                expected_occurrence_id=occurrence_id,
+                expected_message_id=82,
+            )
+
+            async with session_factory() as session:
+                restored = await session.get(Reminder, reminder_id)
+                assert restored is not None
+                assert restored.state == ReminderState.SCHEDULED.value
+                assert restored.status == "pending"
+                assert restored.remind_at_utc.replace(tzinfo=UTC) == successor_b
+                assert restored.delivery_at_utc.replace(tzinfo=UTC) == successor_b
+                assert restored.last_message_id is None
         finally:
             await engine.dispose()
 

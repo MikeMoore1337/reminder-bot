@@ -1280,13 +1280,16 @@ async def complete_reminder(
                     _reset_delivery_retry(reminder)
                     _clear_delivery_identity(reminder)
             else:
-                next_occurrence = advance_occurrence_until_future(
+                # The worker may already have persisted the immediate successor
+                # while keeping this delivered occurrence as the action target.
+                # Done acknowledges only this occurrence; it must not skip a
+                # successor that became due before the callback was handled.
+                next_occurrence = calculate_next_occurrence(
                     occurrence.occurrence_at_utc,
                     reminder.recurrence_type,
                     reminder.recurrence_interval,
                     timezone_name=reminder.schedule_timezone,
                     recurrence_day_of_month=reminder.recurrence_day_of_month,
-                    now_utc=now_utc,
                     recurrence_rule=recurrence_rule,
                 )
                 if next_occurrence is None:
