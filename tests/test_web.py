@@ -2,6 +2,8 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+from aiohttp import web
+
 import app.web as web_module
 
 
@@ -26,6 +28,43 @@ class _Session:
 
 def _response_body(response) -> dict[str, str]:
     return json.loads(response.text)
+
+
+def _route_paths(app) -> set[str]:
+    return {route.resource.canonical for route in app.router.routes()}
+
+
+def test_probe_app_contains_only_liveness_and_readiness_routes() -> None:
+    app = web_module.build_probe_app()
+
+    assert _route_paths(app) == {"/healthz", "/readyz"}
+
+
+def test_webhook_app_adds_telegram_route_to_probe_routes(monkeypatch) -> None:
+    class _WebhookHandler:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        def register(self, app, path: str) -> None:
+            async def handle(_request):
+                return web.Response()
+
+            app.router.add_post(path, handle)
+
+    monkeypatch.setattr(
+        web_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            webhook_secret_token="test-secret",
+            webhook_path="/telegram/webhook",
+        ),
+    )
+    monkeypatch.setattr(web_module, "SimpleRequestHandler", _WebhookHandler)
+    monkeypatch.setattr(web_module, "setup_application", lambda *args, **kwargs: None)
+
+    app = web_module.build_web_app(object(), object())
+
+    assert _route_paths(app) == {"/healthz", "/readyz", "/telegram/webhook"}
 
 
 def test_healthz_is_liveness_only(monkeypatch) -> None:

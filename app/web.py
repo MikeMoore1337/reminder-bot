@@ -35,11 +35,18 @@ async def readinesscheck(_: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-def build_web_app(bot: Bot, dispatcher: Dispatcher) -> web.Application:
-    settings = get_settings()
+def build_probe_app() -> web.Application:
+    """Build the liveness/readiness app shared by polling and webhook modes."""
+
     app = web.Application()
     app.router.add_get("/healthz", healthcheck)
     app.router.add_get("/readyz", readinesscheck)
+    return app
+
+
+def build_web_app(bot: Bot, dispatcher: Dispatcher) -> web.Application:
+    settings = get_settings()
+    app = build_probe_app()
 
     webhook_handler = SimpleRequestHandler(
         dispatcher=dispatcher,

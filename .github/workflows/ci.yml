@@ -131,6 +131,35 @@ jobs:
           import app.worker_main
           '
 
+      - name: Smoke polling probe server in runtime image
+        run: |
+          docker run --rm \
+            --env BOT_TOKEN=ci-test-token \
+            --env DATABASE_URL=postgresql+asyncpg://reminder_test:reminder_test@db:5432/reminder_test \
+            --entrypoint python reminder-bot:ci -c '
+          import asyncio
+          from aiohttp import ClientSession, web
+          from app.web import build_probe_app
+
+          async def main():
+              app = build_probe_app()
+              paths = {route.resource.canonical for route in app.router.routes()}
+              assert paths == {"/healthz", "/readyz"}, paths
+              runner = web.AppRunner(app)
+              await runner.setup()
+              site = web.TCPSite(runner, host="127.0.0.1", port=18080)
+              await site.start()
+              try:
+                  async with ClientSession() as session:
+                      async with session.get("http://127.0.0.1:18080/healthz") as response:
+                          assert response.status == 200
+              finally:
+                  await runner.cleanup()
+
+          asyncio.run(main())
+          print("POLLING_PROBE_SMOKE_OK")
+          '
+
       - name: Validate migration container command
         run: docker compose --profile tools run --rm --no-deps migrate alembic heads
 

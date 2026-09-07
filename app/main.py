@@ -10,7 +10,7 @@ from app.bot_commands import setup_bot_commands
 from app.bot_factory import create_bot, create_dispatcher
 from app.config import get_settings
 from app.logging_config import setup_logging
-from app.web import build_web_app
+from app.web import build_probe_app, build_web_app
 
 settings = get_settings()
 setup_logging(settings.log_level)
@@ -39,11 +39,23 @@ async def run_polling() -> None:
     bot = create_bot()
     dp = create_dispatcher()
 
-    await setup_bot_commands(bot)
+    runner: web.AppRunner | None = None
 
     try:
+        await setup_bot_commands(bot)
+
+        runner = web.AppRunner(build_probe_app())
+        await runner.setup()
+        site = web.TCPSite(runner, host=settings.app_host, port=settings.app_port)
+        await site.start()
+        logger.info(
+            "Probe server started",
+            extra={"extra_data": f"host={settings.app_host} port={settings.app_port}"},
+        )
         await dp.start_polling(bot, allowed_updates=settings.allowed_updates)
     finally:
+        if runner is not None:
+            await runner.cleanup()
         await bot.session.close()
         logger.info("Bot application stopped")
 

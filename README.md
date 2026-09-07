@@ -166,6 +166,9 @@ docker compose up -d
 - `/healthz` — liveness процесса и не зависит от PostgreSQL
 - `/readyz` — bounded PostgreSQL readiness: `200` при `SELECT 1`, `503` при недоступной БД
 
+Bot process слушает `APP_HOST:APP_PORT` в обоих режимах. В polling mode HTTP app содержит только
+`/healthz` и `/readyz`; в webhook mode к этим probe routes добавляется Telegram webhook route.
+
 ## 🔒 Зависимости и lockfiles
 
 `pyproject.toml` — canonical source прямых runtime-зависимостей и `dev` extra. Для обновления

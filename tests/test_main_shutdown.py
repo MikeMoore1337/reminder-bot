@@ -12,16 +12,19 @@ import app.main as main_module
 
 
 class _BotSession:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.closed = False
+        self.events = events
 
     async def close(self) -> None:
         self.closed = True
+        if self.events is not None:
+            self.events.append("bot.close")
 
 
 class _Bot:
-    def __init__(self) -> None:
-        self.session = _BotSession()
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.session = _BotSession(events)
         self.set_webhook_calls: list[dict[str, object]] = []
         self.delete_webhook_calls: list[dict[str, object]] = []
 
@@ -33,23 +36,31 @@ class _Bot:
 
 
 class _Runner:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.setup_calls = 0
         self.cleanup_calls = 0
+        self.events = events
 
     async def setup(self) -> None:
         self.setup_calls += 1
+        if self.events is not None:
+            self.events.append("runner.setup")
 
     async def cleanup(self) -> None:
         self.cleanup_calls += 1
+        if self.events is not None:
+            self.events.append("runner.cleanup")
 
 
 class _Site:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.start_calls = 0
+        self.events = events
 
     async def start(self) -> None:
         self.start_calls += 1
+        if self.events is not None:
+            self.events.append("site.start")
 
 
 class _SignalLoop:
@@ -61,6 +72,21 @@ class _SignalLoop:
         if self.failure is not None:
             raise self.failure
         self.handlers[signum] = callback
+
+
+class _PollingDispatcher:
+    def __init__(self, events: list[str], outcome: str) -> None:
+        self.events = events
+        self.outcome = outcome
+        self.start_calls = 0
+
+    async def start_polling(self, _bot, *, allowed_updates: list[str]) -> None:
+        self.start_calls += 1
+        self.events.append(f"polling:{allowed_updates}")
+        if self.outcome == "error":
+            raise RuntimeError("polling failed")
+        if self.outcome == "cancel":
+            raise asyncio.CancelledError
 
 
 def test_webhook_main_creates_and_passes_stop_event(monkeypatch) -> None:
@@ -88,6 +114,74 @@ def test_webhook_main_creates_and_passes_stop_event(monkeypatch) -> None:
         assert len(installed_events) == 1
         assert passed_events == installed_events
         assert installed_events[0].is_set() is False
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["return", "error", "cancel"])
+def test_polling_probe_server_starts_before_polling_and_cleans_up(
+    monkeypatch, outcome: str
+) -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        bot = _Bot(events)
+        dispatcher = _PollingDispatcher(events, outcome)
+        runner = _Runner(events)
+        site = _Site(events)
+        probe_app = object()
+        probe_apps: list[object] = []
+        bound: dict[str, object] = {}
+
+        monkeypatch.setattr(
+            main_module,
+            "settings",
+            SimpleNamespace(
+                allowed_updates=["message"],
+                app_host="127.0.0.1",
+                app_port=8080,
+            ),
+        )
+        monkeypatch.setattr(main_module, "create_bot", lambda: bot)
+        monkeypatch.setattr(main_module, "create_dispatcher", lambda: dispatcher)
+
+        async def setup_commands(_bot) -> None:
+            events.append("commands")
+
+        monkeypatch.setattr(main_module, "setup_bot_commands", setup_commands)
+
+        def build_probe() -> object:
+            probe_apps.append(probe_app)
+            return probe_app
+
+        monkeypatch.setattr(main_module, "build_probe_app", build_probe)
+        monkeypatch.setattr(main_module.web, "AppRunner", lambda app: runner)
+
+        def create_site(_runner, host, port):
+            bound.update(host=host, port=port)
+            return site
+
+        monkeypatch.setattr(
+            main_module.web,
+            "TCPSite",
+            create_site,
+        )
+
+        if outcome == "return":
+            await main_module.run_polling()
+        else:
+            expected_error = asyncio.CancelledError if outcome == "cancel" else RuntimeError
+            with pytest.raises(expected_error):
+                await main_module.run_polling()
+
+        assert events.index("runner.setup") < events.index("site.start")
+        assert events.index("site.start") < events.index("polling:['message']")
+        assert events.index("polling:['message']") < events.index("runner.cleanup")
+        assert events.index("runner.cleanup") < events.index("bot.close")
+        assert dispatcher.start_calls == 1
+        assert probe_apps == [probe_app]
+        assert bound == {"host": "127.0.0.1", "port": 8080}
+        assert runner.cleanup_calls == 1
+        assert bot.session.closed is True
 
     asyncio.run(scenario())
 
