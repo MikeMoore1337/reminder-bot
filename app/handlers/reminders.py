@@ -10,6 +10,7 @@ from app.services.reminder_parser import parse_reminder_input
 from app.services.reminder_service import (
     cancel_reminder,
     create_reminder,
+    delivery_at_utc,
     format_recurrence,
     snooze_reminder,
 )
@@ -58,6 +59,7 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
             text=parsed.text,
             recurrence_type=parsed.recurrence_type,
             recurrence_interval=parsed.recurrence_interval,
+            datetime_semantics=parsed.datetime_semantics,
         )
     except ValueError as exc:
         await message.answer(str(exc))
@@ -137,7 +139,7 @@ async def reminder_callback(callback: CallbackQuery) -> None:
             await callback.answer("Напоминание не найдено", show_alert=True)
             return
 
-        local_dt = from_utc_to_user(reminder.remind_at_utc, user.timezone)
+        local_dt = from_utc_to_user(delivery_at_utc(reminder), user.timezone)
         await callback.answer("Отложено на 10 минут", show_alert=False)
         await callback_message.edit_reply_markup(reply_markup=None)
         await callback_message.answer(
