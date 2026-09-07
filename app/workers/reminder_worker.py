@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from html import escape
+from typing import Any, cast
 from uuid import uuid4
 
 from aiogram import Bot
@@ -18,7 +19,8 @@ from aiogram.exceptions import (
     TelegramServerError,
 )
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.engine import CursorResult
 
 from app.config import get_settings
 from app.db.models import RecurrenceType, Reminder
@@ -67,19 +69,22 @@ class WorkerMetrics:
 worker_metrics = WorkerMetrics()
 
 
-def reminder_actions_kb(reminder_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Отложить на 10 минут", callback_data=f"reminder:snooze:{reminder_id}"
-                ),
-                InlineKeyboardButton(
-                    text="Удалить", callback_data=f"reminder:delete:{reminder_id}"
-                ),
-            ]
-        ]
+def reminder_actions_kb(
+    reminder_id: int,
+    *,
+    include_snooze: bool = True,
+) -> InlineKeyboardMarkup:
+    buttons = []
+    if include_snooze:
+        buttons.append(
+            InlineKeyboardButton(
+                text="Отложить на 10 минут", callback_data=f"reminder:snooze:{reminder_id}"
+            )
+        )
+    buttons.append(
+        InlineKeyboardButton(text="Удалить", callback_data=f"reminder:delete:{reminder_id}")
     )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 def classify_delivery_error(exc: BaseException) -> DeliveryFailure:
@@ -276,6 +281,40 @@ async def fetch_due_reminders(limit: int) -> list[Reminder]:
     return await claim_due_reminders(limit)
 
 
+async def renew_claim_before_send(
+    reminder_id: int,
+    lease_token: str,
+    *,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Renew a still-owned lease immediately before an external send.
+
+    The transaction commits before the caller invokes Telegram. The predicate
+    rejects cancelled, reclaimed, and already-expired ownership generations.
+    """
+
+    if not lease_token:
+        return False
+
+    current_time = now_utc or utc_now()
+    renewed_until = current_time + timedelta(seconds=settings.worker_lease_duration_seconds)
+    async with SessionLocal() as session, session.begin():
+        result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(Reminder)
+                .where(
+                    Reminder.id == reminder_id,
+                    Reminder.status == "processing",
+                    Reminder.lease_token == lease_token,
+                    Reminder.lease_until > current_time,
+                )
+                .values(lease_until=renewed_until)
+            ),
+        )
+        return bool(result.rowcount)
+
+
 async def finalize_delivery_success(
     reminder_id: int,
     lease_token: str,
@@ -448,6 +487,100 @@ async def _finalize_send_failure(
     return finalized
 
 
+async def process_claimed_reminder(
+    bot: Bot,
+    reminder: Reminder,
+    *,
+    stop_event: asyncio.Event | None = None,
+) -> bool:
+    if stop_event is not None and stop_event.is_set():
+        return False
+
+    lease_token = reminder.lease_token
+    if lease_token is None:
+        return False
+
+    if not await renew_claim_before_send(reminder.id, lease_token):
+        logger.info(
+            "Skipped delivery for stale claim before external send",
+            extra={"extra_data": f"reminder_id={reminder.id}"},
+        )
+        return False
+    if stop_event is not None and stop_event.is_set():
+        return False
+
+    attempt_number = reminder.attempt_count
+    try:
+        sent = await asyncio.wait_for(
+            bot.send_message(
+                chat_id=reminder.chat_id,
+                text=f"⏰ Напоминание\n\n{escape(reminder.text)}",
+                reply_markup=reminder_actions_kb(
+                    reminder.id,
+                    include_snooze=reminder.recurrence_type == RecurrenceType.NONE.value,
+                ),
+            ),
+            timeout=settings.worker_send_timeout_seconds,
+        )
+    except Exception as exc:
+        failure = classify_delivery_error(exc)
+        finalized = await _finalize_send_failure(reminder, failure)
+        if finalized:
+            logger.warning(
+                "Reminder delivery failed",
+                extra={
+                    "extra_data": (
+                        f"reminder_id={reminder.id} attempt={attempt_number} "
+                        f"error_type={failure.error_type} error_kind={failure.kind.value}"
+                    )
+                },
+            )
+        return False
+
+    try:
+        recorded = await set_last_message_id(
+            reminder.id,
+            sent.message_id,
+            lease_token=lease_token,
+            occurrence_at_utc=reminder.remind_at_utc,
+            now_utc=utc_now(),
+        )
+        if not recorded:
+            logger.info(
+                "Ignored stale delivery message metadata",
+                extra={"extra_data": f"reminder_id={reminder.id}"},
+            )
+            return False
+
+        finalized = await finalize_delivery_success(reminder.id, lease_token)
+        if not finalized:
+            logger.info(
+                "Ignored stale delivery success finalization",
+                extra={"extra_data": f"reminder_id={reminder.id}"},
+            )
+            return False
+    except Exception as exc:
+        # A successful external send followed by a DB failure intentionally
+        # leaves the lease for expiry/recovery. This is the documented
+        # at-least-once boundary, not an unsafe token-less finalization.
+        logger.error(
+            "Delivery sent but finalization was not completed; lease remains recoverable",
+            extra={
+                "extra_data": (
+                    f"reminder_id={reminder.id} finalization_error_type={type(exc).__name__[:80]}"
+                )
+            },
+        )
+        return False
+
+    worker_metrics.delivered += 1
+    logger.info(
+        "Reminder delivered",
+        extra={"extra_data": f"reminder_id={reminder.id} attempt={attempt_number}"},
+    )
+    return True
+
+
 async def process_due_reminders(bot: Bot, *, stop_event: asyncio.Event | None = None) -> int:
     if stop_event is not None and stop_event.is_set():
         return 0
@@ -464,77 +597,8 @@ async def process_due_reminders(bot: Bot, *, stop_event: asyncio.Event | None = 
                 extra={"extra_data": f"remaining_claims={len(reminders) - index}"},
             )
             break
-
-        lease_token = reminder.lease_token
-        if lease_token is None:
-            continue
-        attempt_number = reminder.attempt_count
-        try:
-            sent = await asyncio.wait_for(
-                bot.send_message(
-                    chat_id=reminder.chat_id,
-                    text=f"⏰ Напоминание\n\n{escape(reminder.text)}",
-                    reply_markup=reminder_actions_kb(reminder.id),
-                ),
-                timeout=settings.worker_send_timeout_seconds,
-            )
-        except Exception as exc:
-            failure = classify_delivery_error(exc)
-            finalized = await _finalize_send_failure(reminder, failure)
-            if finalized:
-                logger.warning(
-                    "Reminder delivery failed",
-                    extra={
-                        "extra_data": (
-                            f"reminder_id={reminder.id} attempt={attempt_number} "
-                            f"error_type={failure.error_type} error_kind={failure.kind.value}"
-                        )
-                    },
-                )
-            continue
-
-        try:
-            recorded = await set_last_message_id(
-                reminder.id,
-                sent.message_id,
-                lease_token=lease_token,
-                occurrence_at_utc=reminder.remind_at_utc,
-                now_utc=utc_now(),
-            )
-            if not recorded:
-                logger.info(
-                    "Ignored stale delivery message metadata",
-                    extra={"extra_data": f"reminder_id={reminder.id}"},
-                )
-                continue
-
-            finalized = await finalize_delivery_success(reminder.id, lease_token)
-            if not finalized:
-                logger.info(
-                    "Ignored stale delivery success finalization",
-                    extra={"extra_data": f"reminder_id={reminder.id}"},
-                )
-                continue
-        except Exception as exc:
-            # A successful external send followed by a DB failure intentionally
-            # leaves the lease for expiry/recovery. This is the documented
-            # at-least-once boundary, not an unsafe token-less finalization.
-            logger.error(
-                "Delivery sent but finalization was not completed; lease remains recoverable",
-                extra={
-                    "extra_data": (
-                        f"reminder_id={reminder.id} finalization_error_type={type(exc).__name__[:80]}"
-                    )
-                },
-            )
-            continue
-
-        processed_count += 1
-        worker_metrics.delivered += 1
-        logger.info(
-            "Reminder delivered",
-            extra={"extra_data": f"reminder_id={reminder.id} attempt={attempt_number}"},
-        )
+        if await process_claimed_reminder(bot, reminder, stop_event=stop_event):
+            processed_count += 1
 
     return processed_count
 

@@ -28,6 +28,7 @@ The following bounded settings are configurable through environment variables:
 
 - `WORKER_LEASE_DURATION_SECONDS` (1-86400, default 60);
 - `WORKER_SEND_TIMEOUT_SECONDS` (1-300, default 30);
+- `WORKER_LEASE_SAFETY_MARGIN_SECONDS` (1-300, default 10);
 - `WORKER_RETRY_BASE_SECONDS` (1-3600, default 10);
 - `WORKER_RETRY_MAX_SECONDS` (1-86400, default 300);
 - `WORKER_MAX_ATTEMPTS` (1-20, default 3).
@@ -43,6 +44,16 @@ When the claim count reaches `WORKER_MAX_ATTEMPTS`, the occurrence becomes
 Failure text stored in PostgreSQL and transition logs contain only a bounded
 exception type/classification and retry metadata. Reminder text, bot tokens,
 raw callback payloads, and provider secrets are never logged.
+
+The lease duration must be strictly greater than the send timeout plus the
+safety margin: `WORKER_LEASE_DURATION_SECONDS >
+WORKER_SEND_TIMEOUT_SECONDS + WORKER_LEASE_SAFETY_MARGIN_SECONDS`. The
+settings object rejects an invalid combination at startup. A batch claim can
+contain more rows than can be sent inside one original lease, so every row is
+atomically renewed immediately before its Telegram call. The renewal requires
+the exact processing token and a still-live lease, commits before the network
+call, and holds no database lock during the call. A cancelled, reclaimed, or
+expired row is skipped without sending.
 
 ## External-send idempotency boundary
 
@@ -61,17 +72,22 @@ Database transitions are idempotent and ownership-guarded:
   documented rather than hidden.
 
 `last_delivery_occurrence_utc` binds the stored message ID to the occurrence that
-was sent. Existing callback buttons pass the Telegram message ID and are accepted
-only for a still-pending row whose canonical occurrence is the same occurrence;
-stale or duplicate callbacks are otherwise no-ops. Full acknowledgement/action
-UX remains outside Issue #9.
+was sent. One-off successful deliveries retain the latest message identity while
+in `sent`, so Snooze and Delete callbacks are accepted only for the owning user,
+the expected Telegram message ID, and that exact occurrence. Snooze atomically
+clears the consumed identity and reschedules the one-off reminder; Delete removes
+it. Repeated or stale callbacks therefore become no-ops. Recurring deliveries
+expose Delete only: the latest delivered message identity can safely cancel the
+whole recurring reminder after canonical advancement, while occurrence-scoped
+recurring Snooze remains outside Issue #9 and is intentionally not shown.
 
 ## Migration and pre-lease rows
 
 Migration `20260907_0004` adds lease/retry columns and due/retry/lease indexes.
-Existing `attempt_count` values are backfilled to zero. Existing rows in the old
-token-less `processing` state are deterministically reset to `pending` with
-cleared lease fields, preserving their canonical delivery time and retry count.
+Existing `attempt_count` values are backfilled from the existing `retry_count`
+budget. Existing rows in the old token-less `processing` state are then
+deterministically reset to `pending` with cleared lease fields, preserving their
+canonical delivery time and consumed retry budget.
 The old worker must be stopped while this migration runs; this prevents a
 pre-migration worker without a token from finalizing a row that the new worker
 has reclaimed. After deployment, no manual SQL edit is required for recovery.

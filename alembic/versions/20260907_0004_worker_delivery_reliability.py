@@ -42,6 +42,10 @@ def upgrade() -> None:
         sa.Column("last_delivery_occurrence_utc", sa.DateTime(timezone=True), nullable=True),
     )
 
+    # Preserve the retry budget already consumed by the pre-lease worker. This
+    # must happen before resetting token-less processing rows to pending.
+    op.execute(sa.text("UPDATE reminders SET attempt_count = COALESCE(retry_count, 0)"))
+
     # The pre-migration worker had no ownership token or lease. Resetting those
     # rows to pending is the deterministic deployment policy; the old worker
     # must be stopped while migrations run, so no pre-lease owner can finalize.

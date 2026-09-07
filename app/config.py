@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     worker_poll_interval_seconds: float = Field(default=2.0, gt=0, le=3600)
     worker_lease_duration_seconds: int = Field(default=60, ge=1, le=86400)
     worker_send_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    worker_lease_safety_margin_seconds: int = Field(default=10, ge=1, le=300)
     worker_retry_base_seconds: int = Field(default=10, ge=1, le=3600)
     worker_retry_max_seconds: int = Field(default=300, ge=1, le=86400)
     worker_max_attempts: int = Field(default=3, ge=1, le=20)
@@ -37,6 +38,22 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def validate_worker_timing(self) -> "Settings":
+        if self.worker_lease_duration_seconds <= (
+            self.worker_send_timeout_seconds + self.worker_lease_safety_margin_seconds
+        ):
+            raise ValueError(
+                "worker_lease_duration_seconds must be greater than "
+                "worker_send_timeout_seconds plus worker_lease_safety_margin_seconds"
+            )
+        if self.worker_retry_max_seconds < self.worker_retry_base_seconds:
+            raise ValueError(
+                "worker_retry_max_seconds must be greater than or equal to "
+                "worker_retry_base_seconds"
+            )
+        return self
 
     @property
     def allowed_updates(self) -> list[str]:

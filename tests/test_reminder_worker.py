@@ -325,7 +325,7 @@ def test_stale_and_duplicate_callback_actions_are_noops(monkeypatch) -> None:
             async with session_factory() as session:
                 reminder = await session.get(Reminder, reminder_id)
                 assert reminder is not None
-                reminder.last_message_id = 7001
+                reminder.last_message_id = 7002
                 reminder.last_delivery_occurrence_utc = now
                 await session.commit()
                 user = await session.get(User, reminder.user_id)
@@ -351,6 +351,163 @@ def test_stale_and_duplicate_callback_actions_are_noops(monkeypatch) -> None:
             saved = await _get_reminder(session_factory, reminder_id)
             assert saved.status == "pending"
             assert _utc(saved.remind_at_utc) == now + timedelta(hours=1)
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_one_off_latest_delivery_actions_are_atomic_and_consumed(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
+        try:
+            monkeypatch.setattr(reminder_service, "utc_now", lambda: now)
+            reminder_id = await _insert_reminder(session_factory, now)
+            async with session_factory() as session:
+                reminder = await session.get(Reminder, reminder_id)
+                assert reminder is not None
+                reminder.status = "sent"
+                reminder.last_message_id = 7001
+                reminder.last_delivery_occurrence_utc = now
+                user = await session.get(User, reminder.user_id)
+                assert user is not None
+                await session.commit()
+
+            snoozed = await reminder_service.snooze_reminder(
+                user=user,
+                reminder_id=reminder_id,
+                expected_message_id=7001,
+            )
+            assert snoozed is not None
+            assert snoozed.status == "pending"
+            assert _utc(snoozed.delivery_at_utc) == now + timedelta(minutes=10)
+            assert snoozed.last_message_id is None
+            assert snoozed.last_delivery_occurrence_utc is None
+
+            assert (
+                await reminder_service.snooze_reminder(
+                    user=user,
+                    reminder_id=reminder_id,
+                    expected_message_id=7001,
+                )
+                is None
+            )
+
+            async with session_factory() as session:
+                reminder = await session.get(Reminder, reminder_id)
+                assert reminder is not None
+                reminder.status = "sent"
+                reminder.last_message_id = 7002
+                reminder.last_delivery_occurrence_utc = reminder.remind_at_utc
+                await session.commit()
+
+            assert (
+                await reminder_service.cancel_reminder(
+                    user=user,
+                    reminder_id=reminder_id,
+                    expected_message_id=7002,
+                )
+                is True
+            )
+            assert (
+                await reminder_service.cancel_reminder(
+                    user=user,
+                    reminder_id=reminder_id,
+                    expected_message_id=7002,
+                )
+                is False
+            )
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_recurring_delivery_keyboard_exposes_delete_only() -> None:
+    markup = worker.reminder_actions_kb(42, include_snooze=False)
+
+    assert len(markup.inline_keyboard) == 1
+    assert [button.text for button in markup.inline_keyboard[0]] == ["Удалить"]
+
+
+def test_cancel_after_claim_prevents_external_send(monkeypatch) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def send_message(self, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(message_id=9200)
+
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
+        try:
+            monkeypatch.setattr(worker, "settings", _worker_settings())
+            monkeypatch.setattr(worker, "utc_now", lambda: now)
+            reminder_id = await _insert_reminder(session_factory, now)
+            claimed = (await worker.claim_due_reminders(1, now_utc=now))[0]
+            async with session_factory() as session:
+                user = await session.get(User, claimed.user_id)
+                assert user is not None
+
+            assert await reminder_service.cancel_reminder(user, reminder_id)
+            bot = FakeBot()
+            assert not await worker.process_claimed_reminder(bot, claimed)
+            assert bot.calls == 0
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_send_task_leaves_a_reclaimable_lease(monkeypatch) -> None:
+    class BlockingBot:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.calls = 0
+
+        async def send_message(self, **kwargs):
+            self.calls += 1
+            self.started.set()
+            await asyncio.Future()
+
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime.now(UTC)
+        try:
+            monkeypatch.setattr(worker, "settings", _worker_settings())
+            monkeypatch.setattr(worker, "utc_now", lambda: now)
+            reminder_id = await _insert_reminder(session_factory, now)
+            claimed = (await worker.claim_due_reminders(1, now_utc=now))[0]
+            bot = BlockingBot()
+            task = asyncio.create_task(worker.process_claimed_reminder(bot, claimed))
+            await asyncio.wait_for(bot.started.wait(), timeout=1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("cancelled send task unexpectedly completed")
+
+            saved = await _get_reminder(session_factory, reminder_id)
+            assert saved.status == "processing"
+            assert saved.lease_token == claimed.lease_token
+            assert _utc(saved.lease_until) > now
+
+            async with session_factory() as session:
+                await session.execute(
+                    update(Reminder)
+                    .where(Reminder.id == reminder_id)
+                    .values(lease_until=now - timedelta(seconds=1))
+                )
+                await session.commit()
+            assert len(await worker.claim_due_reminders(1, now_utc=now)) == 1
         finally:
             await connection.close()
             await engine.dispose()

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from html import escape
 from typing import Any, cast
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 
 from app.db.models import RecurrenceType, Reminder, User
@@ -216,9 +216,19 @@ async def delete_reminder_any_status(
         if expected_message_id is not None:
             filters.extend(
                 [
-                    Reminder.status == "pending",
+                    Reminder.status.in_(("pending", "sent")),
                     Reminder.last_message_id == expected_message_id,
-                    Reminder.last_delivery_occurrence_utc == Reminder.remind_at_utc,
+                    Reminder.last_delivery_occurrence_utc.is_not(None),
+                    or_(
+                        and_(
+                            Reminder.recurrence_type == RecurrenceType.NONE.value,
+                            Reminder.last_delivery_occurrence_utc == Reminder.remind_at_utc,
+                        ),
+                        Reminder.recurrence_type != RecurrenceType.NONE.value,
+                    ),
+                    Reminder.lease_token.is_(None),
+                    Reminder.lease_until.is_(None),
+                    Reminder.processing_started_at.is_(None),
                 ]
             )
         result = cast(
@@ -258,44 +268,61 @@ async def snooze_reminder(
     *,
     expected_message_id: int | None = None,
 ) -> Reminder | None:
+    if minutes < 1:
+        raise ValueError("Время откладывания должно быть больше 0 минут")
+
+    now_utc = utc_now()
+    snoozed_until_utc = now_utc + timedelta(minutes=minutes)
     async with SessionLocal() as session:
         filters = [
             Reminder.id == reminder_id,
             Reminder.user_id == user.id,
-            Reminder.status == "pending",
+            Reminder.lease_token.is_(None),
+            Reminder.lease_until.is_(None),
+            Reminder.processing_started_at.is_(None),
         ]
         if expected_message_id is not None:
             filters.extend(
                 [
+                    Reminder.status == "sent",
+                    Reminder.recurrence_type == RecurrenceType.NONE.value,
                     Reminder.last_message_id == expected_message_id,
+                    Reminder.last_delivery_occurrence_utc.is_not(None),
                     Reminder.last_delivery_occurrence_utc == Reminder.remind_at_utc,
                 ]
             )
-        result = await session.execute(select(Reminder).where(*filters))
-        reminder = result.scalar_one_or_none()
-        if reminder is None:
+        else:
+            filters.append(Reminder.status == "pending")
+
+        result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(Reminder)
+                .where(*filters)
+                .values(
+                    chat_id=user.chat_id,
+                    delivery_at_utc=snoozed_until_utc,
+                    snoozed_until_utc=snoozed_until_utc,
+                    status="pending",
+                    retry_count=0,
+                    attempt_count=0,
+                    processing_started_at=None,
+                    lease_until=None,
+                    lease_token=None,
+                    next_retry_at=None,
+                    error_text=None,
+                    last_message_id=None,
+                    last_delivery_occurrence_utc=None,
+                )
+            ),
+        )
+        if not result.rowcount:
             return None
 
-        reminder.chat_id = user.chat_id
-        canonical_at_utc, snoozed_until_utc = build_snooze_state(
-            reminder.remind_at_utc,
-            utc_now(),
-            minutes,
-        )
-        reminder.remind_at_utc = canonical_at_utc
-        reminder.delivery_at_utc = snoozed_until_utc
-        reminder.snoozed_until_utc = snoozed_until_utc
-        reminder.status = "pending"
-        reminder.retry_count = 0
-        reminder.attempt_count = 0
-        reminder.processing_started_at = None
-        reminder.lease_until = None
-        reminder.lease_token = None
-        reminder.next_retry_at = None
-        reminder.error_text = None
-
+        reminder = (
+            await session.execute(select(Reminder).where(Reminder.id == reminder_id))
+        ).scalar_one()
         await session.commit()
-        await session.refresh(reminder)
         return cast(Reminder | None, reminder)
 
 
