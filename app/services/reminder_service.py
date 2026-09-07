@@ -15,10 +15,10 @@ from app.utils.datetime_utils import from_utc_to_user, to_utc, utc_now
 logger = logging.getLogger(__name__)
 
 
-def _next_month(dt: datetime) -> datetime:
+def _next_month(dt: datetime, day_of_month: int | None = None) -> datetime:
     year = dt.year + (1 if dt.month == 12 else 0)
     month = 1 if dt.month == 12 else dt.month + 1
-    day = min(dt.day, calendar.monthrange(year, month)[1])
+    day = min(day_of_month or dt.day, calendar.monthrange(year, month)[1])
     return dt.replace(year=year, month=month, day=day)
 
 
@@ -46,6 +46,8 @@ def calculate_next_occurrence(
     remind_at_utc: datetime,
     recurrence_type: str,
     recurrence_interval: int,
+    timezone_name: str = "UTC",
+    recurrence_day_of_month: int | None = None,
 ) -> datetime | None:
     if recurrence_type == RecurrenceType.NONE.value:
         return None
@@ -56,19 +58,63 @@ def calculate_next_occurrence(
     if recurrence_type == RecurrenceType.HOURLY.value:
         return remind_at_utc + timedelta(hours=recurrence_interval)
 
+    local_dt = from_utc_to_user(remind_at_utc, timezone_name).replace(tzinfo=None)
+
     if recurrence_type == RecurrenceType.DAILY.value:
-        return remind_at_utc + timedelta(days=recurrence_interval)
+        next_local_dt = local_dt + timedelta(days=recurrence_interval)
+        return to_utc(next_local_dt, timezone_name)
 
     if recurrence_type == RecurrenceType.WEEKLY.value:
-        return remind_at_utc + timedelta(weeks=recurrence_interval)
+        next_local_dt = local_dt + timedelta(weeks=recurrence_interval)
+        return to_utc(next_local_dt, timezone_name)
 
     if recurrence_type == RecurrenceType.MONTHLY.value:
-        next_dt = remind_at_utc
+        next_dt = local_dt
         for _ in range(recurrence_interval):
-            next_dt = _next_month(next_dt)
-        return next_dt
+            next_dt = _next_month(next_dt, recurrence_day_of_month)
+        return to_utc(next_dt, timezone_name)
 
     raise ValueError(f"Unsupported recurrence_type: {recurrence_type}")
+
+
+def advance_occurrence_until_future(
+    remind_at_utc: datetime,
+    recurrence_type: str,
+    recurrence_interval: int,
+    timezone_name: str,
+    recurrence_day_of_month: int | None,
+    now_utc: datetime,
+) -> datetime | None:
+    next_occurrence = calculate_next_occurrence(
+        remind_at_utc,
+        recurrence_type,
+        recurrence_interval,
+        timezone_name=timezone_name,
+        recurrence_day_of_month=recurrence_day_of_month,
+    )
+    while next_occurrence is not None and next_occurrence <= now_utc:
+        next_occurrence = calculate_next_occurrence(
+            next_occurrence,
+            recurrence_type,
+            recurrence_interval,
+            timezone_name=timezone_name,
+            recurrence_day_of_month=recurrence_day_of_month,
+        )
+    return next_occurrence
+
+
+def build_snooze_state(
+    canonical_at_utc: datetime,
+    now_utc: datetime,
+    minutes: int,
+) -> tuple[datetime, datetime]:
+    if minutes < 1:
+        raise ValueError("Время откладывания должно быть больше 0 минут")
+    return canonical_at_utc, now_utc + timedelta(minutes=minutes)
+
+
+def delivery_at_utc(reminder: Reminder) -> datetime:
+    return reminder.delivery_at_utc or reminder.remind_at_utc
 
 
 async def create_reminder(
@@ -82,6 +128,9 @@ async def create_reminder(
 
     remind_at_utc = to_utc(local_dt, user.timezone)
     now_utc = utc_now()
+    recurrence_day_of_month = (
+        local_dt.day if recurrence_type == RecurrenceType.MONTHLY.value else None
+    )
 
     if recurrence_type == RecurrenceType.NONE.value and remind_at_utc <= now_utc:
         raise ValueError("Время напоминания уже прошло")
@@ -92,6 +141,8 @@ async def create_reminder(
                 remind_at_utc,
                 recurrence_type,
                 recurrence_interval,
+                timezone_name=user.timezone,
+                recurrence_day_of_month=recurrence_day_of_month,
             )
             if next_dt is None:
                 break
@@ -104,8 +155,11 @@ async def create_reminder(
             text=text,
             remind_at_utc=remind_at_utc,
             status="pending",
+            schedule_timezone=user.timezone,
+            delivery_at_utc=remind_at_utc,
             recurrence_type=recurrence_type,
             recurrence_interval=recurrence_interval,
+            recurrence_day_of_month=recurrence_day_of_month,
         )
         session.add(reminder)
         await session.commit()
@@ -134,7 +188,7 @@ async def list_pending_reminders(user: User) -> list[Reminder]:
                 Reminder.user_id == user.id,
                 Reminder.status == "pending",
             )
-            .order_by(Reminder.remind_at_utc.asc())
+            .order_by(func.coalesce(Reminder.delivery_at_utc, Reminder.remind_at_utc).asc())
         )
         return list(result.scalars().all())
 
@@ -178,7 +232,14 @@ async def snooze_reminder(user: User, reminder_id: int, minutes: int = 10) -> Re
             return None
 
         reminder.chat_id = user.chat_id
-        reminder.remind_at_utc = utc_now() + timedelta(minutes=minutes)
+        canonical_at_utc, snoozed_until_utc = build_snooze_state(
+            reminder.remind_at_utc,
+            utc_now(),
+            minutes,
+        )
+        reminder.remind_at_utc = canonical_at_utc
+        reminder.delivery_at_utc = snoozed_until_utc
+        reminder.snoozed_until_utc = snoozed_until_utc
         reminder.status = "pending"
         reminder.retry_count = 0
         reminder.error_text = None
@@ -266,7 +327,7 @@ def format_recurrence(reminder: Reminder) -> str:
 
 
 def format_reminder_for_user(reminder: Reminder, timezone_name: str) -> str:
-    local_dt = from_utc_to_user(reminder.remind_at_utc, timezone_name)
+    local_dt = from_utc_to_user(delivery_at_utc(reminder), timezone_name)
     return (
         f"ID: {reminder.id}\n"
         f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"

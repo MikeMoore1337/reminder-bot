@@ -44,7 +44,10 @@ class User(Base):
 
 class Reminder(Base):
     __tablename__ = "reminders"
-    __table_args__ = (Index("ix_reminders_status_remind_at_utc", "status", "remind_at_utc"),)
+    __table_args__ = (
+        Index("ix_reminders_status_remind_at_utc", "status", "remind_at_utc"),
+        Index("ix_reminders_status_delivery_at_utc", "status", "delivery_at_utc"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(
@@ -54,6 +57,11 @@ class Reminder(Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     remind_at_utc: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), index=True, nullable=False
+    )
+    schedule_timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    delivery_at_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    snoozed_until_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     status: Mapped[str] = mapped_column(String(20), index=True, nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(
@@ -66,6 +74,7 @@ class Reminder(Base):
         String(16), nullable=False, default=RecurrenceType.NONE.value
     )
     recurrence_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    recurrence_day_of_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     user: Mapped[User] = relationship(back_populates="reminders")

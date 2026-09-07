@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -12,14 +12,63 @@ def validate_timezone(timezone_name: str) -> str:
     return timezone_name
 
 
-def to_utc(naive_local_dt: datetime, timezone_name: str) -> datetime:
+def _valid_local_candidates(local_dt: datetime, tz: ZoneInfo) -> list[datetime]:
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        candidate = local_dt.replace(tzinfo=tz, fold=fold)
+        round_trip = candidate.astimezone(UTC).astimezone(tz)
+        if round_trip.replace(tzinfo=None) == local_dt and all(
+            existing.astimezone(UTC) != candidate.astimezone(UTC) for existing in candidates
+        ):
+            candidates.append(candidate)
+    return candidates
+
+
+def localize_in_timezone(local_dt: datetime, timezone_name: str) -> datetime:
+    """Convert a wall-clock datetime using deterministic DST policies.
+
+    Ambiguous local times use the earlier occurrence (fold=0). A nonexistent local
+    time is shifted forward to the first valid local time, preserving the intended
+    calendar direction across a spring-forward gap.
+    """
+
     tz = ZoneInfo(timezone_name)
-    localized = naive_local_dt.replace(tzinfo=tz)
-    return localized.astimezone(UTC)
+    naive_local_dt = local_dt.replace(tzinfo=None)
+    candidates = _valid_local_candidates(naive_local_dt, tz)
+    if candidates:
+        return candidates[0]
+
+    fold_zero = naive_local_dt.replace(tzinfo=tz, fold=0)
+    fold_one = naive_local_dt.replace(tzinfo=tz, fold=1)
+    offset_zero = fold_zero.utcoffset()
+    offset_one = fold_one.utcoffset()
+    if offset_zero is not None and offset_one is not None:
+        forward_gap = offset_one - offset_zero
+        if forward_gap > timedelta(0):
+            shifted = naive_local_dt + forward_gap
+            shifted_candidates = _valid_local_candidates(shifted, tz)
+            if shifted_candidates:
+                return shifted_candidates[0]
+
+    # ZoneInfo transitions are normally minute-aligned, but keep a bounded
+    # fallback for unusual historical transitions and retain the same policy.
+    for minutes in range(1, 24 * 60 + 1):
+        shifted = naive_local_dt + timedelta(minutes=minutes)
+        shifted_candidates = _valid_local_candidates(shifted, tz)
+        if shifted_candidates:
+            return shifted_candidates[0]
+
+    raise ValueError(f"Не удалось разрешить локальное время: {local_dt!s} {timezone_name}")
+
+
+def to_utc(local_dt: datetime, timezone_name: str) -> datetime:
+    return localize_in_timezone(local_dt, timezone_name).astimezone(UTC)
 
 
 def from_utc_to_user(dt_utc: datetime, timezone_name: str) -> datetime:
     tz = ZoneInfo(timezone_name)
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=UTC)
     return dt_utc.astimezone(tz)
 
 

@@ -6,12 +6,13 @@ from html import escape
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.orm import joinedload
 
 from app.config import get_settings
 from app.db.models import RecurrenceType, Reminder
 from app.db.session import SessionLocal
-from app.services.reminder_service import calculate_next_occurrence, set_last_message_id
+from app.services.reminder_service import advance_occurrence_until_future, set_last_message_id
 from app.utils.datetime_utils import utc_now
 
 logger = logging.getLogger(__name__)
@@ -34,15 +35,17 @@ def reminder_actions_kb(reminder_id: int) -> InlineKeyboardMarkup:
 
 
 async def fetch_due_reminders(limit: int) -> list[Reminder]:
+    delivery_at = func.coalesce(Reminder.delivery_at_utc, Reminder.remind_at_utc)
     async with SessionLocal() as session:
         async with session.begin():
             result = await session.execute(
                 select(Reminder)
+                .options(joinedload(Reminder.user))
                 .where(
                     Reminder.status == "pending",
-                    Reminder.remind_at_utc <= utc_now(),
+                    delivery_at <= utc_now(),
                 )
-                .order_by(Reminder.remind_at_utc.asc())
+                .order_by(delivery_at.asc())
                 .with_for_update(skip_locked=True)
                 .limit(limit)
             )
@@ -56,35 +59,39 @@ async def fetch_due_reminders(limit: int) -> list[Reminder]:
 
 async def mark_after_send(reminder_id: int) -> None:
     async with SessionLocal() as session, session.begin():
-        reminder = await session.get(Reminder, reminder_id)
+        result = await session.execute(
+            select(Reminder).options(joinedload(Reminder.user)).where(Reminder.id == reminder_id)
+        )
+        reminder = result.scalar_one_or_none()
         if reminder is None:
             return
-        reminder.sent_at = utc_now()
+        now_utc = utc_now()
+        reminder.sent_at = now_utc
         reminder.error_text = None
         reminder.retry_count = 0
 
         if reminder.recurrence_type == RecurrenceType.NONE.value:
             reminder.status = "sent"
+            reminder.delivery_at_utc = None
+            reminder.snoozed_until_utc = None
             return
 
-        next_occurrence = calculate_next_occurrence(
+        next_occurrence = advance_occurrence_until_future(
             reminder.remind_at_utc,
             reminder.recurrence_type,
             reminder.recurrence_interval,
+            timezone_name=reminder.schedule_timezone or reminder.user.timezone,
+            recurrence_day_of_month=reminder.recurrence_day_of_month,
+            now_utc=now_utc,
         )
         if next_occurrence is None:
             reminder.status = "sent"
+            reminder.delivery_at_utc = None
+            reminder.snoozed_until_utc = None
             return
-        while next_occurrence <= utc_now():
-            future_occurrence = calculate_next_occurrence(
-                next_occurrence,
-                reminder.recurrence_type,
-                reminder.recurrence_interval,
-            )
-            if future_occurrence is None:
-                break
-            next_occurrence = future_occurrence
         reminder.remind_at_utc = next_occurrence
+        reminder.delivery_at_utc = next_occurrence
+        reminder.snoozed_until_utc = None
         reminder.status = "pending"
 
 
