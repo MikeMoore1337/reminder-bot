@@ -1,118 +1,311 @@
 # Production deployment
 
-Repository-side production deployment is intentionally disabled by default.
+Repository-side production deployment is disabled by default. No production
+SSH, bootstrap, secret/variable change, database mutation, or `DEPLOY_ENABLED`
+change is part of the repository implementation.
 
-The deployment workflow is `.github/workflows/deploy-production.yml`. It can run only when repository variable `DEPLOY_ENABLED` is exactly `true` and either:
+The deployment workflow is `.github/workflows/deploy-production.yml`. Its only
+automatic entry point is a successful `CI` `push` run on `master`. Manual
+dispatch is allowed only from `master` and still requires a successful `CI`
+`push` run for the exact SHA. Both paths require repository variable
+`DEPLOY_ENABLED` to equal the literal string `true`.
 
-- the existing `CI` workflow completed successfully for a `push` to `master`; or
-- an owner manually dispatches the deploy workflow from `master`, where the workflow re-verifies that the exact SHA already has a successful `CI` push run.
+## Production facts
 
-The workflow always deploys an exact 40-character SHA. Both the GitHub runner and the VPS reject a queued/stale deploy when current `origin/master` is no longer that SHA.
+The owner-provided production target is Ubuntu Linux x86_64 at
+`111.88.215.204`, SSH port `25566`, with host fingerprint
+`SHA256:4GKTOEHN6g/j5P8qCdTX1KNXuGoKMG0qN4cod3DFwYY`, Docker `29.6.2`,
+Compose `5.3.1`, about 1.9 GiB RAM, 2 GiB swap, and about 24 GiB free disk.
+The unrelated `mtproxy` Compose project at `/opt/mtproxy/docker-compose.yml`
+is outside this deployment and must never be touched.
 
-## Owner-only bootstrap
+`/root/reminder_bot` is a legacy non-canonical directory containing the
+production `.env`. It is not used as the deployment checkout and must not be
+deleted, renamed, or converted in place. The canonical clean Git checkout is
+`/opt/reminder-bot`.
 
-Do not perform these steps as part of ordinary repository work. They require explicit owner authorization.
+## Immutable image transport
 
-### 1. Prepare a dedicated VPS deployment account
+The GitHub runner checks out the exact 40-character protected `master` SHA and
+builds exactly one application image:
 
-Prefer a dedicated non-root account that can:
+`reminder-bot:<FULL_SHA>`
 
-- read/write the application checkout;
-- run Docker Compose for this application;
-- fetch the public GitHub repository;
-- not administer unrelated services or containers.
+The image has these OCI labels:
 
-The production checkout should live at one absolute path such as `/opt/reminder-bot`. Bootstrap it once from `MikeMoore1337/reminder-bot` and keep its `origin` pointing to that repository.
+- `org.opencontainers.image.revision=<FULL_SHA>`;
+- `org.opencontainers.image.source=https://github.com/MikeMoore1337/reminder-bot`.
 
-The checkout must contain a production `.env` that is ignored by Git and readable only by the deployment account. The workflow never uploads or rewrites this file.
+The runner sends that image directly to the VPS with `docker save`, a gzip
+stream, and the already host-pinned SSH connection. The VPS runs `docker load`
+and verifies both labels before changing any Reminder Bot service. No Docker
+Hub/GHCR repository or permanent VPS registry credential is required.
 
-Do not place `mtproxy` or another unrelated Compose project in the Reminder Bot application directory/project.
+`migrate`, `bot`, and `worker` all use the same Compose image expression:
 
-### 2. Create a dedicated SSH key
+`REMINDER_BOT_IMAGE` (local fallback: `reminder-bot:local`)
 
-Create a deployment-only key pair. Install only the public key in the authorized keys for the deployment account.
+Local `docker compose build` remains supported. The production script never
+builds on the VPS; every build-capable production `up` operation uses
+`--no-build`.
 
-Store the private key as GitHub Actions secret:
+## Stable production identity
 
-- `PROD_SSH_PRIVATE_KEY`
+Every production Compose command is invoked with project `reminder_bot`. The
+Compose volume declaration names the existing PostgreSQL volume explicitly:
 
-Do not reuse a personal/root SSH key when a dedicated key is practical.
+`reminder_bot_postgres_data`
 
-### 3. Pin the VPS host key
+The logical Compose volume name remains `postgres_data`. Before the first live
+service operation the script requires that the volume already exists, has
+labels `com.docker.compose.project=reminder_bot` and
+`com.docker.compose.volume=postgres_data`, and contains `PG_VERSION` equal to
+`17`. Missing volume, unexpected labels, or another PostgreSQL major version
+is a human-required stop; Compose is never allowed to create a replacement
+database.
 
-Obtain the VPS SSH host key fingerprint through a trusted owner-controlled channel and construct the exact OpenSSH `known_hosts` line outside GitHub Actions.
+Production polling requires `BOT_MODE=polling` and one `bot` service. The host
+port is published only on `127.0.0.1:8080`; the container still listens on
+`APP_HOST:APP_PORT`, and local/webhook setups can set `APP_PUBLISH_HOST` in
+their own `.env`.
 
-Store the line(s) as GitHub Actions secret:
+## Owner-only bootstrap procedure
 
-- `PROD_SSH_KNOWN_HOSTS`
+Run this procedure only after the repository PR lifecycle is complete and the
+owner explicitly authorizes VPS bootstrap. It is intentionally not automated
+by GitHub Actions and has not been run by Codex.
 
-The workflow uses `StrictHostKeyChecking=yes` and deliberately does not run `ssh-keyscan` as trust bootstrap.
+The known legacy directory `/root/reminder_bot` and its `.env` must remain
+untouched. Never run a Docker cleanup command, `down` with volume removal, or
+any command naming the unrelated `mtproxy` Compose project.
 
-### 4. Configure repository variables
+### 1. Create the dedicated account and directories
 
-Set:
+Use a dedicated non-root account; the examples use `reminder-deploy` and the
+canonical checkout `/opt/reminder-bot`:
 
-- `PROD_SSH_HOST` - production host/IP;
-- `PROD_SSH_PORT` - SSH port;
-- `PROD_SSH_USER` - dedicated deployment account;
-- `PROD_APP_DIR` - absolute production repository path;
-- `DEPLOY_ENABLED` - leave unset or `false` until bootstrap verification is complete.
+```bash
+if ! getent passwd reminder-deploy >/dev/null; then
+  sudo useradd --system --create-home --shell /usr/sbin/nologin reminder-deploy
+fi
+sudo install -d -o reminder-deploy -g reminder-deploy -m 0755 /opt/reminder-bot
+sudo install -d -o reminder-deploy -g reminder-deploy -m 0700 \
+  /opt/reminder-bot/backups /opt/reminder-bot/locks /opt/reminder-bot/state
+```
 
-### 5. Verify the VPS manually before enablement
+If `/opt/reminder-bot` exists but is not a Git checkout, stop for human
+review. Do not delete or replace it:
 
-Before `DEPLOY_ENABLED=true`, owner verification should confirm:
+```bash
+if [ ! -d /opt/reminder-bot/.git ]; then
+  test ! -e /opt/reminder-bot/.git
+  sudo -u reminder-deploy git clone --branch master --single-branch \
+    https://github.com/MikeMoore1337/reminder-bot.git /opt/reminder-bot
+fi
+test "$(sudo -u reminder-deploy git -C /opt/reminder-bot remote get-url origin)" \
+  = "https://github.com/MikeMoore1337/reminder-bot.git"
+```
 
-- `git status --porcelain --untracked-files=all` is empty in the production checkout (ignored `.env` is allowed);
-- `git remote get-url origin` points to the intended Reminder Bot repository;
-- `docker compose config --quiet` succeeds without printing the interpolated configuration;
-- PostgreSQL uses the intended persistent volume;
-- `docker compose --profile tools run --rm migrate` can reach the production database;
-- `bot` and `worker` are the only Reminder Bot application processes;
-- unrelated containers such as `mtproxy` are outside this Compose project;
-- the dedicated deployment user can perform only the required Git/Docker operations.
+The clone command is allowed only when the path is absent. Do not use
+`git reset --hard`, `git clean`, or a broad cleanup to repair a partial
+checkout.
 
-Do not run destructive downgrade/volume cleanup as an enablement test.
+### 2. Preserve and copy the production environment securely
 
-### 6. Enable automatic deployment
+Do not print either file. Keep the legacy source as-is and copy it only when
+the canonical destination has not already been provisioned:
 
-Only after explicit owner approval, set:
+```bash
+sudo test -f /root/reminder_bot/.env
+if ! sudo test -e /opt/reminder-bot/.env; then
+  sudo install -o reminder-deploy -g reminder-deploy -m 0600 \
+    /root/reminder_bot/.env /opt/reminder-bot/.env
+fi
+sudo chown reminder-deploy:reminder-deploy /opt/reminder-bot/.env
+sudo chmod 0600 /opt/reminder-bot/.env
+```
 
-`DEPLOY_ENABLED=true`
+The file must contain `BOT_MODE=polling` and the existing database settings.
+Do not replace the database URL with a new database, and do not delete
+`/root/reminder_bot`.
 
-The next successful `CI` workflow on current `master` will trigger the deploy workflow. A manual dispatch from `master` can re-run deployment only for a SHA that already has a successful `CI` push run.
+### 3. Install the restricted SSH command boundary
 
-## Remote deploy sequence
+Install the reviewed wrapper as a root-owned file. Create
+`/etc/reminder-bot/deploy-app-dir` as a root-owned mode `0644` file containing
+exactly one line, `/opt/reminder-bot`, and no trailing configuration:
 
-`scripts/deploy_production.sh` fails closed and performs:
+```bash
+sudo install -d -o root -g root -m 0755 /etc/reminder-bot
+sudo install -o root -g root -m 0755 \
+  /opt/reminder-bot/deploy/scripts/reminder_bot_ssh_wrapper.sh \
+  /usr/local/sbin/reminder-bot-ssh-wrapper
+sudo chown root:root /etc/reminder-bot/deploy-app-dir
+sudo chmod 0644 /etc/reminder-bot/deploy-app-dir
+```
 
-1. validate arguments, tools, repository, `.env`, and clean non-ignored worktree;
-2. fetch `origin/master` and require exact equality with the requested SHA;
-3. detach-checkout the exact SHA;
-4. validate Compose quietly;
-5. build application images;
-6. start PostgreSQL;
-7. run `alembic upgrade head` through the `migrate` Compose service;
-8. recreate/start `bot` and `worker` without `docker compose down`;
-9. poll `/readyz` for up to 60 seconds;
-10. require the worker container to be running;
-11. print only the deployed SHA.
+The file contents should be reviewed with an owner-controlled editor rather
+than printed into a log. The value must match the repository variable
+`PROD_APP_DIR`. If a different canonical absolute path is approved, update
+the policy file and workflow variable together and review the wrapper allowlist
+before enabling deployment.
 
-The deploy path never runs `docker compose down --volumes`, `git clean`, `git reset --hard`, a database downgrade, or commands against unrelated Docker projects.
+Generate a new deployment-only ED25519 key on the owner-controlled workstation.
+Install only its public key for `reminder-deploy`, using the wrapper and
+OpenSSH `restrict` option. The authorized-keys entry has this shape; replace
+`<PUBLIC_KEY>` with the generated public key and do not put the private key in
+the repository:
 
-## Failure and recovery
+```text
+command="/usr/local/sbin/reminder-bot-ssh-wrapper",restrict ssh-ed25519 <PUBLIC_KEY> reminder-bot-ci
+```
 
-A failed deploy exits non-zero in GitHub Actions.
+`restrict` disables agent forwarding, TCP forwarding, X11 forwarding, and
+PTY allocation. The wrapper accepts only `docker load` and the exact
+SHA-carrying deploy command emitted by the workflow; it rejects interactive
+shells and arbitrary commands. The Docker group is root-equivalent, so the
+forced-command boundary is required if the account is added to it:
 
-- Failure before bot/worker rollout leaves the existing application containers running.
-- Migration failure stops the deployment before application rollout. Inspect the migration error and database state before retrying.
-- Readiness/worker failure after rollout requires diagnosis on the VPS. Do not delete the PostgreSQL volume to recover.
-- A stale queued SHA is rejected. Let the current successful `master` CI trigger a new deployment instead of forcing the older SHA.
-- Re-running the deploy workflow manually is allowed only after the exact current master SHA already has a successful `CI` push run.
+```bash
+sudo usermod -aG docker reminder-deploy
+```
 
-Rollback of application code may require a normal Git revert merged through protected `master`, followed by green CI and automatic deployment. Database rollback is not automatic and requires an explicit owner-approved migration/recovery plan.
+Apply account-specific SSH daemon hardening through the owner’s normal
+configuration management, then validate before reload:
+
+```text
+Match User reminder-deploy
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthenticationMethods publickey
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTTY no
+```
+
+Run `sudo sshd -t` before reloading the SSH service. Do not reuse an owner or
+root key. The workflow also sends
+`PasswordAuthentication=no`, `KbdInteractiveAuthentication=no`,
+`ForwardAgent=no`, `ForwardX11=no`, `ClearAllForwardings=yes`, and
+`RequestTTY=no`, and keeps `StrictHostKeyChecking=yes` with the owner-pinned
+`PROD_SSH_KNOWN_HOSTS` value. It never runs `ssh-keyscan`.
+
+### 4. Verify tools and the existing PostgreSQL volume without starting services
+
+Run these checks as the deployment account where appropriate. They may inspect
+the existing volume but must not start Compose or create a new volume:
+
+```bash
+sudo -u reminder-deploy git --version
+sudo -u reminder-deploy docker version
+sudo -u reminder-deploy docker compose version
+sudo -u reminder-deploy flock --version
+
+volume_metadata="$(sudo -u reminder-deploy docker volume inspect \
+  --format '{{.Name}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.volume"}}' \
+  reminder_bot_postgres_data)"
+test "${volume_metadata}" = "reminder_bot_postgres_data|reminder_bot|postgres_data"
+pg_version="$(sudo -u reminder-deploy docker run --rm \
+  --mount type=volume,source=reminder_bot_postgres_data,target=/var/lib/postgresql/data,readonly \
+  postgres:17 sh -c 'cat /var/lib/postgresql/data/PG_VERSION')"
+test "${pg_version}" = 17
+```
+
+If any check fails, stop with `HUMAN_REQUIRED`. Do not run `docker volume
+create`, do not rename/copy PostgreSQL data files, and do not use `down` with
+volume removal. Validate Compose syntax only:
+
+```bash
+sudo -u reminder-deploy env \
+  REMINDER_BOT_IMAGE=reminder-bot:local \
+  APP_PUBLISH_HOST=127.0.0.1 \
+  docker compose -p reminder_bot config --quiet
+```
+
+This procedure deliberately does not run `docker compose up`, migrations, or
+the deployment script. It also never inspects, restarts, stops, prunes, or
+reconfigures `mtproxy`.
+
+### 5. Configure owner-controlled GitHub values, but leave deployment off
+
+Variables:
+
+- `DEPLOY_ENABLED` (leave unset or `false`);
+- `PROD_SSH_HOST`;
+- `PROD_SSH_PORT`;
+- `PROD_SSH_USER=reminder-deploy`;
+- `PROD_APP_DIR=/opt/reminder-bot`.
+
+Secrets:
+
+- `PROD_SSH_PRIVATE_KEY`;
+- `PROD_SSH_KNOWN_HOSTS`.
+
+The known-host entry must be constructed from the owner-verified VPS host key
+fingerprint, not from runtime `ssh-keyscan`. Do not create or change these
+GitHub values as part of this repository task.
+
+## Deployment sequence and safety gates
+
+For an enabled, correctly bootstrapped deployment, the workflow and remote
+script perform this bounded sequence:
+
+1. validate the exact 40-character SHA and the successful `master` CI run;
+2. acquire the Reminder Bot-specific server lock
+   `/opt/reminder-bot/locks/deploy.lock` with a bounded `flock` wait;
+3. check out and load `reminder-bot:<FULL_SHA>`, verifying OCI labels;
+4. validate project `reminder_bot`, the exact named volume, labels, PG17, and
+   the polling invariant before live service changes;
+5. re-fetch `origin/master` and require the requested SHA;
+6. start/check PostgreSQL with `docker compose -p reminder_bot up -d --no-build db`;
+7. create a private custom-format `pg_dump` under
+   `/opt/reminder-bot/backups/<UTC>_pre-deploy_<FULL_SHA>.dump`, require success
+   and a non-empty file, then retain only the latest ten deploy-created dumps;
+8. re-fetch `origin/master`, then run the `migrate` service with
+   `--no-build`; backup failure or migration failure stops before bot/worker
+   replacement;
+9. re-fetch `origin/master` before application rollout, then controlled-restart
+   only the single `bot` and `worker` services with `--no-build`;
+10. require bot existence, running state, exact image, configured healthcheck
+    health, and local `/healthz` plus `/readyz` HTTP 200 responses;
+11. require the worker to have the exact image and running state, record its
+    restart count, observe it for ten seconds, and require the same container
+    and restart count at the end;
+12. re-fetch `origin/master`, atomically write the full SHA to
+    `/opt/reminder-bot/state/deployed-sha`, and emit
+    `Deployment verdict: ACTIVE <FULL_SHA>`.
+
+The lock path is Reminder Bot-specific and cannot affect `mtproxy`. A second
+deployment waits at most 30 seconds and then fails without Docker service or
+database mutation. GitHub Actions additionally serializes the production
+workflow with `cancel-in-progress: false`.
+
+## Stale and failure recovery
+
+- A stale SHA before database mutation fails closed before starting production
+  services.
+- If `master` advances while PostgreSQL starts or while the backup is made,
+  the deploy stops before migration.
+- If `master` advances after migration commits, the deploy fails visibly before
+  bot/worker replacement. No automatic database downgrade is attempted; let a
+  newer successful `master` deployment follow.
+- Migration failure leaves the existing bot/worker containers in place.
+- Readiness or worker-observation failure after rollout is a visible failed
+  deployment requiring diagnosis. Do not delete or replace the PostgreSQL
+  volume to recover.
+- Application rollback is a normal revert merged through protected `master`,
+  followed by green CI and a new exact-SHA deployment. Database recovery is a
+  separate owner-approved operation.
+
+The script never builds an application image on the VPS and never uses global
+Docker prune commands, volume deletion, destructive Compose volume options,
+raw PostgreSQL file copying, or commands against an unrelated Compose project.
 
 ## Secrets and logs
 
-The workflow does not print `.env`, private keys, or known-host content. SSH material exists only in the ephemeral GitHub runner and is removed in an `always()` cleanup step.
-
-Application secrets remain on the VPS. Repository CI and deployment-contract tests require no Telegram or production database credentials.
+The workflow never uploads or prints `.env`, database passwords, private keys,
+or known-host contents. The private SSH material exists only on the ephemeral
+runner and is removed in an `always()` cleanup step. Backup output contains
+database data but remains on the VPS under a private directory and is never
+sent to CI logs.

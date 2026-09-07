@@ -147,6 +147,9 @@ cython_debug/
 # of Docker COPY . . so production builds cannot embed local data accidentally.
 test-results/
 test-artifacts/
+backups/
+locks/
+state/
 audio/
 media/
 stt-models/

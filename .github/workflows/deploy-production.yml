@@ -35,7 +35,7 @@ jobs:
         )
       }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Resolve exact deploy SHA
@@ -64,7 +64,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Reject stale master target
+      - name: Verify exact checkout
+        shell: bash
+        env:
+          DEPLOY_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${DEPLOY_SHA}" ]] || {
+            echo "Checkout did not land on the exact deploy SHA" >&2
+            exit 1
+          }
+
+      - name: Reject stale master target before build
         shell: bash
         env:
           DEPLOY_SHA: ${{ steps.target.outputs.sha }}
@@ -86,7 +97,7 @@ jobs:
           set -euo pipefail
           gh api \
             -H "Accept: application/vnd.github+json" \
-            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${DEPLOY_SHA}&event=push&status=success&per_page=10" \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${DEPLOY_SHA}&event=push&status=success&per_page=100" \
             > "${RUNNER_TEMP}/ci-runs.json"
           python - "${RUNNER_TEMP}/ci-runs.json" "${DEPLOY_SHA}" <<'PY'
           import json
@@ -106,6 +117,43 @@ jobs:
               raise SystemExit("No successful master push CI found for exact deploy SHA")
           PY
           rm -f "${RUNNER_TEMP}/ci-runs.json"
+
+      - name: Build one exact deployment image
+        shell: bash
+        env:
+          DEPLOY_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          image="reminder-bot:${DEPLOY_SHA}"
+          source_label="https://github.com/${GITHUB_REPOSITORY}"
+          docker build \
+            --label "org.opencontainers.image.revision=${DEPLOY_SHA}" \
+            --label "org.opencontainers.image.source=${source_label}" \
+            --tag "${image}" \
+            .
+          revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${image}")"
+          source="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "${image}")"
+          [[ "${revision}" == "${DEPLOY_SHA}" ]] || {
+            echo "Deployment image revision label mismatch" >&2
+            exit 1
+          }
+          [[ "${source}" == "${source_label}" ]] || {
+            echo "Deployment image source label mismatch" >&2
+            exit 1
+          }
+
+      - name: Reject stale master target after build
+        shell: bash
+        env:
+          DEPLOY_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          current_master_sha="$(git rev-parse origin/master)"
+          if [[ "${current_master_sha}" != "${DEPLOY_SHA}" ]]; then
+            echo "Refusing stale deploy after image build: origin/master=${current_master_sha}, target=${DEPLOY_SHA}" >&2
+            exit 1
+          fi
 
       - name: Validate production deployment configuration
         shell: bash
@@ -129,7 +177,7 @@ jobs:
           [[ "${PROD_SSH_USER}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || { echo "Invalid SSH user" >&2; exit 1; }
           [[ "${PROD_APP_DIR}" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "Invalid PROD_APP_DIR" >&2; exit 1; }
 
-      - name: Configure pinned SSH trust
+      - name: Configure pinned restricted SSH trust
         shell: bash
         env:
           PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
@@ -142,6 +190,38 @@ jobs:
           printf '%s\n' "${PROD_SSH_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
           chmod 600 "${HOME}/.ssh/known_hosts"
 
+      - name: Transfer exact image over pinned SSH
+        shell: bash
+        env:
+          DEPLOY_SHA: ${{ steps.target.outputs.sha }}
+          PROD_SSH_HOST: ${{ vars.PROD_SSH_HOST }}
+          PROD_SSH_PORT: ${{ vars.PROD_SSH_PORT }}
+          PROD_SSH_USER: ${{ vars.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          docker save "reminder-bot:${DEPLOY_SHA}" |
+            gzip -1 |
+            ssh \
+              -i "${HOME}/.ssh/reminder_bot_deploy" \
+              -p "${PROD_SSH_PORT}" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o PreferredAuthentications=publickey \
+              -o PasswordAuthentication=no \
+              -o KbdInteractiveAuthentication=no \
+              -o ForwardAgent=no \
+              -o ForwardX11=no \
+              -o ClearAllForwardings=yes \
+              -o PermitLocalCommand=no \
+              -o RequestTTY=no \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+              -o ConnectTimeout=10 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=3 \
+              "${PROD_SSH_USER}@${PROD_SSH_HOST}" \
+              docker load
+
       - name: Deploy exact protected master SHA
         shell: bash
         env:
@@ -152,15 +232,25 @@ jobs:
           PROD_APP_DIR: ${{ vars.PROD_APP_DIR }}
         run: |
           set -euo pipefail
-          printf -v remote_command 'bash -s -- %q %q' "${PROD_APP_DIR}" "${DEPLOY_SHA}"
+          printf -v remote_command 'REMINDER_BOT_IMAGE=%q bash -s -- %q %q' "reminder-bot:${DEPLOY_SHA}" "${PROD_APP_DIR}" "${DEPLOY_SHA}"
           ssh \
             -i "${HOME}/.ssh/reminder_bot_deploy" \
             -p "${PROD_SSH_PORT}" \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
+            -o PreferredAuthentications=publickey \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o ForwardAgent=no \
+            -o ForwardX11=no \
+            -o ClearAllForwardings=yes \
+            -o PermitLocalCommand=no \
+            -o RequestTTY=no \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
             -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
             "${PROD_SSH_USER}@${PROD_SSH_HOST}" \
             "${remote_command}" \
             < scripts/deploy_production.sh
