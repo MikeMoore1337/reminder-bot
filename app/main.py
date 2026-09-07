@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 
 from aiohttp import web
 
@@ -14,6 +15,23 @@ from app.web import build_web_app
 settings = get_settings()
 setup_logging(settings.log_level)
 logger = logging.getLogger(__name__)
+
+
+def _install_shutdown_handlers(
+    stop_event: asyncio.Event,
+    *,
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> None:
+    if loop is None:
+        loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            logger.info(
+                "Signal handler is unavailable; webhook shutdown remains runtime-managed",
+                extra={"extra_data": f"signal={signum.name}"},
+            )
 
 
 async def run_polling() -> None:
@@ -76,7 +94,9 @@ async def run_webhook(stop_event: asyncio.Event | None = None) -> None:
 
 async def main() -> None:
     if settings.normalized_bot_mode == "webhook":
-        await run_webhook()
+        stop_event = asyncio.Event()
+        _install_shutdown_handlers(stop_event)
+        await run_webhook(stop_event)
         return
     await run_polling()
 
