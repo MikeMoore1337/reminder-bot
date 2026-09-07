@@ -47,6 +47,13 @@ class Reminder(Base):
     __table_args__ = (
         Index("ix_reminders_status_remind_at_utc", "status", "remind_at_utc"),
         Index("ix_reminders_status_delivery_at_utc", "status", "delivery_at_utc"),
+        Index("ix_reminders_status_next_retry_at", "status", "next_retry_at"),
+        Index("ix_reminders_status_lease_until", "status", "lease_until"),
+        Index(
+            "ix_reminders_status_processing_started_at",
+            "status",
+            "processing_started_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -70,11 +77,21 @@ class Reminder(Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    processing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     recurrence_type: Mapped[str] = mapped_column(
         String(16), nullable=False, default=RecurrenceType.NONE.value
     )
     recurrence_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     recurrence_day_of_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    last_delivery_occurrence_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     user: Mapped[User] = relationship(back_populates="reminders")

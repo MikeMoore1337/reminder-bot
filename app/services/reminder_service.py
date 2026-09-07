@@ -4,9 +4,10 @@ import calendar
 import logging
 from datetime import datetime, timedelta
 from html import escape
-from typing import cast
+from typing import Any, cast
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.engine import CursorResult
 
 from app.db.models import RecurrenceType, Reminder, User
 from app.db.session import SessionLocal
@@ -204,19 +205,40 @@ async def list_pending_reminders(user: User) -> list[Reminder]:
         return list(result.scalars().all())
 
 
-async def delete_reminder_any_status(user: User, reminder_id: int) -> bool:
+async def delete_reminder_any_status(
+    user: User,
+    reminder_id: int,
+    *,
+    expected_message_id: int | None = None,
+) -> bool:
     async with SessionLocal() as session:
-        result = await session.execute(
-            select(Reminder).where(
-                Reminder.id == reminder_id,
-                Reminder.user_id == user.id,
+        filters = [Reminder.id == reminder_id, Reminder.user_id == user.id]
+        if expected_message_id is not None:
+            filters.extend(
+                [
+                    Reminder.status.in_(("pending", "sent")),
+                    Reminder.last_message_id == expected_message_id,
+                    Reminder.last_delivery_occurrence_utc.is_not(None),
+                    or_(
+                        and_(
+                            Reminder.recurrence_type == RecurrenceType.NONE.value,
+                            Reminder.last_delivery_occurrence_utc == Reminder.remind_at_utc,
+                        ),
+                        Reminder.recurrence_type != RecurrenceType.NONE.value,
+                    ),
+                    Reminder.lease_token.is_(None),
+                    Reminder.lease_until.is_(None),
+                    Reminder.processing_started_at.is_(None),
+                ]
             )
+        result = cast(
+            CursorResult[Any],
+            await session.execute(delete(Reminder).where(*filters)),
         )
-        reminder = result.scalar_one_or_none()
-        if reminder is None:
+        deleted = bool(result.rowcount)
+        if not deleted:
             return False
 
-        await session.delete(reminder)
         await session.commit()
 
         logger.info(
@@ -226,45 +248,113 @@ async def delete_reminder_any_status(user: User, reminder_id: int) -> bool:
         return True
 
 
-async def cancel_reminder(user: User, reminder_id: int) -> bool:
-    return await delete_reminder_any_status(user=user, reminder_id=reminder_id)
+async def cancel_reminder(
+    user: User,
+    reminder_id: int,
+    *,
+    expected_message_id: int | None = None,
+) -> bool:
+    return await delete_reminder_any_status(
+        user=user,
+        reminder_id=reminder_id,
+        expected_message_id=expected_message_id,
+    )
 
 
-async def snooze_reminder(user: User, reminder_id: int, minutes: int = 10) -> Reminder | None:
+async def snooze_reminder(
+    user: User,
+    reminder_id: int,
+    minutes: int = 10,
+    *,
+    expected_message_id: int | None = None,
+) -> Reminder | None:
+    if minutes < 1:
+        raise ValueError("Время откладывания должно быть больше 0 минут")
+
+    now_utc = utc_now()
+    snoozed_until_utc = now_utc + timedelta(minutes=minutes)
     async with SessionLocal() as session:
-        result = await session.execute(
-            select(Reminder).where(
-                Reminder.id == reminder_id,
-                Reminder.user_id == user.id,
+        filters = [
+            Reminder.id == reminder_id,
+            Reminder.user_id == user.id,
+            Reminder.lease_token.is_(None),
+            Reminder.lease_until.is_(None),
+            Reminder.processing_started_at.is_(None),
+        ]
+        if expected_message_id is not None:
+            filters.extend(
+                [
+                    Reminder.status == "sent",
+                    Reminder.recurrence_type == RecurrenceType.NONE.value,
+                    Reminder.last_message_id == expected_message_id,
+                    Reminder.last_delivery_occurrence_utc.is_not(None),
+                    Reminder.last_delivery_occurrence_utc == Reminder.remind_at_utc,
+                ]
             )
+        else:
+            filters.append(Reminder.status == "pending")
+
+        result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(Reminder)
+                .where(*filters)
+                .values(
+                    chat_id=user.chat_id,
+                    delivery_at_utc=snoozed_until_utc,
+                    snoozed_until_utc=snoozed_until_utc,
+                    status="pending",
+                    retry_count=0,
+                    attempt_count=0,
+                    processing_started_at=None,
+                    lease_until=None,
+                    lease_token=None,
+                    next_retry_at=None,
+                    error_text=None,
+                    last_message_id=None,
+                    last_delivery_occurrence_utc=None,
+                )
+            ),
         )
-        reminder = result.scalar_one_or_none()
-        if reminder is None:
+        if not result.rowcount:
             return None
 
-        reminder.chat_id = user.chat_id
-        canonical_at_utc, snoozed_until_utc = build_snooze_state(
-            reminder.remind_at_utc,
-            utc_now(),
-            minutes,
-        )
-        reminder.remind_at_utc = canonical_at_utc
-        reminder.delivery_at_utc = snoozed_until_utc
-        reminder.snoozed_until_utc = snoozed_until_utc
-        reminder.status = "pending"
-        reminder.retry_count = 0
-        reminder.error_text = None
-
+        reminder = (
+            await session.execute(select(Reminder).where(Reminder.id == reminder_id))
+        ).scalar_one()
         await session.commit()
-        await session.refresh(reminder)
         return cast(Reminder | None, reminder)
 
 
-async def set_last_message_id(reminder_id: int, message_id: int | None) -> None:
+async def set_last_message_id(
+    reminder_id: int,
+    message_id: int | None,
+    *,
+    lease_token: str,
+    occurrence_at_utc: datetime,
+    now_utc: datetime | None = None,
+) -> bool:
+    if not lease_token:
+        return False
+
     async with SessionLocal() as session, session.begin():
-        reminder = await session.get(Reminder, reminder_id)
-        if reminder is not None:
-            reminder.last_message_id = message_id
+        result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(Reminder)
+                .where(
+                    Reminder.id == reminder_id,
+                    Reminder.status == "processing",
+                    Reminder.lease_token == lease_token,
+                    Reminder.lease_until > (now_utc or utc_now()),
+                )
+                .values(
+                    last_message_id=message_id,
+                    last_delivery_occurrence_utc=occurrence_at_utc,
+                )
+            ),
+        )
+        return bool(result.rowcount)
 
 
 async def get_stats() -> dict[str, int]:

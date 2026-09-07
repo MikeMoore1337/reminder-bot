@@ -58,7 +58,8 @@ calendar wall-clock rules.
 - Because canonical occurrence, schedule timezone, and delivery override are stored,
   a normal worker restart does not require in-memory scheduling state. Recovery of a
   reminder left in `processing` after a worker crash, including lease expiry and retry
-  ownership, remains the separate delivery-reliability scope of Issue #9.
+  ownership, is defined in the [worker delivery reliability contract](worker_delivery.md)
+  for Issue #9.
 
 ## User timezone contract
 
