@@ -79,36 +79,67 @@ The known legacy directory `/root/reminder_bot` and its `.env` must remain
 untouched. Never run a Docker cleanup command, `down` with volume removal, or
 any command naming the unrelated `mtproxy` Compose project.
 
-### 1. Create the dedicated account and directories
+### 1. Create the dedicated account, clone, and then runtime directories
 
-Use a dedicated non-root account; the examples use `reminder-deploy` and the
-canonical checkout `/opt/reminder-bot`:
+This is a first-bootstrap procedure. The dedicated non-root account uses a
+functional `/bin/bash` login shell because OpenSSH executes a forced command
+through the account's login shell with `-c`. That does not provide interactive
+SSH: the password is locked, the CI key is forced/restricted, and the
+account-specific SSH policy below disables interactive features.
+
+The canonical checkout is `/opt/reminder-bot`. The target must be absent or an
+empty directory. An existing Git checkout, symlink, file, or non-empty
+directory is an unknown deployment state and requires `HUMAN_REQUIRED`; never
+delete or replace it. Runtime directories are deliberately created only after
+the clone succeeds:
 
 ```bash
 if ! getent passwd reminder-deploy >/dev/null; then
-  sudo useradd --system --create-home --shell /usr/sbin/nologin reminder-deploy
+  sudo useradd --system --create-home --shell /bin/bash reminder-deploy
+else
+  current_shell="$(getent passwd reminder-deploy | awk -F: '{print $7}')"
+  case "${current_shell}" in
+    /bin/bash|/bin/sh) ;;
+    *) sudo usermod --shell /bin/bash reminder-deploy ;;
+  esac
 fi
-sudo install -d -o reminder-deploy -g reminder-deploy -m 0755 /opt/reminder-bot
-sudo install -d -o reminder-deploy -g reminder-deploy -m 0700 \
-  /opt/reminder-bot/backups /opt/reminder-bot/locks /opt/reminder-bot/state
-```
+sudo passwd --lock reminder-deploy
+case "$(getent passwd reminder-deploy | awk -F: '{print $7}')" in
+  /bin/bash|/bin/sh) ;;
+  *) printf 'HUMAN_REQUIRED: reminder-deploy must use /bin/bash or /bin/sh.\n' >&2; exit 1 ;;
+esac
 
-If `/opt/reminder-bot` exists but is not a Git checkout, stop for human
-review. Do not delete or replace it:
-
-```bash
-if [ ! -d /opt/reminder-bot/.git ]; then
-  test ! -e /opt/reminder-bot/.git
-  sudo -u reminder-deploy git clone --branch master --single-branch \
-    https://github.com/MikeMoore1337/reminder-bot.git /opt/reminder-bot
+app_dir=/opt/reminder-bot
+if sudo test -e "${app_dir}" || sudo test -L "${app_dir}"; then
+  if sudo test -L "${app_dir}" || ! sudo test -d "${app_dir}"; then
+    printf 'HUMAN_REQUIRED: %s is not a directory; do not replace it.\n' "${app_dir}" >&2
+    exit 1
+  fi
+  if sudo test -e "${app_dir}/.git" || \
+    [ -n "$(sudo find "${app_dir}" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    printf 'HUMAN_REQUIRED: %s is non-empty or already a Git checkout; do not replace it.\n' \
+      "${app_dir}" >&2
+    exit 1
+  fi
+else
+  sudo install -d -o reminder-deploy -g reminder-deploy -m 0755 "${app_dir}"
 fi
-test "$(sudo -u reminder-deploy git -C /opt/reminder-bot remote get-url origin)" \
+sudo chown reminder-deploy:reminder-deploy "${app_dir}"
+sudo chmod 0755 "${app_dir}"
+
+sudo -u reminder-deploy git clone --branch master --single-branch \
+  https://github.com/MikeMoore1337/reminder-bot.git "${app_dir}"
+test -d "${app_dir}/.git"
+test "$(sudo -u reminder-deploy git -C "${app_dir}" remote get-url origin)" \
   = "https://github.com/MikeMoore1337/reminder-bot.git"
+
+sudo install -d -o reminder-deploy -g reminder-deploy -m 0700 \
+  "${app_dir}/backups" "${app_dir}/locks" "${app_dir}/state"
 ```
 
-The clone command is allowed only when the path is absent. Do not use
-`git reset --hard`, `git clean`, or a broad cleanup to repair a partial
-checkout.
+Do not use `git reset --hard`, `git clean`, or a broad cleanup to repair a
+partial checkout. If the clone fails, stop and investigate before creating
+runtime state or copying `.env`.
 
 ### 2. Preserve and copy the production environment securely
 
@@ -265,8 +296,9 @@ script perform this bounded sequence:
 8. re-fetch `origin/master`, then run the `migrate` service with
    `--no-build`; backup failure or migration failure stops before bot/worker
    replacement;
-9. re-fetch `origin/master` before application rollout, then controlled-restart
-   only the single `bot` and `worker` services with `--no-build`;
+9. re-fetch `origin/master` before application rollout, then replace only the
+   single `bot` and `worker` services with
+   `docker compose -p reminder_bot up -d --no-build --no-deps --force-recreate bot worker`;
 10. require bot existence, running state, exact image, configured healthcheck
     health, and local `/healthz` plus `/readyz` HTTP 200 responses;
 11. require the worker to have the exact image and running state, record its

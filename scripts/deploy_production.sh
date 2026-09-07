@@ -258,7 +258,7 @@ fi
 # Once migration has committed, a stale target is still a visible failure; no
 # automatic database downgrade is attempted.
 assert_current_master
-"${compose[@]}" up -d --no-build --force-recreate bot worker
+"${compose[@]}" up -d --no-build --no-deps --force-recreate bot worker
 
 bot_ready=0
 for ((attempt = 1; attempt <= 30; attempt++)); do

@@ -170,6 +170,7 @@ def test_remote_deploy_script_contains_the_production_safety_contract() -> None:
         "RestartCount",
         "duration=10s",
         "--no-build",
+        "--no-deps",
         "--force-recreate",
         "--abort-on-container-exit",
         "--exit-code-from migrate",
@@ -205,6 +206,9 @@ def test_bootstrap_documentation_covers_legacy_env_and_restricted_ssh() -> None:
         "/root/reminder_bot",
         "0600",
         "reminder-deploy",
+        "/bin/bash",
+        "functional `/bin/bash` login shell",
+        "HUMAN_REQUIRED",
         "reminder_bot_postgres_data",
         "com.docker.compose.project",
         "PG_VERSION",
@@ -232,6 +236,57 @@ def test_bootstrap_documentation_covers_legacy_env_and_restricted_ssh() -> None:
         "SSH command is not allowed",
     ):
         assert fragment in wrapper
+
+
+def test_bootstrap_documentation_is_clone_first_and_shell_compatible() -> None:
+    docs = (ROOT / "docs" / "production-deploy.md").read_text(encoding="utf-8")
+    bootstrap_section = docs.split(
+        "### 1. Create the dedicated account, clone, and then runtime directories", 1
+    )[1].split("### 2. Preserve and copy the production environment securely", 1)[0]
+    code_blocks = re.findall(r"```bash\n(.*?)```", bootstrap_section, flags=re.DOTALL)
+    assert len(code_blocks) == 1
+    bootstrap = code_blocks[0]
+
+    clone_index = bootstrap.index("git clone")
+    runtime_index = bootstrap.index('"${app_dir}/backups"')
+    empty_check_index = bootstrap.index("mindepth 1")
+
+    assert "--shell /bin/bash" in bootstrap
+    assert "/usr/sbin/nologin" not in bootstrap
+    assert empty_check_index < clone_index < runtime_index
+    assert "HUMAN_REQUIRED" in bootstrap
+    assert 'sudo test -L "${app_dir}"' in bootstrap
+    assert not any(
+        f'"${{app_dir}}/{runtime_dir}"' in bootstrap[:clone_index]
+        for runtime_dir in ("backups", "locks", "state")
+    )
+    assert "sudo -u reminder-deploy git clone" in bootstrap
+    assert '"${app_dir}"' in bootstrap
+
+    section2_start = docs.index("### 2. Preserve and copy the production environment securely")
+    section3_start = docs.index("### 3. Install the restricted SSH command boundary")
+    section4_start = docs.index(
+        "### 4. Verify tools and the existing PostgreSQL volume without starting services"
+    )
+    env_section = docs[section2_start:section3_start]
+    ssh_section = docs[section3_start:section4_start]
+    volume_section = docs[section4_start:]
+
+    assert "/root/reminder_bot/.env" in env_section
+    assert "authorized-keys" in ssh_section
+    assert "reminder_bot_postgres_data" in volume_section
+    assert "PG_VERSION" in volume_section
+    assert docs.index("git clone") < docs.index("/opt/reminder-bot/backups")
+
+
+def test_ssh_wrapper_rejects_arbitrary_original_command() -> None:
+    wrapper = SSH_WRAPPER.read_text(encoding="utf-8")
+
+    original_command = 'original_command="${SSH_ORIGINAL_COMMAND:-}"'
+    assert original_command in wrapper
+    assert 'if [[ "${original_command}" == "docker load" ]]' in wrapper
+    assert 'fail "SSH command is not allowed"' in wrapper
+    assert wrapper.index('fail "SSH command is not allowed"') > wrapper.index(original_command)
 
 
 def _deployment_fixture(tmp_path: Path) -> tuple[dict[str, Path], str, dict[str, str]]:
@@ -456,10 +511,21 @@ def test_deploy_success_uses_exact_image_project_volume_backup_and_marker(tmp_pa
     assert "compose -p reminder_bot config --quiet" in calls
     assert "compose -p reminder_bot up -d --no-build db" in calls
     assert "compose -p reminder_bot --profile tools up --no-build --no-deps" in calls
-    assert "compose -p reminder_bot up -d --no-build --force-recreate bot worker" in calls
+    rollout = "compose -p reminder_bot up -d --no-build --no-deps --force-recreate bot worker"
+    assert rollout in calls
     assert "pg_dump" in calls
     assert "docker compose build" not in calls
     assert calls.index("pg_dump") < calls.index("migrate") < calls.index("bot worker")
+    call_lines = calls.splitlines()
+    migration_index = next(index for index, line in enumerate(call_lines) if "migrate" in line)
+    post_migration_compose = [
+        line for line in call_lines[migration_index + 1 :] if line.startswith("compose")
+    ]
+    assert rollout in post_migration_compose
+    assert not any(
+        " db" in line and not any(read_only in line for read_only in ("ps -q db", "inspect"))
+        for line in post_migration_compose
+    )
     assert all(
         "compose -p reminder_bot" in line
         for line in calls.splitlines()
@@ -525,7 +591,10 @@ def test_migration_failure_prevents_bot_worker_replacement(tmp_path: Path) -> No
 
     assert result.returncode != 0
     assert "database migration failed" in result.stderr
-    assert "compose -p reminder_bot up -d --no-build --force-recreate bot worker" not in calls
+    assert (
+        "compose -p reminder_bot up -d --no-build --no-deps --force-recreate bot worker"
+        not in calls
+    )
     assert not (paths["state"] / "deployed-sha").exists()
 
 
