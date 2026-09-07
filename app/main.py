@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 
 from aiohttp import web
 
@@ -9,11 +10,28 @@ from app.bot_commands import setup_bot_commands
 from app.bot_factory import create_bot, create_dispatcher
 from app.config import get_settings
 from app.logging_config import setup_logging
-from app.web import build_web_app
+from app.web import build_probe_app, build_web_app
 
 settings = get_settings()
 setup_logging(settings.log_level)
 logger = logging.getLogger(__name__)
+
+
+def _install_shutdown_handlers(
+    stop_event: asyncio.Event,
+    *,
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> None:
+    if loop is None:
+        loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            logger.info(
+                "Signal handler is unavailable; webhook shutdown remains runtime-managed",
+                extra={"extra_data": f"signal={signum.name}"},
+            )
 
 
 async def run_polling() -> None:
@@ -21,16 +39,28 @@ async def run_polling() -> None:
     bot = create_bot()
     dp = create_dispatcher()
 
-    await setup_bot_commands(bot)
+    runner: web.AppRunner | None = None
 
     try:
+        await setup_bot_commands(bot)
+
+        runner = web.AppRunner(build_probe_app())
+        await runner.setup()
+        site = web.TCPSite(runner, host=settings.app_host, port=settings.app_port)
+        await site.start()
+        logger.info(
+            "Probe server started",
+            extra={"extra_data": f"host={settings.app_host} port={settings.app_port}"},
+        )
         await dp.start_polling(bot, allowed_updates=settings.allowed_updates)
     finally:
+        if runner is not None:
+            await runner.cleanup()
         await bot.session.close()
         logger.info("Bot application stopped")
 
 
-async def run_webhook() -> None:
+async def run_webhook(stop_event: asyncio.Event | None = None) -> None:
     logger.info(
         "Starting bot application in webhook mode",
         extra={
@@ -62,8 +92,11 @@ async def run_webhook() -> None:
     try:
         await site.start()
         logger.info("Webhook server started")
-        while True:
-            await asyncio.sleep(3600)
+        if stop_event is None:
+            while True:
+                await asyncio.sleep(3600)
+        else:
+            await stop_event.wait()
     finally:
         await bot.delete_webhook(drop_pending_updates=False)
         await runner.cleanup()
@@ -73,7 +106,9 @@ async def run_webhook() -> None:
 
 async def main() -> None:
     if settings.normalized_bot_mode == "webhook":
-        await run_webhook()
+        stop_event = asyncio.Event()
+        _install_shutdown_handlers(stop_event)
+        await run_webhook(stop_event)
         return
     await run_polling()
 

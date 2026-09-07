@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reminder-bot-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install development lock
+        run: python -m pip install --requirement requirements-dev.txt
+
+      - name: Check lockfile freshness
+        run: |
+          pip-compile --index-url https://pypi.org/simple --no-emit-index-url --strip-extras --output-file=requirements.txt pyproject.toml
+          pip-compile --index-url https://pypi.org/simple --no-emit-index-url --strip-extras --extra dev --output-file=requirements-dev.txt pyproject.toml
+          git diff --exit-code -- requirements.txt requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check app tests alembic --no-cache
+
+      - name: Ruff format
+        run: ruff format --check app tests alembic --no-cache
+
+      - name: Mypy
+        run: mypy app --ignore-missing-imports --cache-dir .mypy_cache/ci
+
+  tests-postgres:
+    name: tests-postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BOT_TOKEN: ci-test-token
+      DATABASE_URL: postgresql+asyncpg://reminder_test:reminder_test@127.0.0.1:5432/reminder_test
+      REMINDER_BOT_TEST_DATABASE_URL: postgresql+asyncpg://reminder_test:reminder_test@127.0.0.1:5432/reminder_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: reminder_test
+          POSTGRES_PASSWORD: reminder_test
+          POSTGRES_DB: reminder_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U reminder_test -d reminder_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install development lock
+        run: python -m pip install --requirement requirements-dev.txt
+
+      - name: Validate migration chain and round trip
+        run: |
+          test "$(alembic heads | grep -c '(head)')" -eq 1
+          test "$(alembic heads | grep -c '20260907_0004')" -eq 1
+          alembic upgrade head
+          alembic downgrade 20260907_0003
+          alembic upgrade head
+
+      - name: Run PostgreSQL worker integration suite without skips
+        run: python -m pytest -q tests/test_reminder_worker_postgres.py -p no:cacheprovider
+
+      - name: Run full test suite
+        run: python -m pytest -q -p no:cacheprovider
+
+  docker-smoke:
+    name: docker-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create secret-free Compose environment
+        run: cp .env.example .env
+
+      - name: Validate Compose configuration
+        run: |
+          docker compose config --quiet
+          docker compose --profile tools config --quiet
+
+      - name: Build production image
+        run: docker build --tag reminder-bot:ci .
+
+      - name: Verify runtime image has no development tools
+        run: |
+          docker run --rm \
+            --env BOT_TOKEN=ci-test-token \
+            --env DATABASE_URL=postgresql+asyncpg://reminder_test:reminder_test@db:5432/reminder_test \
+            --entrypoint python reminder-bot:ci -c '
+          import importlib.util
+          forbidden = ("pytest", "pytest_asyncio", "ruff", "mypy", "pre_commit", "piptools")
+          present = [name for name in forbidden if importlib.util.find_spec(name) is not None]
+          assert not present, present
+          import app.web
+          import app.worker_main
+          '
+
+      - name: Smoke polling probe server in runtime image
+        run: |
+          docker run --rm \
+            --env BOT_TOKEN=ci-test-token \
+            --env DATABASE_URL=postgresql+asyncpg://reminder_test:reminder_test@db:5432/reminder_test \
+            --entrypoint python reminder-bot:ci -c '
+          import asyncio
+          from aiohttp import ClientSession, web
+          from app.web import build_probe_app
+
+          async def main():
+              app = build_probe_app()
+              paths = {route.resource.canonical for route in app.router.routes()}
+              assert paths == {"/healthz", "/readyz"}, paths
+              runner = web.AppRunner(app)
+              await runner.setup()
+              site = web.TCPSite(runner, host="127.0.0.1", port=18080)
+              await site.start()
+              try:
+                  async with ClientSession() as session:
+                      async with session.get("http://127.0.0.1:18080/healthz") as response:
+                          assert response.status == 200
+              finally:
+                  await runner.cleanup()
+
+          asyncio.run(main())
+          print("POLLING_PROBE_SMOKE_OK")
+          '
+
+      - name: Validate migration container command
+        run: docker compose --profile tools run --rm --no-deps migrate alembic heads
+
+      - name: Run Compose migration smoke without Telegram API
+        run: |
+          trap 'docker compose down --volumes --remove-orphans || true; rm -f .env' EXIT
+          docker compose up -d db
+          docker compose --profile tools run --rm migrate

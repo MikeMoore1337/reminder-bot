@@ -88,6 +88,28 @@ Before merging, verify all of the following:
 
 Never bypass or force merge, ignore a required check, merge a PR with `CHANGES REQUESTED`, or treat a changed head as covered by an earlier approval. Before Issue #13 establishes required CI checks, exact approval plus passing local/integration checks, a mergeable PR, and no blockers are sufficient. After Issue #13, required checks are mandatory and auto-merge is preferred when it preserves the same exact-head and review guards.
 
+After Issue #13, the repository's configured required checks are the exact GitHub Actions jobs
+`quality`, `tests-postgres`, and `docker-smoke`. A self-merge must wait for all three checks to be
+green on the exact approved head; an empty or missing check result is not green. Repository
+auto-merge may be enabled and preferred after review when exact-head protection, review guards,
+and branch policy remain effective.
+
+## CI and dependency baseline
+
+- Python 3.12 is the canonical CI/runtime baseline for this repository. Docker, Ruff, and mypy
+  are aligned to that version; do not add a version matrix without an approved compatibility need.
+- Direct runtime dependencies are declared in `pyproject.toml` and compiled into
+  `requirements.txt`. The `dev` extra is compiled into `requirements-dev.txt` and is never
+  installed by the production Docker image.
+- Lockfiles target Linux/Python 3.12, matching CI and the production container; do not commit
+  platform-only resolution differences from a Windows host.
+- `pip-tools` is the current lock maintenance tool. Do not migrate to Poetry, PDM, or uv as part
+  of routine Issue work without a separate decision and measured benefit.
+- CI is secret-free: tests use fakes and a controlled PostgreSQL service, never production
+  Telegram credentials or databases.
+- `/healthz` is process liveness and must not query PostgreSQL. `/readyz` is bounded database
+  readiness and must fail closed with HTTP 503 without exposing connection details.
+
 ## VPS constraints
 
 Target a small Linux CPU-only VPS with limited RAM:
