@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import UTC, date, datetime, time, timedelta
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -15,6 +16,7 @@ from app.db.models import (
     ReminderState,
     User,
 )
+from app.handlers import reminders as reminders_handler
 from app.services import clarification_service, reminder_service
 from app.services.recurrence import (
     completion_relative_rule,
@@ -194,6 +196,99 @@ def test_ambiguous_input_never_becomes_a_reminder_and_can_be_resolved() -> None:
     assert isinstance(resolved, ParsedReminder)
     assert resolved.local_dt == datetime(2026, 9, 8, 18, 30, tzinfo=ZoneInfo("Europe/Moscow"))
     assert resolved.text == "позвонить"
+
+
+def test_clarification_time_only_answers_are_calendar_safe() -> None:
+    request = parse_reminder_input("напомни после обеда позвонить", MOSCOW_NOW)
+    assert isinstance(request, ClarificationRequest)
+
+    same_day = parse_clarification_answer(
+        request.raw_text,
+        "14:00",
+        now_local=MOSCOW_NOW,
+    )
+    assert isinstance(same_day, ParsedReminder)
+    assert same_day.local_dt == datetime(
+        2026,
+        9,
+        7,
+        14,
+        0,
+        tzinfo=ZoneInfo("Europe/Moscow"),
+    )
+    assert same_day.text == "позвонить"
+
+    after_time = parse_clarification_answer(
+        request.raw_text,
+        "14:00",
+        now_local=MOSCOW_NOW.replace(hour=15),
+    )
+    assert isinstance(after_time, ParsedReminder)
+    assert after_time.local_dt == datetime(
+        2026,
+        9,
+        8,
+        14,
+        0,
+        tzinfo=ZoneInfo("Europe/Moscow"),
+    )
+
+
+def test_after_lunch_answer_creates_reminder_through_handler(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            monkeypatch.setattr(clarification_service, "SessionLocal", session_factory)
+            monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
+            user = User(
+                telegram_user_id=506,
+                chat_id=606,
+                timezone="Europe/Moscow",
+            )
+            async with session_factory() as session:
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+
+            request = parse_reminder_input(
+                "напомни после обеда позвонить",
+                MOSCOW_NOW,
+            )
+            assert isinstance(request, ClarificationRequest)
+            await clarification_service.create_clarification(user, request)
+            message = type(
+                "FakeMessage",
+                (),
+                {"text": "14:00", "answer": AsyncMock()},
+            )()
+
+            assert await reminders_handler._handle_clarification(message, user)
+            message.answer.assert_awaited_once()
+            async with session_factory() as session:
+                reminders = list(
+                    (
+                        await session.scalars(select(Reminder).where(Reminder.user_id == user.id))
+                    ).all()
+                )
+            assert len(reminders) == 1
+            assert reminders[0].text == "позвонить"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_weekly_interval_above_bound_returns_bounded_feedback() -> None:
+    result = parse_reminder_input(
+        "напомни каждые 53 недели по понедельникам в 09:00 отчёт",
+        MOSCOW_NOW,
+    )
+
+    assert isinstance(result, ClarificationRequest)
+    assert "от 1 до 52" in result.prompt
 
 
 def test_calendar_rules_handle_dst_month_end_and_leap_year() -> None:
@@ -560,6 +655,110 @@ def test_completion_relative_snooze_child_advances_parent_from_done(monkeypatch)
                 assert restored_parent.status == "pending"
                 assert restored_parent.remind_at_utc.replace(tzinfo=UTC) == expected_next
                 assert restored_child.state == ReminderState.COMPLETED.value
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_bounded_recurrence_done_schedules_or_terminates_and_persists(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
+            user = User(
+                telegram_user_id=505,
+                chat_id=605,
+                timezone="Europe/Moscow",
+            )
+            async with session_factory() as session:
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+
+            async def seed(occurrence_at: datetime, message_id: int, rule: dict) -> tuple[int, int]:
+                async with session_factory() as session:
+                    reminder = Reminder(
+                        user_id=user.id,
+                        chat_id=user.chat_id,
+                        text="bounded report",
+                        remind_at_utc=occurrence_at,
+                        delivery_at_utc=None,
+                        schedule_timezone=user.timezone,
+                        status="sent",
+                        state=ReminderState.DELIVERED.value,
+                        action_revision=0,
+                        recurrence_type="advanced",
+                        recurrence_interval=1,
+                        recurrence_rule=json.dumps(rule),
+                        last_message_id=message_id,
+                        last_delivery_occurrence_utc=occurrence_at,
+                    )
+                    session.add(reminder)
+                    await session.flush()
+                    occurrence = ReminderOccurrence(
+                        reminder_id=reminder.id,
+                        occurrence_at_utc=occurrence_at,
+                        delivery_at_utc=occurrence_at,
+                        status=OccurrenceState.DELIVERED.value,
+                        action_revision=0,
+                        message_id=message_id,
+                        delivered_at=occurrence_at,
+                    )
+                    session.add(occurrence)
+                    await session.commit()
+                    return reminder.id, occurrence.id
+
+            rule = weekly_rule(
+                [0],
+                time(9),
+                anchor_week=date(2026, 9, 7),
+                until=date(2026, 9, 21),
+            )
+            non_final_at = to_utc(datetime(2026, 9, 14, 9, 0), user.timezone)
+            non_final_id, non_final_occurrence_id = await seed(non_final_at, 80, rule)
+            non_final_done_at = to_utc(datetime(2026, 9, 14, 10, 0), user.timezone)
+            monkeypatch.setattr(reminder_service, "utc_now", lambda: non_final_done_at)
+            assert await reminder_service.complete_reminder(
+                user,
+                non_final_id,
+                expected_revision=0,
+                expected_occurrence_id=non_final_occurrence_id,
+                expected_message_id=80,
+            )
+            expected_next = to_utc(datetime(2026, 9, 21, 9, 0), user.timezone)
+            async with session_factory() as session:
+                scheduled = await session.get(Reminder, non_final_id)
+                assert scheduled is not None
+                assert scheduled.state == ReminderState.SCHEDULED.value
+                assert scheduled.status == "pending"
+                assert scheduled.remind_at_utc.replace(tzinfo=UTC) == expected_next
+
+            final_at = expected_next
+            final_id, final_occurrence_id = await seed(final_at, 81, rule)
+            final_done_at = to_utc(datetime(2026, 9, 21, 10, 0), user.timezone)
+            monkeypatch.setattr(reminder_service, "utc_now", lambda: final_done_at)
+            assert await reminder_service.complete_reminder(
+                user,
+                final_id,
+                expected_revision=0,
+                expected_occurrence_id=final_occurrence_id,
+                expected_message_id=81,
+            )
+
+            # A fresh ORM load proves the terminal state survives a restart.
+            async with session_factory() as session:
+                completed = await session.get(Reminder, final_id)
+                assert completed is not None
+                assert completed.state == ReminderState.COMPLETED.value
+                assert completed.status == "sent"
+                assert completed.delivery_at_utc is None
+                assert completed.last_message_id is None
+                assert completed.completed_at is not None
+                assert completed.completed_at.replace(tzinfo=UTC) == final_done_at
         finally:
             await engine.dispose()
 

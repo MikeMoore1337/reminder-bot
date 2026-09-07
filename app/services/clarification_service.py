@@ -6,9 +6,9 @@ from typing import Any, cast
 from sqlalchemy import delete, select
 from sqlalchemy.engine import CursorResult
 
-from app.db.models import ReminderClarification, User
+from app.db.models import Reminder, ReminderClarification, User
 from app.db.session import SessionLocal
-from app.services.reminder_parser import ClarificationRequest
+from app.services.reminder_parser import ClarificationRequest, ParsedReminder
 
 CLARIFICATION_TTL = timedelta(minutes=15)
 MAX_CLARIFICATION_TEXT_LENGTH = 4096
@@ -87,6 +87,65 @@ async def get_active_clarification(
             await session.delete(clarification)
             return None
         return clarification
+
+
+async def consume_clarification_and_create_reminder(
+    user: User,
+    clarification_id: int,
+    raw_text: str,
+    parsed: ParsedReminder,
+    *,
+    now_utc: datetime | None = None,
+) -> Reminder | None:
+    """Consume one exact clarification and create its reminder atomically.
+
+    The owner row is locked before the clarification row so this operation has
+    the same lock order as clarification replacement. A duplicate Telegram
+    retry waits for the first transaction and then finds the consumed row.
+    """
+
+    current_time = _as_utc(now_utc or datetime.now(UTC))
+    async with SessionLocal() as session, session.begin():
+        owner = await session.scalar(
+            select(User).where(User.id == user.id, User.chat_id == user.chat_id).with_for_update()
+        )
+        if owner is None:
+            raise ValueError("Пользователь не найден")
+
+        clarification = await session.scalar(
+            select(ReminderClarification)
+            .where(
+                ReminderClarification.id == clarification_id,
+                ReminderClarification.user_id == owner.id,
+                ReminderClarification.chat_id == owner.chat_id,
+                ReminderClarification.raw_text == raw_text,
+            )
+            .with_for_update()
+        )
+        if clarification is None:
+            return None
+        if _as_utc(clarification.expires_at) <= current_time:
+            await session.delete(clarification)
+            return None
+
+        # Import locally to keep the service dependency graph acyclic.
+        from app.services.reminder_service import create_reminder_in_session
+
+        reminder = await create_reminder_in_session(
+            session,
+            owner,
+            parsed.local_dt,
+            parsed.text,
+            parsed.recurrence_type,
+            parsed.recurrence_interval,
+            parsed.datetime_semantics,
+            parsed.recurrence_rule,
+            parsed.recurrence_day_of_month,
+            now_utc=current_time,
+        )
+        await session.delete(clarification)
+        await session.flush()
+        return reminder
 
 
 async def delete_clarification(user: User, clarification_id: int) -> bool:

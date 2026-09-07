@@ -109,6 +109,11 @@ resume the prompt; `/cancel` removes it. Invalid replies keep the same prompt, w
 an explicit date/time or full command creates the reminder through the normal service
 validation path.
 
+For `напомни после обеда ...`, a time-only answer such as `14:00` uses the
+user's local calendar: it targets today when that time is still ahead, otherwise
+the next local day. Clarification consumption and reminder creation share one
+transaction, so duplicate Telegram retries cannot create two reminders.
+
 Existing recurring reminders are migrated deterministically to a version 1 `legacy`
 rule from their scalar `recurrence_type`, `recurrence_interval`, and
 `recurrence_day_of_month` values. No existing schedule is reinterpreted; the scalar

@@ -96,6 +96,10 @@ to one user/chat, expires after 15 minutes, stores no Telegram update history, a
 is resolved only by an explicit command or date/time answer. `/cancel` clears both
 clarifications and action drafts.
 
+An `HH:MM` answer to `после обеда` means that time today if it is still in the
+future in the user's timezone, or the same time on the next local day otherwise.
+The resolved clarification and reminder are consumed/created atomically.
+
 ## Cancellation and retention
 
 `Delete` and `/cancel ID` perform an atomic persisted transition to

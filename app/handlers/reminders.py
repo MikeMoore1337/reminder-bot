@@ -19,8 +19,8 @@ from app.db.models import User
 from app.services import reminder_service
 from app.services.clarification_service import (
     cancel_clarification,
+    consume_clarification_and_create_reminder,
     create_clarification,
-    delete_clarification,
     get_active_clarification,
 )
 from app.services.reminder_parser import (
@@ -64,6 +64,7 @@ REMINDER_FORMAT_HINT = (
 )
 
 STALE_FEEDBACK = "Это действие уже неактуально"
+CLARIFICATION_STALE_FEEDBACK = "Это уточнение уже обработано или истекло"
 
 
 def _message_ids(message: Message) -> tuple[int, int] | None:
@@ -147,21 +148,20 @@ async def _handle_clarification(message: Message, user: User) -> bool:
         return True
 
     try:
-        reminder = await create_reminder(
+        reminder = await consume_clarification_and_create_reminder(
             user=user,
-            local_dt=parsed.local_dt,
-            text=parsed.text,
-            recurrence_type=parsed.recurrence_type,
-            recurrence_interval=parsed.recurrence_interval,
-            datetime_semantics=parsed.datetime_semantics,
-            recurrence_rule=parsed.recurrence_rule,
-            recurrence_day_of_month=parsed.recurrence_day_of_month,
+            clarification_id=clarification.id,
+            raw_text=clarification.raw_text,
+            parsed=parsed,
         )
     except ValueError as exc:
         await message.answer(str(exc))
         return True
 
-    await delete_clarification(user, clarification.id)
+    if reminder is None:
+        await message.answer(CLARIFICATION_STALE_FEEDBACK)
+        return True
+
     local_dt = from_utc_to_user(reminder.remind_at_utc, user.timezone)
     await message.answer(
         "Напоминание сохранено после уточнения.\n"

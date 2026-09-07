@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from app.db.models import RecurrenceType
 from app.services.recurrence import (
+    RecurrenceRuleError,
     completion_relative_rule,
     first_occurrence_after,
     legacy_rule,
@@ -421,12 +422,22 @@ def _parse_advanced_recurrence(
         )
     if until is None:
         until = tail_until
-    rule = _rule_from_prefix(
-        cleaned_prefix,
-        target_time=target_time,
-        now_local=now_local,
-        until=until,
-    )
+    try:
+        rule = _rule_from_prefix(
+            cleaned_prefix,
+            target_time=target_time,
+            now_local=now_local,
+            until=until,
+        )
+    except RecurrenceRuleError:
+        return ClarificationRequest(
+            kind="recurrence_rule",
+            prompt=(
+                "Интервал недельного правила должен быть от 1 до 52. "
+                "Повтори команду с допустимым интервалом. Черновик действует 15 минут."
+            ),
+            raw_text=text[:MAX_INPUT_LENGTH],
+        )
     if rule is None:
         return _NO_MATCH
     reminder_text = cleaned_tail.strip()
@@ -697,9 +708,19 @@ def parse_clarification_answer(
     if local_dt is not None and reminder_text:
         return ParsedReminder(local_dt=local_dt, text=reminder_text)
 
-    if re.fullmatch(r"\d{1,2}:\d{2}", value) and "завтра вечером" in raw_text.lower():
+    normalized_raw = raw_text.lower().replace("ё", "е")
+    if re.fullmatch(r"\d{1,2}:\d{2}", value) and (
+        "завтра вечером" in normalized_raw or "после обеда" in normalized_raw
+    ):
         hour, minute = (int(part) for part in value.split(":", 1))
-        local_dt = _build_time(now_local + timedelta(days=1), str(hour), str(minute))
+        tomorrow = "завтра вечером" in normalized_raw
+        local_dt = _build_time(
+            now_local + timedelta(days=1 if tomorrow else 0),
+            str(hour),
+            str(minute),
+        )
+        if not tomorrow and local_dt is not None and local_dt <= now_local:
+            local_dt += timedelta(days=1)
         if local_dt is not None and reminder_text:
             return ParsedReminder(local_dt=local_dt, text=reminder_text)
     return None

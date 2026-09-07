@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     ActionDraft,
@@ -347,7 +348,8 @@ def parse_edit_schedule(
     )
 
 
-async def create_reminder(
+async def create_reminder_in_session(
+    session: AsyncSession,
     user: User,
     local_dt: datetime,
     text: str,
@@ -356,6 +358,8 @@ async def create_reminder(
     datetime_semantics: DatetimeSemantics = "wall_clock",
     recurrence_rule: Mapping[str, Any] | str | None = None,
     recurrence_day_of_month: int | None = None,
+    *,
+    now_utc: datetime | None = None,
 ) -> Reminder:
     canonical_rule: dict[str, Any] | None = None
     if recurrence_rule is not None:
@@ -384,7 +388,7 @@ async def create_reminder(
         semantics=datetime_semantics,
     )
     _validate_initial_rule_date(remind_at_utc, canonical_rule, user.timezone)
-    now_utc = utc_now()
+    current_time = _as_utc(now_utc or utc_now())
     if recurrence_day_of_month is None and recurrence_type == RecurrenceType.MONTHLY.value:
         recurrence_day_of_month = local_dt.day
     if canonical_rule is None and recurrence_type != RecurrenceType.NONE.value:
@@ -394,11 +398,11 @@ async def create_reminder(
             recurrence_day_of_month,
         )
 
-    if recurrence_type == RecurrenceType.NONE.value and remind_at_utc <= now_utc:
+    if recurrence_type == RecurrenceType.NONE.value and remind_at_utc <= current_time:
         raise ValueError("Время напоминания уже прошло")
 
     if recurrence_type != RecurrenceType.NONE.value:
-        while remind_at_utc <= now_utc:
+        while remind_at_utc <= current_time:
             next_dt = calculate_next_occurrence(
                 remind_at_utc,
                 recurrence_type,
@@ -410,40 +414,65 @@ async def create_reminder(
             if next_dt is None:
                 break
             remind_at_utc = next_dt
-        if remind_at_utc <= now_utc:
+        if remind_at_utc <= current_time:
             raise ValueError("Первое повторение должно быть в будущем и попадать в правило")
 
-    async with SessionLocal() as session:
-        reminder = Reminder(
-            user_id=user.id,
-            chat_id=user.chat_id,
-            text=text.strip(),
-            remind_at_utc=remind_at_utc,
-            status="pending",
-            state=ReminderState.SCHEDULED.value,
-            action_revision=0,
-            schedule_timezone=user.timezone,
-            delivery_at_utc=remind_at_utc,
-            recurrence_type=recurrence_type,
-            recurrence_interval=recurrence_interval,
-            recurrence_day_of_month=recurrence_day_of_month,
-            recurrence_rule=encode_rule(canonical_rule) if canonical_rule is not None else None,
-        )
-        session.add(reminder)
-        await session.commit()
-        await session.refresh(reminder)
+    reminder = Reminder(
+        user_id=user.id,
+        chat_id=user.chat_id,
+        text=text.strip(),
+        remind_at_utc=remind_at_utc,
+        status="pending",
+        state=ReminderState.SCHEDULED.value,
+        action_revision=0,
+        schedule_timezone=user.timezone,
+        delivery_at_utc=remind_at_utc,
+        recurrence_type=recurrence_type,
+        recurrence_interval=recurrence_interval,
+        recurrence_day_of_month=recurrence_day_of_month,
+        recurrence_rule=encode_rule(canonical_rule) if canonical_rule is not None else None,
+    )
+    session.add(reminder)
+    await session.flush()
 
-        logger.info(
-            "Created reminder",
-            extra={
-                "extra_data": (
-                    f"reminder_id={reminder.id} user_id={user.id} "
-                    f"remind_at_utc={reminder.remind_at_utc.isoformat()} "
-                    f"recurrence_type={reminder.recurrence_type} "
-                    f"recurrence_interval={reminder.recurrence_interval}"
-                )
-            },
-        )
+    logger.info(
+        "Created reminder",
+        extra={
+            "extra_data": (
+                f"reminder_id={reminder.id} user_id={user.id} "
+                f"remind_at_utc={reminder.remind_at_utc.isoformat()} "
+                f"recurrence_type={reminder.recurrence_type} "
+                f"recurrence_interval={reminder.recurrence_interval}"
+            )
+        },
+    )
+    return reminder
+
+
+async def create_reminder(
+    user: User,
+    local_dt: datetime,
+    text: str,
+    recurrence_type: str = "none",
+    recurrence_interval: int = 1,
+    datetime_semantics: DatetimeSemantics = "wall_clock",
+    recurrence_rule: Mapping[str, Any] | str | None = None,
+    recurrence_day_of_month: int | None = None,
+) -> Reminder:
+    async with SessionLocal() as session:
+        async with session.begin():
+            reminder = await create_reminder_in_session(
+                session,
+                user,
+                local_dt,
+                text,
+                recurrence_type,
+                recurrence_interval,
+                datetime_semantics,
+                recurrence_rule,
+                recurrence_day_of_month,
+            )
+        await session.refresh(reminder)
         return reminder
 
 
@@ -1251,7 +1280,31 @@ async def complete_reminder(
                     _reset_delivery_retry(reminder)
                     _clear_delivery_identity(reminder)
             else:
-                reminder.state = ReminderState.SCHEDULED.value
+                next_occurrence = advance_occurrence_until_future(
+                    occurrence.occurrence_at_utc,
+                    reminder.recurrence_type,
+                    reminder.recurrence_interval,
+                    timezone_name=reminder.schedule_timezone,
+                    recurrence_day_of_month=reminder.recurrence_day_of_month,
+                    now_utc=now_utc,
+                    recurrence_rule=recurrence_rule,
+                )
+                if next_occurrence is None:
+                    reminder.state = ReminderState.COMPLETED.value
+                    reminder.completed_at = now_utc
+                    reminder.status = "sent"
+                    reminder.delivery_at_utc = None
+                    reminder.snoozed_until_utc = None
+                    _clear_delivery_identity(reminder)
+                else:
+                    reminder.remind_at_utc = next_occurrence
+                    reminder.delivery_at_utc = next_occurrence
+                    reminder.snoozed_until_utc = None
+                    reminder.state = ReminderState.SCHEDULED.value
+                    reminder.status = "pending"
+                    reminder.completed_at = None
+                    _reset_delivery_retry(reminder)
+                    _clear_delivery_identity(reminder)
         else:
             reminder.state = ReminderState.COMPLETED.value
             reminder.completed_at = now_utc
