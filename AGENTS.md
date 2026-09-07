@@ -73,6 +73,21 @@ For an approved product task, follow:
 - Codex does not merge a PR unless the owner explicitly asks for that action.
 - Refresh base and rerun the relevant final checks after a rebase, amend, or changed commit.
 
+## Guarded Codex self-merge policy
+
+Codex may self-merge only when the owner explicitly authorizes `APPROVED TO MERGE` for the exact PR and the exact current head SHA in the owner prompt or in the control Issue. This authorization is valid only for that exact head; if the head changes, the approval is invalid and must be renewed.
+
+Before merging, verify all of the following:
+
+- exactly one functionally coherent Issue is in scope;
+- the PR targets `master`, the current head SHA is the approved SHA, and no commit appeared after approval;
+- there is no newer `CHANGES REQUESTED`, `BLOCKED`, or `HUMAN_REQUIRED` decision in the control channel;
+- task tests and every required GitHub check passed, the PR is mergeable, and no review conversation remains unresolved;
+- the diff, migrations, and generated artifacts stay within the approved scope;
+- no owner-only production, credential, deployment, or destructive decision is being made implicitly.
+
+Never bypass or force merge, ignore a required check, merge a PR with `CHANGES REQUESTED`, or treat a changed head as covered by an earlier approval. Before Issue #13 establishes required CI checks, exact approval plus passing local/integration checks, a mergeable PR, and no blockers are sufficient. After Issue #13, required checks are mandatory and auto-merge is preferred when it preserves the same exact-head and review guards.
+
 ## VPS constraints
 
 Target a small Linux CPU-only VPS with limited RAM:
