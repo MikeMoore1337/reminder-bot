@@ -10,6 +10,7 @@ def test_relative_minute_does_not_truncate_elapsed_seconds() -> None:
     parsed = parse_reminder_input("напомни через 1 минуту позвонить", now_local)
 
     assert parsed is not None
+    assert parsed.datetime_semantics == "instant"
     assert parsed.local_dt == datetime(
         2026, 1, 1, 12, 1, 45, 123456, tzinfo=ZoneInfo("Europe/Moscow")
     )
@@ -21,6 +22,7 @@ def test_relative_recurrence_preserves_elapsed_seconds() -> None:
     parsed = parse_reminder_input("напомни каждые 10 минут проверить сервер", now_local)
 
     assert parsed is not None
+    assert parsed.datetime_semantics == "instant"
     assert parsed.local_dt == datetime(2026, 1, 1, 12, 10, 45, tzinfo=ZoneInfo("Europe/Moscow"))
 
 
@@ -32,6 +34,7 @@ def test_relative_interval_remains_elapsed_across_dst_forward() -> None:
 
     assert parsed is not None
     assert parsed.local_dt == datetime(2026, 3, 29, 4, 30, tzinfo=timezone)
+    assert parsed.datetime_semantics == "instant"
 
 
 def test_leap_day_accepts_valid_year_and_rejects_invalid_year() -> None:

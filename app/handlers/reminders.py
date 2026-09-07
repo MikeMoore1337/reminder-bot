@@ -59,6 +59,7 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
             text=parsed.text,
             recurrence_type=parsed.recurrence_type,
             recurrence_interval=parsed.recurrence_interval,
+            datetime_semantics=parsed.datetime_semantics,
         )
     except ValueError as exc:
         await message.answer(str(exc))

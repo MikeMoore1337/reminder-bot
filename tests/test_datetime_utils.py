@@ -1,6 +1,12 @@
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
-from app.utils.datetime_utils import from_utc_to_user, localize_in_timezone, to_utc
+from app.utils.datetime_utils import (
+    from_utc_to_user,
+    localize_in_timezone,
+    resolve_schedule_datetime,
+    to_utc,
+)
 
 
 def test_daily_local_time_keeps_wall_clock_across_dst_forward() -> None:
@@ -33,6 +39,29 @@ def test_ambiguous_local_time_uses_earlier_occurrence() -> None:
 
     assert localized.fold == 0
     assert localized.astimezone(UTC) == datetime(2026, 10, 25, 0, 30, tzinfo=UTC)
+
+
+def test_calendar_ambiguous_input_still_uses_fold_zero_policy() -> None:
+    assert to_utc(datetime(2026, 10, 25, 3, 30), "Europe/Helsinki") == datetime(
+        2026, 10, 25, 0, 30, tzinfo=UTC
+    )
+
+
+def test_instant_input_preserves_fold_one_and_exact_utc_instant() -> None:
+    instant = datetime(
+        2026,
+        10,
+        25,
+        3,
+        30,
+        tzinfo=ZoneInfo("Europe/Helsinki"),
+        fold=1,
+    )
+
+    assert instant.astimezone(UTC) == datetime(2026, 10, 25, 1, 30, tzinfo=UTC)
+    assert resolve_schedule_datetime(instant, "Europe/Helsinki", "instant") == datetime(
+        2026, 10, 25, 1, 30, tzinfo=UTC
+    )
 
 
 def test_naive_utc_database_value_is_interpreted_as_utc() -> None:

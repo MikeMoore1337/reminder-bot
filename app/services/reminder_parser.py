@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from app.db.models import RecurrenceType
+from app.utils.datetime_utils import DatetimeSemantics
 
 Recurrence = Literal["none", "minutes", "hourly", "daily", "weekly", "monthly"]
 
@@ -45,6 +46,7 @@ class ParsedReminder:
     text: str
     recurrence_type: Recurrence = "none"
     recurrence_interval: int = 1
+    datetime_semantics: DatetimeSemantics = "wall_clock"
 
 
 def _parse_datetime(value: str, fmt: str) -> datetime | None:
@@ -107,13 +109,21 @@ def parse_reminder_input(raw_text: str, now_local: datetime) -> ParsedReminder |
     if m:
         hours, reminder_text = m.groups()
         dt = _add_elapsed_interval(now_local, timedelta(hours=int(hours)))
-        return ParsedReminder(local_dt=dt, text=reminder_text.strip())
+        return ParsedReminder(
+            local_dt=dt,
+            text=reminder_text.strip(),
+            datetime_semantics="instant",
+        )
 
     m = IN_MINUTES_RE.match(text)
     if m:
         minutes, reminder_text = m.groups()
         dt = _add_elapsed_interval(now_local, timedelta(minutes=int(minutes)))
-        return ParsedReminder(local_dt=dt, text=reminder_text.strip())
+        return ParsedReminder(
+            local_dt=dt,
+            text=reminder_text.strip(),
+            datetime_semantics="instant",
+        )
 
     m = EVERY_DAY_RE.match(text)
     if m:
@@ -155,6 +165,7 @@ def parse_reminder_input(raw_text: str, now_local: datetime) -> ParsedReminder |
             text=reminder_text.strip(),
             recurrence_type="minutes",
             recurrence_interval=interval,
+            datetime_semantics="instant",
         )
 
     m = EVERY_HOUR_RE.match(text)
@@ -165,6 +176,7 @@ def parse_reminder_input(raw_text: str, now_local: datetime) -> ParsedReminder |
             local_dt=dt,
             text=reminder_text.strip(),
             recurrence_type="hourly",
+            datetime_semantics="instant",
         )
 
     m = EVERY_HOURS_RE.match(text)
@@ -177,6 +189,7 @@ def parse_reminder_input(raw_text: str, now_local: datetime) -> ParsedReminder |
             text=reminder_text.strip(),
             recurrence_type="hourly",
             recurrence_interval=interval,
+            datetime_semantics="instant",
         )
 
     return None

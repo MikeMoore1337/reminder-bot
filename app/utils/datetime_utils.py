@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+DatetimeSemantics = Literal["wall_clock", "instant"]
 
 
 def validate_timezone(timezone_name: str) -> str:
@@ -63,6 +66,24 @@ def localize_in_timezone(local_dt: datetime, timezone_name: str) -> datetime:
 
 def to_utc(local_dt: datetime, timezone_name: str) -> datetime:
     return localize_in_timezone(local_dt, timezone_name).astimezone(UTC)
+
+
+def to_utc_instant(instant_dt: datetime) -> datetime:
+    if instant_dt.tzinfo is None:
+        raise ValueError("Elapsed datetime must be timezone-aware")
+    return instant_dt.astimezone(UTC)
+
+
+def resolve_schedule_datetime(
+    local_dt: datetime,
+    timezone_name: str,
+    semantics: DatetimeSemantics = "wall_clock",
+) -> datetime:
+    if semantics == "wall_clock":
+        return to_utc(local_dt, timezone_name)
+    if semantics == "instant":
+        return to_utc_instant(local_dt)
+    raise ValueError(f"Unsupported datetime semantics: {semantics}")
 
 
 def from_utc_to_user(dt_utc: datetime, timezone_name: str) -> datetime:

@@ -10,7 +10,13 @@ from sqlalchemy import func, select
 
 from app.db.models import RecurrenceType, Reminder, User
 from app.db.session import SessionLocal
-from app.utils.datetime_utils import from_utc_to_user, to_utc, utc_now
+from app.utils.datetime_utils import (
+    DatetimeSemantics,
+    from_utc_to_user,
+    resolve_schedule_datetime,
+    to_utc,
+    utc_now,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,10 +129,15 @@ async def create_reminder(
     text: str,
     recurrence_type: str = "none",
     recurrence_interval: int = 1,
+    datetime_semantics: DatetimeSemantics = "wall_clock",
 ) -> Reminder:
     validate_recurrence(recurrence_type, recurrence_interval)
 
-    remind_at_utc = to_utc(local_dt, user.timezone)
+    remind_at_utc = resolve_schedule_datetime(
+        local_dt,
+        user.timezone,
+        semantics=datetime_semantics,
+    )
     now_utc = utc_now()
     recurrence_day_of_month = (
         local_dt.day if recurrence_type == RecurrenceType.MONTHLY.value else None

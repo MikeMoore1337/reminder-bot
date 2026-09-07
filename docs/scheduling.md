@@ -18,6 +18,17 @@ advances the canonical occurrence and resets the delivery override. This keeps a
 snooze local to one occurrence and makes the next occurrence reconstructable after
 restart from PostgreSQL alone.
 
+## Input semantics
+
+Every parsed reminder carries an explicit datetime semantics:
+
+- `wall_clock` is used for absolute local dates/times and daily, weekly, or monthly
+  calendar rules. `to_utc` applies the documented ambiguous/nonexistent-time policy.
+- `instant` is used for relative minute/hour input and elapsed minute/hour recurrence.
+  The parser first adds the elapsed interval through UTC; `create_reminder` then uses
+  the already-aware instant directly. It must not pass that value back through
+  wall-clock localization, because doing so could lose `fold=1` during fall-back.
+
 ## Calendar arithmetic
 
 Daily, weekly, and monthly recurrence is calculated from the canonical occurrence in
@@ -48,3 +59,10 @@ calendar wall-clock rules.
   a normal worker restart does not require in-memory scheduling state. Recovery of a
   reminder left in `processing` after a worker crash, including lease expiry and retry
   ownership, remains the separate delivery-reliability scope of Issue #9.
+
+## User timezone contract
+
+New users default to `Europe/Moscow`. A validated explicit timezone choice is stored in
+`users.timezone` and is read back from PostgreSQL on later sessions/restarts. New
+reminders capture that currently persisted value in `schedule_timezone`; existing
+recurring reminders keep their captured value even if the profile timezone changes.
