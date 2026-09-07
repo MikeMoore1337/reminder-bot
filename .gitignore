@@ -171,6 +171,9 @@ cython_debug/
 # Local test and runtime artifacts
 test-results/
 test-artifacts/
+backups/
+locks/
+state/
 audio/
 media/
 stt-models/

@@ -17,6 +17,7 @@ services:
 
   migrate:
     build: .
+    image: ${REMINDER_BOT_IMAGE:-reminder-bot:local}
     container_name: reminder_bot_migrate
     command: alembic upgrade head
     env_file:
@@ -29,6 +30,7 @@ services:
 
   bot:
     build: .
+    image: ${REMINDER_BOT_IMAGE:-reminder-bot:local}
     container_name: reminder_bot_app
     command: python -m app.main
     env_file:
@@ -39,7 +41,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "${APP_PUBLISH_HOST:-0.0.0.0}:8080:8080"
     healthcheck:
       test:
         ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
@@ -51,6 +53,7 @@ services:
 
   worker:
     build: .
+    image: ${REMINDER_BOT_IMAGE:-reminder-bot:local}
     container_name: reminder_bot_worker
     command: python -m app.worker_main
     env_file:
@@ -64,3 +67,4 @@ services:
 
 volumes:
   postgres_data:
+    name: reminder_bot_postgres_data
