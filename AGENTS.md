@@ -101,6 +101,8 @@ and branch policy remain effective.
 - Direct runtime dependencies are declared in `pyproject.toml` and compiled into
   `requirements.txt`. The `dev` extra is compiled into `requirements-dev.txt` and is never
   installed by the production Docker image.
+- Lockfiles target Linux/Python 3.12, matching CI and the production container; do not commit
+  platform-only resolution differences from a Windows host.
 - `pip-tools` is the current lock maintenance tool. Do not migrate to Poetry, PDM, or uv as part
   of routine Issue work without a separate decision and measured benefit.
 - CI is secret-free: tests use fakes and a controlled PostgreSQL service, never production

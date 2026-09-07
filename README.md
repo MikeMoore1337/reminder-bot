@@ -169,7 +169,10 @@ docker compose up -d
 ## 🔒 Зависимости и lockfiles
 
 `pyproject.toml` — canonical source прямых runtime-зависимостей и `dev` extra. Для обновления
-lockfiles используется `pip-tools`; `requirements.in` не нужен и не дублирует `pyproject.toml`:
+lockfiles используется `pip-tools`; `requirements.in` не нужен и не дублирует `pyproject.toml`.
+Lockfiles генерируются под Linux/Python 3.12 — это target CI и production Docker; на Windows
+запускай команды в WSL или Linux-контейнере, чтобы не добавить Windows-only зависимости вроде
+`colorama`:
 
 ```bash
 python -m pip install --upgrade pip-tools
