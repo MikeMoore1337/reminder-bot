@@ -101,6 +101,17 @@ class DigestDeliveryState(StrEnum):
     FAILED = "failed"
 
 
+class ConditionSubscriptionState(StrEnum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
+class ConditionDeliveryState(StrEnum):
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+
+
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (
@@ -159,6 +170,9 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     digest_deliveries: Mapped[list[ReminderDigestDelivery]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    condition_subscriptions: Mapped[list[ConditionSubscription]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -737,6 +751,178 @@ class ReminderDigestDelivery(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="digest_deliveries")
+
+
+class ConditionSubscription(Base):
+    """Restart-safe definition of one external condition poll."""
+
+    __tablename__ = "condition_subscriptions"
+    __table_args__ = (
+        Index(
+            "ix_condition_subscriptions_state_next_poll_lease",
+            "state",
+            "next_poll_at_utc",
+            "lease_until_utc",
+        ),
+        Index("ix_condition_subscriptions_user_state", "user_id", "state"),
+        Index("ix_condition_subscriptions_provider_target_hash", "provider_type", "target_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    target_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    message_template: Mapped[str] = mapped_column(Text, nullable=False)
+    poll_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)
+    trigger_on_initial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ConditionSubscriptionState.ACTIVE.value
+    )
+    next_poll_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_observed_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_until_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    transition_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped[User] = relationship(back_populates="condition_subscriptions")
+    observations: Mapped[list[ConditionObservation]] = relationship(
+        back_populates="subscription", cascade="all, delete-orphan"
+    )
+    transitions: Mapped[list[ConditionTransition]] = relationship(
+        back_populates="subscription", cascade="all, delete-orphan"
+    )
+    deliveries: Mapped[list[ConditionDelivery]] = relationship(
+        back_populates="subscription", cascade="all, delete-orphan"
+    )
+
+
+class ConditionObservation(Base):
+    """Bounded success/failure history; provider payloads are never persisted."""
+
+    __tablename__ = "condition_observations"
+    __table_args__ = (
+        Index(
+            "ix_condition_observations_subscription_observed_at",
+            "subscription_id",
+            "observed_at_utc",
+        ),
+        Index("ix_condition_observations_success_observed_at", "success", "observed_at_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscription_id: Mapped[int] = mapped_column(
+        ForeignKey("condition_subscriptions.id", ondelete="CASCADE"), nullable=False
+    )
+    observed_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    retry_after_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    subscription: Mapped[ConditionSubscription] = relationship(back_populates="observations")
+
+
+class ConditionTransition(Base):
+    """One serialized state transition for a subscription."""
+
+    __tablename__ = "condition_transitions"
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_id",
+            "sequence",
+            name="uq_condition_transitions_subscription_sequence",
+        ),
+        Index(
+            "ix_condition_transitions_subscription_observed_at",
+            "subscription_id",
+            "observed_at_utc",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscription_id: Mapped[int] = mapped_column(
+        ForeignKey("condition_subscriptions.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    previous_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_state: Mapped[str] = mapped_column(String(64), nullable=False)
+    fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    observed_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    subscription: Mapped[ConditionSubscription] = relationship(back_populates="transitions")
+    deliveries: Mapped[list[ConditionDelivery]] = relationship(
+        back_populates="transition", cascade="all, delete-orphan"
+    )
+
+
+class ConditionDelivery(Base):
+    """Durable, idempotent outbox item emitted once per transition."""
+
+    __tablename__ = "condition_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_id",
+            "transition_sequence",
+            name="uq_condition_deliveries_subscription_transition",
+        ),
+        Index("ix_condition_deliveries_state_created_at", "state", "created_at"),
+        Index("ix_condition_deliveries_subscription_state", "subscription_id", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscription_id: Mapped[int] = mapped_column(
+        ForeignKey("condition_subscriptions.id", ondelete="CASCADE"), nullable=False
+    )
+    transition_id: Mapped[int] = mapped_column(
+        ForeignKey("condition_transitions.id", ondelete="CASCADE"), nullable=False
+    )
+    transition_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    previous_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_state: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_text: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ConditionDeliveryState.PENDING.value
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    sent_at_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    subscription: Mapped[ConditionSubscription] = relationship(back_populates="deliveries")
+    transition: Mapped[ConditionTransition] = relationship(back_populates="deliveries")
+
+    @property
+    def message(self) -> str:
+        """Compatibility-friendly name for outbox consumers."""
+
+        return self.message_text
 
 
 # Short aliases keep the persistence vocabulary convenient for service and test callers.

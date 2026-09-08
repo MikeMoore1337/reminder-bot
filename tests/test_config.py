@@ -56,6 +56,59 @@ def test_worker_retry_max_cannot_be_below_retry_base() -> None:
         _settings(worker_retry_base_seconds=60, worker_retry_max_seconds=30)
 
 
+def test_condition_bounds_are_opt_in_and_lease_covers_request_with_margin() -> None:
+    settings = _settings()
+
+    assert settings.condition_worker_enabled is False
+    assert settings.condition_cleanup_interval_seconds == 3600
+    assert settings.condition_drain_max_batches == 10
+    assert settings.condition_drain_interval_seconds == 1
+    assert settings.condition_authorization_env_allowlist == frozenset()
+    assert settings.condition_authorization_env_bindings == {}
+    assert settings.condition_lease_duration_seconds > (
+        settings.condition_request_timeout_seconds + settings.worker_lease_safety_margin_seconds
+    )
+    assert settings.condition_retry_max_seconds >= settings.condition_retry_base_seconds
+
+    with pytest.raises(ValidationError, match="condition_lease_duration_seconds"):
+        _settings(condition_request_timeout_seconds=60, condition_lease_duration_seconds=61)
+    with pytest.raises(ValidationError, match="condition_retry_max_seconds"):
+        _settings(condition_retry_base_seconds=60, condition_retry_max_seconds=30)
+
+
+def test_condition_authorization_allowlist_is_deployment_owned_and_bounded() -> None:
+    settings = _settings(
+        CONDITION_AUTHORIZATION_ENV_ALLOWLIST="provider_token,SECOND_PROVIDER_TOKEN"
+    )
+
+    assert settings.condition_authorization_env_allowlist == frozenset(
+        {"PROVIDER_TOKEN", "SECOND_PROVIDER_TOKEN"}
+    )
+    with pytest.raises(ValidationError, match="condition_authorization_env_allowlist"):
+        _settings(CONDITION_AUTHORIZATION_ENV_ALLOWLIST="provider-token")
+
+
+def test_condition_authorization_bindings_require_allowlist_and_https_origin() -> None:
+    settings = _settings(
+        CONDITION_AUTHORIZATION_ENV_ALLOWLIST="PROVIDER_TOKEN",
+        CONDITION_AUTHORIZATION_ENV_BINDINGS="PROVIDER_TOKEN=https://api.example.com",
+    )
+
+    assert settings.condition_authorization_env_bindings == {
+        "PROVIDER_TOKEN": "https://api.example.com"
+    }
+    with pytest.raises(ValidationError, match="condition_authorization_env_bindings"):
+        _settings(
+            CONDITION_AUTHORIZATION_ENV_ALLOWLIST="PROVIDER_TOKEN",
+            CONDITION_AUTHORIZATION_ENV_BINDINGS="PROVIDER_TOKEN=http://api.example.com",
+        )
+    with pytest.raises(ValidationError, match="condition_authorization_env_bindings"):
+        _settings(
+            CONDITION_AUTHORIZATION_ENV_ALLOWLIST="PROVIDER_TOKEN",
+            CONDITION_AUTHORIZATION_ENV_BINDINGS="PROVIDER_TOKEN=https://api.example.com/status",
+        )
+
+
 def test_persistent_policy_settings_are_bounded_and_validate_quiet_hours() -> None:
     settings = _settings(
         persistent_repeat_interval_minutes=15,
