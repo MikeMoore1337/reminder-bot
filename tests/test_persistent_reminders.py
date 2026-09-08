@@ -285,6 +285,138 @@ def test_persistent_claim_defers_for_quiet_hours_and_user_cooldown(monkeypatch) 
     asyncio.run(scenario())
 
 
+def test_persistent_quiet_deferral_preserves_failed_attempt_budget(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _setup(monkeypatch)
+        first_at = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+        quiet_at = datetime(2026, 9, 8, 20, 30, tzinfo=UTC)
+        resumed_at = datetime(2026, 9, 9, 5, 0, tzinfo=UTC)
+        failure = worker.DeliveryFailure(
+            kind=worker.DeliveryErrorKind.TRANSIENT,
+            error_type="TimeoutError",
+        )
+        try:
+            monkeypatch.setattr(
+                worker,
+                "settings",
+                _worker_settings(
+                    worker_max_attempts=2,
+                    worker_retry_base_seconds=1,
+                    worker_retry_max_seconds=10,
+                ),
+            )
+            user = await _add_user(session_factory)
+            reminder, _ = await _add_persistent_reminder(session_factory, user, first_at)
+
+            first_claim = (await worker.claim_due_reminders(1, now_utc=first_at))[0]
+            assert first_claim.attempt_count == 1
+            assert await worker.finalize_delivery_failure(
+                reminder.id,
+                first_claim.lease_token,
+                failure,
+                now_utc=first_at,
+            )
+
+            failed_once = await _get_reminder(session_factory, reminder.id)
+            assert failed_once.attempt_count == 1
+            assert failed_once.retry_count == 1
+
+            assert await worker.claim_due_reminders(1, now_utc=quiet_at) == []
+            deferred = await _get_reminder(session_factory, reminder.id)
+            assert deferred.attempt_count == 1
+            assert deferred.retry_count == 1
+            assert deferred.persistent_deferred_count == 1
+
+            second_claim = (await worker.claim_due_reminders(1, now_utc=resumed_at))[0]
+            assert second_claim.attempt_count == 2
+            assert await worker.finalize_delivery_failure(
+                reminder.id,
+                second_claim.lease_token,
+                failure,
+                now_utc=resumed_at,
+            )
+
+            exhausted = await _get_reminder(session_factory, reminder.id)
+            assert exhausted.status == "failed"
+            assert exhausted.state == ReminderState.FAILED.value
+            assert exhausted.attempt_count == 2
+            assert exhausted.retry_count == 2
+            assert await worker.claim_due_reminders(1, now_utc=resumed_at) == []
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_persistent_user_cooldown_deferral_preserves_failed_attempt_budget(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _setup(monkeypatch)
+        first_at = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+        cooldown_at = first_at + timedelta(minutes=1)
+        resumed_at = cooldown_at + timedelta(minutes=1)
+        failure = worker.DeliveryFailure(
+            kind=worker.DeliveryErrorKind.TRANSIENT,
+            error_type="TimeoutError",
+        )
+        try:
+            monkeypatch.setattr(
+                worker,
+                "settings",
+                _worker_settings(
+                    worker_max_attempts=2,
+                    worker_retry_base_seconds=1,
+                    worker_retry_max_seconds=10,
+                    persistent_user_cooldown_minutes=1,
+                ),
+            )
+            user = await _add_user(session_factory)
+            reminder, _ = await _add_persistent_reminder(session_factory, user, first_at)
+
+            first_claim = (await worker.claim_due_reminders(1, now_utc=first_at))[0]
+            assert first_claim.attempt_count == 1
+            assert await worker.finalize_delivery_failure(
+                reminder.id,
+                first_claim.lease_token,
+                failure,
+                now_utc=first_at,
+            )
+
+            async with session_factory() as session:
+                owner = await session.get(User, user.id)
+                assert owner is not None
+                owner.next_persistent_delivery_at_utc = resumed_at
+                await session.commit()
+
+            assert await worker.claim_due_reminders(1, now_utc=cooldown_at) == []
+            deferred = await _get_reminder(session_factory, reminder.id)
+            assert deferred.attempt_count == 1
+            assert deferred.retry_count == 1
+            assert deferred.persistent_deferred_count == 1
+            assert _utc(deferred.delivery_at_utc) == resumed_at
+
+            second_claim = (await worker.claim_due_reminders(1, now_utc=resumed_at))[0]
+            assert second_claim.attempt_count == 2
+            assert await worker.finalize_delivery_failure(
+                reminder.id,
+                second_claim.lease_token,
+                failure,
+                now_utc=resumed_at,
+            )
+
+            exhausted = await _get_reminder(session_factory, reminder.id)
+            assert exhausted.status == "failed"
+            assert exhausted.state == ReminderState.FAILED.value
+            assert exhausted.attempt_count == 2
+            assert exhausted.retry_count == 2
+            assert await worker.claim_due_reminders(1, now_utc=resumed_at) == []
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_snooze_stops_one_off_persistent_loop_and_disable_is_owner_revision_guarded(
     monkeypatch,
 ) -> None:

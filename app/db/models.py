@@ -386,6 +386,7 @@ class ReminderClarification(Base):
     voice_transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     context_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default=ReminderMode.NORMAL.value)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     clarification_type: Mapped[str] = mapped_column(String(32), nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)

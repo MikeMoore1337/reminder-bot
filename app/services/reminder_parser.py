@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
@@ -149,6 +149,15 @@ class ClarificationRequest:
     kind: str
     prompt: str
     raw_text: str
+    mode: str = "normal"
+
+
+def restore_clarification_mode(parsed: ParsedReminder, mode: str) -> ParsedReminder:
+    """Keep a persisted persistent-mode request through an ambiguous answer."""
+
+    if mode == "persistent":
+        parsed.mode = "persistent"
+    return parsed
 
 
 def _parse_datetime(value: str, fmt: str) -> datetime | None:
@@ -703,6 +712,8 @@ def parse_reminder_input(
     parsed = _parse_reminder_input(normalized_text, now_local)
     if isinstance(parsed, ParsedReminder):
         parsed.mode = mode
+    elif isinstance(parsed, ClarificationRequest):
+        parsed = replace(parsed, mode=mode)
     return parsed
 
 
@@ -734,18 +745,22 @@ def parse_clarification_answer(
     answer: str,
     *,
     now_local: datetime,
+    mode: str = "normal",
 ) -> ParsedReminder | ClarificationRequest | None:
     """Resolve a stored clarification without accepting an ambiguous shortcut."""
 
     parsed = parse_reminder_input(answer, now_local=now_local)
     if isinstance(parsed, ParsedReminder):
-        return parsed
+        return restore_clarification_mode(parsed, mode)
 
     value = answer.strip()
     local_dt = _explicit_answer_datetime(value)
     reminder_text = _clarification_text(raw_text)
     if local_dt is not None and reminder_text:
-        return ParsedReminder(local_dt=local_dt, text=reminder_text)
+        return restore_clarification_mode(
+            ParsedReminder(local_dt=local_dt, text=reminder_text),
+            mode,
+        )
 
     normalized_raw = raw_text.lower().replace("ё", "е")
     if re.fullmatch(r"\d{1,2}:\d{2}", value) and (
@@ -761,7 +776,10 @@ def parse_clarification_answer(
         if not tomorrow and local_dt is not None and local_dt <= now_local:
             local_dt += timedelta(days=1)
         if local_dt is not None and reminder_text:
-            return ParsedReminder(local_dt=local_dt, text=reminder_text)
+            return restore_clarification_mode(
+                ParsedReminder(local_dt=local_dt, text=reminder_text),
+                mode,
+            )
     return None
 
 

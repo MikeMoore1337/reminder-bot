@@ -118,6 +118,13 @@ def upgrade() -> None:
     op.alter_column("reminders", "persistent_deferred_count", nullable=False, server_default=None)
 
     op.add_column(
+        "reminder_clarifications",
+        sa.Column("mode", sa.String(length=16), nullable=True, server_default="normal"),
+    )
+    op.execute(sa.text("UPDATE reminder_clarifications SET mode = 'normal' WHERE mode IS NULL"))
+    op.alter_column("reminder_clarifications", "mode", nullable=False, server_default=None)
+
+    op.add_column(
         "voice_reminder_drafts",
         sa.Column("mode", sa.String(length=16), nullable=True, server_default="normal"),
     )
@@ -127,6 +134,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_column("voice_reminder_drafts", "mode")
+    op.drop_column("reminder_clarifications", "mode")
     op.drop_column("reminders", "persistent_stop_reason")
     op.drop_column("reminders", "persistent_disabled_at")
     op.drop_column("reminders", "persistent_exhausted_at")

@@ -19,6 +19,7 @@ from app.services.reminder_parser import (
     ParsedReminder,
     parse_clarification_answer,
     parse_reminder_input,
+    restore_clarification_mode,
 )
 from app.utils.datetime_utils import utc_now
 
@@ -755,8 +756,9 @@ def parse_context_clarification_answer(
     answer: str,
     *,
     now_local: datetime,
+    mode: str = "normal",
 ) -> ParsedReminder | None:
-    parsed = parse_clarification_answer(raw_text, answer, now_local=now_local)
+    parsed = parse_clarification_answer(raw_text, answer, now_local=now_local, mode=mode)
     if isinstance(parsed, ParsedReminder):
         return parsed
 
@@ -772,7 +774,8 @@ def parse_context_clarification_answer(
         prefix = "завтра" if "завтра вечером" in normalized_raw else "сегодня"
         candidate = f"напомни {prefix} в {value} {CONTEXT_PLACEHOLDER}"
     elif time_match is not None:
-        return _time_only_context_answer(value, now_local)
+        time_only = _time_only_context_answer(value, now_local)
+        return restore_clarification_mode(time_only, mode) if time_only is not None else None
     else:
         candidate = (
             f"{value} {CONTEXT_PLACEHOLDER}"
@@ -780,7 +783,9 @@ def parse_context_clarification_answer(
             else (f"напомни {value} {CONTEXT_PLACEHOLDER}")
         )
     resolved = parse_reminder_input(candidate, now_local=now_local)
-    return resolved if isinstance(resolved, ParsedReminder) else None
+    return (
+        restore_clarification_mode(resolved, mode) if isinstance(resolved, ParsedReminder) else None
+    )
 
 
 def _row_to_snapshot(row: ReminderContext) -> MessageContextSnapshot:

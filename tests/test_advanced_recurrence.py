@@ -394,6 +394,72 @@ def test_clarification_is_restart_safe_and_expires(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_persistent_ambiguous_clarification_survives_restart_and_creates_persistent_reminder(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            monkeypatch.setattr(clarification_service, "SessionLocal", session_factory)
+            monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
+            user = User(telegram_user_id=503, chat_id=603, timezone="Europe/Moscow")
+            async with session_factory() as session:
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+
+            request = parse_reminder_input(
+                "напомни важное завтра вечером позвонить",
+                MOSCOW_NOW,
+            )
+            assert isinstance(request, ClarificationRequest)
+            assert request.mode == "persistent"
+
+            created_at = datetime(2026, 9, 7, 7, 0, tzinfo=UTC)
+            created = await clarification_service.create_clarification(
+                user,
+                request,
+                now_utc=created_at,
+            )
+            restored = await clarification_service.get_active_clarification(
+                user,
+                now_utc=created_at + timedelta(minutes=1),
+            )
+            assert restored is not None
+            assert restored.id == created.id
+            assert restored.mode == "persistent"
+
+            message = type(
+                "FakeMessage",
+                (),
+                {"text": "18:30", "answer": AsyncMock()},
+            )()
+            assert await reminders_handler._handle_clarification(
+                message,
+                user,
+                now_utc=created_at + timedelta(minutes=1),
+            )
+
+            async with session_factory() as session:
+                reminders = list(
+                    (
+                        await session.scalars(select(Reminder).where(Reminder.user_id == user.id))
+                    ).all()
+                )
+                assert await session.scalar(select(ReminderClarification)) is None
+            assert len(reminders) == 1
+            assert reminders[0].text == "позвонить"
+            assert reminders[0].mode == "persistent"
+            message.answer.assert_awaited_once()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_advanced_rule_is_persisted_and_reconstructed_after_restart(monkeypatch) -> None:
     async def scenario() -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")

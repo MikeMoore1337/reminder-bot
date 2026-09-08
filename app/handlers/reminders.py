@@ -242,12 +242,14 @@ async def _handle_clarification(
             clarification.raw_text,
             raw_value,
             now_local=from_utc_to_user(current_time, user.timezone),
+            mode=clarification.mode,
         )
         if context is not None
         else parse_clarification_answer(
             clarification.raw_text,
             raw_value,
             now_local=from_utc_to_user(current_time, user.timezone),
+            mode=clarification.mode,
         )
     )
     if not isinstance(parsed, ParsedReminder):

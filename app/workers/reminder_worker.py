@@ -338,9 +338,10 @@ def _safe_failure_text(failure: DeliveryFailure) -> str:
 
 
 def _release_policy_deferral(reminder: Reminder, delivery_at_utc: datetime) -> None:
+    """Return a policy-deferred job without resetting its delivery budget."""
+
     reminder.delivery_at_utc = delivery_at_utc
     reminder.status = "pending"
-    reminder.attempt_count = 0
     reminder.next_retry_at = None
     reminder.processing_started_at = None
     reminder.lease_until = None
