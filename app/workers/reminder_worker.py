@@ -32,6 +32,13 @@ from app.db.models import (
     ReminderState,
 )
 from app.db.session import SessionLocal
+from app.services.message_context import (
+    MessageContextSnapshot,
+    cleanup_expired_reminder_contexts,
+    context_metrics,
+    format_context_for_delivery,
+    get_context_for_delivery,
+)
 from app.services.recurrence import is_completion_relative
 from app.services.reminder_service import (
     advance_occurrence_until_future,
@@ -719,6 +726,107 @@ async def _finalize_send_failure(
     return finalized
 
 
+def _delivery_text(
+    reminder: Reminder,
+    context: MessageContextSnapshot | None,
+    *,
+    media_unavailable: bool = False,
+) -> str:
+    prefix = "⏰ Напоминание\n\n"
+    if context is not None:
+        context_text = format_context_for_delivery(
+            context,
+            media_unavailable=media_unavailable,
+            max_length=2400,
+        )
+    elif reminder.context_kind is not None:
+        context_metrics.delivery_fallback(reminder.context_kind)
+        context_text = format_context_for_delivery(
+            None,
+            fallback_kind=reminder.context_kind,
+            max_length=2400,
+        )
+    else:
+        context_text = ""
+    reminder_budget = max(0, 4096 - len(prefix) - 2)
+    if context_text:
+        reminder_budget = max(0, reminder_budget - min(1800, reminder_budget))
+    reminder_html = _escape_bounded(reminder.text, reminder_budget)
+    text = prefix + reminder_html
+    if context_text:
+        remaining = max(0, 4096 - len(text) - 2)
+        context_html = _escape_bounded(context_text, min(2400, remaining))
+        if context_html:
+            text += f"\n\n{context_html}"
+    return text
+
+
+def _escape_bounded(value: str, max_length: int) -> str:
+    """Escape and truncate plain text without cutting an HTML entity."""
+
+    if max_length <= 0:
+        return ""
+    escaped = escape(value)
+    if len(escaped) <= max_length:
+        return escaped
+    low, high = 0, len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(escape(value[:middle])) <= max_length - 1:
+            low = middle
+        else:
+            high = middle - 1
+    return f"{escape(value[:low])}…"
+
+
+async def _send_delivery(
+    bot: Bot,
+    reminder: Reminder,
+    context: MessageContextSnapshot | None,
+    *,
+    reply_markup: InlineKeyboardMarkup,
+) -> Any:
+    delivery_text = _delivery_text(reminder, context)
+    if (
+        context is not None
+        and context.media_file_id
+        and context.media_kind in {"photo", "document"}
+        and len(delivery_text) <= 1024
+    ):
+        media_kind = context.media_kind
+        method_name = "send_photo" if media_kind == "photo" else "send_document"
+        media_method = getattr(bot, method_name, None)
+        if callable(media_method):
+            media_argument = "photo" if media_kind == "photo" else "document"
+            try:
+                return await media_method(
+                    chat_id=reminder.chat_id,
+                    **{media_argument: context.media_file_id},
+                    caption=delivery_text,
+                    reply_markup=reply_markup,
+                )
+            except TelegramBadRequest:
+                # A Telegram file_id can expire or become unavailable. Only a
+                # provider-confirmed bad request falls back here; network
+                # failures remain retryable and never risk a second send.
+                logger.info(
+                    "Context media unavailable; using text delivery fallback",
+                    extra={
+                        "extra_data": (f"reminder_id={reminder.id} context_kind={context.kind}")
+                    },
+                )
+                delivery_text = _delivery_text(
+                    reminder,
+                    context,
+                    media_unavailable=True,
+                )
+    return await bot.send_message(
+        chat_id=reminder.chat_id,
+        text=delivery_text,
+        reply_markup=reply_markup,
+    )
+
+
 async def process_claimed_reminder(
     bot: Bot,
     reminder: Reminder,
@@ -753,11 +861,30 @@ async def process_claimed_reminder(
         return False
 
     attempt_number = reminder.attempt_count
+    context: MessageContextSnapshot | None = None
+    if reminder.context_kind is not None:
+        try:
+            context = await get_context_for_delivery(
+                reminder.id,
+                reminder.user_id,
+                reminder.chat_id,
+                now_utc=utc_now(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Unable to load reminder context; using text fallback",
+                extra={
+                    "extra_data": (
+                        f"reminder_id={reminder.id} error_type={type(exc).__name__[:80]}"
+                    )
+                },
+            )
     try:
         sent = await asyncio.wait_for(
-            bot.send_message(
-                chat_id=reminder.chat_id,
-                text=f"⏰ Напоминание\n\n{escape(reminder.text)}",
+            _send_delivery(
+                bot,
+                reminder,
+                context,
                 reply_markup=reminder_actions_kb(
                     reminder.id,
                     occurrence_id=occurrence_id,
@@ -897,6 +1024,7 @@ async def reminder_loop(bot: Bot, stop_event: asyncio.Event | None = None) -> No
             )
         ):
             await cleanup_expired_voice_drafts(now_utc=current_time)
+            await cleanup_expired_reminder_contexts(now_utc=current_time)
             last_voice_cleanup_at = current_time
         if await _wait_for_stop(stop_event, settings.worker_poll_interval_seconds):
             break

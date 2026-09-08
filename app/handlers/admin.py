@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from app.config import get_settings
+from app.services.message_context import get_context_metrics
 from app.services.reminder_service import get_failed_reminders, get_stats
 from app.services.voice_service import get_voice_metrics
 
@@ -26,6 +27,7 @@ async def cmd_stats(message: Message) -> None:
 
     stats = await get_stats()
     voice = get_voice_metrics()
+    context = get_context_metrics()
     voice_stt_failures = sum(
         count for key, count in voice.items() if key.startswith("failure_stt_")
     )
@@ -41,7 +43,9 @@ async def cmd_stats(message: Message) -> None:
         f"🎙 Голосовой STT: <b>{voice['stt_success']}</b> успешно / "
         f"<b>{voice_stt_failures}</b> ошибок\n"
         f"🛠 Исправлено голосом: <b>{voice['parse_correction']}</b>\n"
-        f"✅ Подтверждено голосом: <b>{voice['confirmation_success']}</b>"
+        f"✅ Подтверждено голосом: <b>{voice['confirmation_success']}</b>\n"
+        f"📎 Context fallback: <b>{sum(value for key, value in context.items() if key.startswith('context_delivery_fallback_'))}</b>\n"
+        f"🧹 Context cleanup: <b>{sum(value for key, value in context.items() if key.startswith('context_cleanup_') and key != 'context_cleanup_failures')}</b>"
     )
 
     await message.answer(text, parse_mode="HTML")

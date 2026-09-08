@@ -8,6 +8,11 @@ from sqlalchemy.engine import CursorResult
 
 from app.db.models import ActionDraft, Reminder, ReminderClarification, User, VoiceReminderDraft
 from app.db.session import SessionLocal
+from app.services.message_context import (
+    MessageContextSnapshot,
+    deserialize_context_snapshot,
+    serialize_context_snapshot,
+)
 from app.services.reminder_parser import ClarificationRequest, ParsedReminder
 
 CLARIFICATION_TTL = timedelta(minutes=15)
@@ -31,6 +36,7 @@ async def create_clarification(
     origin: str = CLARIFICATION_ORIGIN_TEXT,
     voice_transcript: str | None = None,
     source_message_id: int | None = None,
+    context_snapshot: MessageContextSnapshot | None = None,
 ) -> ReminderClarification:
     raw_text = request.raw_text.strip()
     if not raw_text or len(raw_text) > MAX_CLARIFICATION_TEXT_LENGTH:
@@ -48,6 +54,11 @@ async def create_clarification(
     normalized_source_id = (
         source_message_id if source_message_id is not None and source_message_id > 0 else None
     )
+    serialized_context = (
+        serialize_context_snapshot(context_snapshot) if context_snapshot is not None else None
+    )
+    if origin == CLARIFICATION_ORIGIN_VOICE and serialized_context is not None:
+        raise ValueError("Голосовое уточнение не может содержать Telegram context")
     current_time = _as_utc(now_utc or datetime.now(UTC))
     expiry = _as_utc(expires_at or (current_time + CLARIFICATION_TTL))
 
@@ -84,6 +95,7 @@ async def create_clarification(
                 origin=origin,
                 voice_transcript=normalized_transcript,
                 source_message_id=normalized_source_id,
+                context_snapshot=serialized_context,
                 raw_text=raw_text,
                 clarification_type=request.kind,
                 prompt=request.prompt,
@@ -94,6 +106,7 @@ async def create_clarification(
             existing.origin = origin
             existing.voice_transcript = normalized_transcript
             existing.source_message_id = normalized_source_id
+            existing.context_snapshot = serialized_context
             existing.raw_text = raw_text
             existing.clarification_type = request.kind
             existing.prompt = request.prompt
@@ -168,6 +181,8 @@ async def consume_clarification_and_create_reminder(
         # Import locally to keep the service dependency graph acyclic.
         from app.services.reminder_service import create_reminder_in_session
 
+        context = deserialize_context_snapshot(clarification.context_snapshot)
+
         reminder = await create_reminder_in_session(
             session,
             owner,
@@ -179,6 +194,7 @@ async def consume_clarification_and_create_reminder(
             parsed.recurrence_rule,
             parsed.recurrence_day_of_month,
             now_utc=current_time,
+            context=context,
         )
         await session.delete(clarification)
         await session.flush()
