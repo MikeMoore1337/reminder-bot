@@ -50,6 +50,14 @@ class OccurrenceState(StrEnum):
     FAILED = "failed"
 
 
+class ReminderMode(StrEnum):
+    NORMAL = "normal"
+    PERSISTENT = "persistent"
+    # ``important`` is the product language for the same bounded persistent
+    # mode.  The database stores the canonical ``persistent`` value.
+    IMPORTANT = "persistent"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -67,6 +75,9 @@ class User(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+    next_persistent_delivery_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     reminders: Mapped[list[Reminder]] = relationship(
@@ -156,6 +167,26 @@ class Reminder(Base):
         DateTime(timezone=True), nullable=True
     )
     context_kind: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default=ReminderMode.NORMAL.value)
+    persistent_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    persistent_max_deliveries: Mapped[int] = mapped_column(Integer, nullable=False, default=6)
+    persistent_max_escalations: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    persistent_quiet_hours_start: Mapped[str] = mapped_column(
+        String(5), nullable=False, default="22:00"
+    )
+    persistent_quiet_hours_end: Mapped[str] = mapped_column(
+        String(5), nullable=False, default="08:00"
+    )
+    persistent_delivery_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    persistent_escalation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    persistent_deferred_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    persistent_exhausted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    persistent_disabled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    persistent_stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="reminders")
     parent_reminder: Mapped[Reminder | None] = relationship(
@@ -323,6 +354,7 @@ class VoiceReminderDraft(Base):
     recurrence_interval: Mapped[int] = mapped_column(Integer, nullable=False)
     recurrence_day_of_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
     recurrence_rule: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default=ReminderMode.NORMAL.value)
     action_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     preview_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -354,6 +386,7 @@ class ReminderClarification(Base):
     voice_transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     context_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default=ReminderMode.NORMAL.value)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     clarification_type: Mapped[str] = mapped_column(String(32), nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)

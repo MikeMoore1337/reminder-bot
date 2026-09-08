@@ -30,6 +30,7 @@ from app.db.models import (
     Reminder,
     ReminderOccurrence,
     ReminderState,
+    User,
 )
 from app.db.session import SessionLocal
 from app.services.message_context import (
@@ -39,11 +40,17 @@ from app.services.message_context import (
     format_context_for_delivery,
     get_context_for_delivery,
 )
+from app.services.persistent_policy import (
+    is_persistent_mode,
+    next_allowed_delivery,
+    next_persistent_delivery,
+)
 from app.services.recurrence import is_completion_relative
 from app.services.reminder_service import (
     advance_occurrence_until_future,
     delivery_at_utc,
     get_recurrence_rule,
+    persistent_policy_for_reminder,
     prepare_delivery_occurrence,
     set_last_message_id,
 )
@@ -75,6 +82,9 @@ class WorkerMetrics:
     failed: int = 0
     expired_leases: int = 0
     processing_age_seconds: float = 0.0
+    quiet_hours_deferred: int = 0
+    user_cooldown_deferred: int = 0
+    persistent_exhausted: int = 0
 
     def snapshot(self) -> dict[str, int | float]:
         return {
@@ -85,6 +95,9 @@ class WorkerMetrics:
             "failed": self.failed,
             "expired_leases": self.expired_leases,
             "processing_age_seconds": self.processing_age_seconds,
+            "quiet_hours_deferred": self.quiet_hours_deferred,
+            "user_cooldown_deferred": self.user_cooldown_deferred,
+            "persistent_exhausted": self.persistent_exhausted,
         }
 
 
@@ -100,6 +113,7 @@ def reminder_actions_kb(
     recurrence_type: str = RecurrenceType.NONE.value,
     include_snooze: bool = True,
     origin: CallbackOrigin | str = CallbackOrigin.DELIVERY,
+    mode: str = "normal",
 ) -> InlineKeyboardMarkup:
     # Keep the old helper call useful for callers that only want a compact
     # cancellation button. Real delivery cards always pass an occurrence id.
@@ -144,10 +158,14 @@ def reminder_actions_kb(
         rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
         if recurrence_type != RecurrenceType.NONE.value:
             rows.append([button("⏸ Пауза", CallbackAction.PAUSE)])
+        if is_persistent_mode(mode):
+            rows.append([button("🔕 Выключить повторы", CallbackAction.DISABLE_PERSISTENT)])
         rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
     elif state == ReminderState.PAUSED.value:
         rows.append([button("▶️ Продолжить", CallbackAction.RESUME)])
         rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
+        if is_persistent_mode(mode):
+            rows.append([button("🔕 Выключить повторы", CallbackAction.DISABLE_PERSISTENT)])
         rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
     elif state in {ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value}:
         if include_snooze:
@@ -155,6 +173,8 @@ def reminder_actions_kb(
         rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
         if recurrence_type != RecurrenceType.NONE.value:
             rows.append([button("⏸ Пауза", CallbackAction.PAUSE)])
+        if is_persistent_mode(mode):
+            rows.append([button("🔕 Выключить повторы", CallbackAction.DISABLE_PERSISTENT)])
         rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
     else:
         rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
@@ -317,6 +337,73 @@ def _safe_failure_text(failure: DeliveryFailure) -> str:
     return text[:2000]
 
 
+def _release_policy_deferral(reminder: Reminder, delivery_at_utc: datetime) -> None:
+    """Return a policy-deferred job without resetting its delivery budget."""
+
+    reminder.delivery_at_utc = delivery_at_utc
+    reminder.status = "pending"
+    reminder.next_retry_at = None
+    reminder.processing_started_at = None
+    reminder.lease_until = None
+    reminder.lease_token = None
+
+
+def _mark_persistent_exhausted(reminder: Reminder, current_time: datetime) -> None:
+    reminder.status = "sent"
+    reminder.state = ReminderState.DELIVERED.value
+    reminder.delivery_at_utc = None
+    reminder.snoozed_until_utc = None
+    reminder.last_message_id = None
+    reminder.last_delivery_occurrence_utc = None
+    reminder.persistent_exhausted_at = current_time
+    reminder.persistent_stop_reason = "delivery_limit"
+    _clear_processing_state(reminder)
+
+
+def _next_persistent_delivery_after_now(reminder: Reminder, now_utc: datetime) -> datetime:
+    policy = persistent_policy_for_reminder(reminder)
+    candidate = max(_as_utc(delivery_at_utc(reminder)), _as_utc(now_utc))
+    return next_allowed_delivery(
+        candidate,
+        reminder.schedule_timezone,
+        quiet_hours_start=policy.quiet_hours_start,
+        quiet_hours_end=policy.quiet_hours_end,
+    )
+
+
+async def _reserve_user_persistent_slot(
+    session: Any,
+    reminder: Reminder,
+    current_time: datetime,
+) -> datetime | None:
+    """Reserve the user cooldown before committing a worker claim.
+
+    The user row is locked in the same transaction as the reminder claim. This
+    keeps two workers from claiming several persistent reminders for one user
+    at the same time, while a failed send simply leaves a harmless short-lived
+    reservation that cannot create notification spam.
+    """
+
+    cooldown_minutes = max(
+        0,
+        int(getattr(settings, "persistent_user_cooldown_minutes", 0)),
+    )
+    if cooldown_minutes == 0:
+        return None
+
+    owner = await session.scalar(select(User).where(User.id == reminder.user_id).with_for_update())
+    if owner is None:
+        return None
+    available_at = owner.next_persistent_delivery_at_utc
+    if available_at is not None and _as_utc(available_at) > _as_utc(current_time):
+        return _as_utc(available_at)
+
+    owner.next_persistent_delivery_at_utc = _as_utc(current_time) + timedelta(
+        minutes=cooldown_minutes
+    )
+    return None
+
+
 async def claim_due_reminders(
     limit: int,
     *,
@@ -343,6 +430,9 @@ async def claim_due_reminders(
     recovered_count = 0
     expired_count = 0
     exhausted_count = 0
+    persistent_exhausted_count = 0
+    quiet_deferred_count = 0
+    user_cooldown_deferred_count = 0
     max_recovered_age = 0.0
     current_processing_age = 0.0
 
@@ -379,6 +469,35 @@ async def claim_due_reminders(
                     reminder.action_revision += 1
                     reminder.delivery_at_utc = None
                     reminder.snoozed_until_utc = None
+                    continue
+
+            if is_persistent_mode(reminder.mode):
+                policy = persistent_policy_for_reminder(reminder)
+                delivery_count = int(getattr(reminder, "persistent_delivery_count", None) or 0)
+                if delivery_count >= policy.max_effective_deliveries:
+                    _mark_persistent_exhausted(reminder, current_time)
+                    persistent_exhausted_count += 1
+                    continue
+
+                policy_delivery_at = _next_persistent_delivery_after_now(
+                    reminder,
+                    current_time,
+                )
+                if policy_delivery_at > _as_utc(current_time):
+                    reminder.persistent_deferred_count += 1
+                    _release_policy_deferral(reminder, policy_delivery_at)
+                    quiet_deferred_count += 1
+                    continue
+
+                available_at = await _reserve_user_persistent_slot(
+                    session,
+                    reminder,
+                    current_time,
+                )
+                if available_at is not None and available_at > _as_utc(current_time):
+                    reminder.persistent_deferred_count += 1
+                    _release_policy_deferral(reminder, available_at)
+                    user_cooldown_deferred_count += 1
                     continue
 
             was_recovery = reminder.status == "processing"
@@ -432,15 +551,27 @@ async def claim_due_reminders(
     worker_metrics.recovered += recovered_count
     worker_metrics.expired_leases += expired_count
     worker_metrics.failed += exhausted_count
+    worker_metrics.persistent_exhausted += persistent_exhausted_count
+    worker_metrics.quiet_hours_deferred += quiet_deferred_count
+    worker_metrics.user_cooldown_deferred += user_cooldown_deferred_count
     worker_metrics.processing_age_seconds = current_processing_age
 
-    if claimed or recovered_count or exhausted_count:
+    if (
+        claimed
+        or recovered_count
+        or exhausted_count
+        or persistent_exhausted_count
+        or quiet_deferred_count
+        or user_cooldown_deferred_count
+    ):
         logger.info(
             "Reminder claim batch",
             extra={
                 "extra_data": (
                     f"claimed={len(claimed)} recovered={recovered_count} "
-                    f"exhausted={exhausted_count} "
+                    f"exhausted={exhausted_count} quiet_deferred={quiet_deferred_count} "
+                    f"user_cooldown_deferred={user_cooldown_deferred_count} "
+                    f"persistent_exhausted={persistent_exhausted_count} "
                     f"processing_age_seconds={current_processing_age:.3f}"
                 )
             },
@@ -548,6 +679,34 @@ async def finalize_delivery_success(
         reminder.attempt_count = 0
         if reminder.last_delivery_occurrence_utc is None:
             reminder.last_delivery_occurrence_utc = current_occurrence
+
+        if is_persistent_mode(reminder.mode):
+            policy = persistent_policy_for_reminder(reminder)
+            reminder.persistent_delivery_count += 1
+            reminder.persistent_escalation_count = max(0, reminder.persistent_delivery_count - 1)
+            if reminder.persistent_delivery_count >= policy.max_effective_deliveries:
+                reminder.status = "sent"
+                reminder.state = ReminderState.DELIVERED.value
+                reminder.delivery_at_utc = None
+                reminder.snoozed_until_utc = None
+                reminder.persistent_exhausted_at = current_time
+                reminder.persistent_stop_reason = "delivery_limit"
+                _clear_processing_state(reminder)
+                worker_metrics.persistent_exhausted += 1
+                return True
+
+            reminder.delivery_at_utc = next_persistent_delivery(
+                current_time,
+                reminder.schedule_timezone,
+                policy,
+            )
+            reminder.snoozed_until_utc = None
+            reminder.status = "pending"
+            reminder.state = ReminderState.SCHEDULED.value
+            reminder.persistent_exhausted_at = None
+            reminder.persistent_stop_reason = None
+            _clear_processing_state(reminder)
+            return True
 
         recurrence_rule = get_recurrence_rule(reminder)
         if reminder.recurrence_type == RecurrenceType.NONE.value:
@@ -732,7 +891,26 @@ def _delivery_text(
     *,
     media_unavailable: bool = False,
 ) -> str:
-    prefix = "⏰ Напоминание\n\n"
+    if is_persistent_mode(reminder.mode):
+        policy = persistent_policy_for_reminder(reminder)
+        delivery_count = int(getattr(reminder, "persistent_delivery_count", None) or 0)
+        delivery_number = delivery_count + 1
+        remaining = max(0, policy.max_effective_deliveries - delivery_number)
+        if remaining == 0:
+            persistence_hint = (
+                "Это последняя автоматическая доставка по лимиту. "
+                "Нажми «Готово», «Отложить», «Выключить повторы» или «Удалить»."
+            )
+        else:
+            persistence_hint = (
+                f"Повтор через {policy.interval_minutes} мин.; "
+                f"автоматических доставок осталось: {remaining}. "
+                "Чтобы остановить, нажми «Готово», «Отложить», "
+                "«Выключить повторы» или «Удалить»."
+            )
+        prefix = f"🔔 Важное напоминание\n\n{persistence_hint}\n\n"
+    else:
+        prefix = "⏰ Напоминание\n\n"
     if context is not None:
         context_text = format_context_for_delivery(
             context,
@@ -897,6 +1075,7 @@ async def process_claimed_reminder(
                     state=ReminderState.DELIVERED.value,
                     recurrence_type=reminder.recurrence_type,
                     include_snooze=True,
+                    mode=reminder.mode,
                 ),
             ),
             timeout=settings.worker_send_timeout_seconds,

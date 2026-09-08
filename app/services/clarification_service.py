@@ -13,6 +13,7 @@ from app.services.message_context import (
     deserialize_context_snapshot,
     serialize_context_snapshot,
 )
+from app.services.persistent_policy import normalize_reminder_mode
 from app.services.reminder_parser import ClarificationRequest, ParsedReminder
 
 CLARIFICATION_TTL = timedelta(minutes=15)
@@ -61,6 +62,7 @@ async def create_clarification(
         raise ValueError("Голосовое уточнение не может содержать Telegram context")
     current_time = _as_utc(now_utc or datetime.now(UTC))
     expiry = _as_utc(expires_at or (current_time + CLARIFICATION_TTL))
+    clarification_mode = normalize_reminder_mode(request.mode)
 
     async with SessionLocal() as session, session.begin():
         owner = await session.scalar(
@@ -96,6 +98,7 @@ async def create_clarification(
                 voice_transcript=normalized_transcript,
                 source_message_id=normalized_source_id,
                 context_snapshot=serialized_context,
+                mode=clarification_mode,
                 raw_text=raw_text,
                 clarification_type=request.kind,
                 prompt=request.prompt,
@@ -107,6 +110,7 @@ async def create_clarification(
             existing.voice_transcript = normalized_transcript
             existing.source_message_id = normalized_source_id
             existing.context_snapshot = serialized_context
+            existing.mode = clarification_mode
             existing.raw_text = raw_text
             existing.clarification_type = request.kind
             existing.prompt = request.prompt
@@ -182,6 +186,12 @@ async def consume_clarification_and_create_reminder(
         from app.services.reminder_service import create_reminder_in_session
 
         context = deserialize_context_snapshot(clarification.context_snapshot)
+        clarification_mode = normalize_reminder_mode(clarification.mode)
+        reminder_mode = (
+            clarification_mode
+            if clarification_mode == "persistent"
+            else normalize_reminder_mode(parsed.mode)
+        )
 
         reminder = await create_reminder_in_session(
             session,
@@ -195,6 +205,7 @@ async def consume_clarification_and_create_reminder(
             parsed.recurrence_day_of_month,
             now_utc=current_time,
             context=context,
+            mode=reminder_mode,
         )
         await session.delete(clarification)
         await session.flush()
