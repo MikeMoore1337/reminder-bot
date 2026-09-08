@@ -470,7 +470,9 @@ async def record_snooze_event_in_session(
     if not _suggestion_eligible(reminder):
         return None
 
-    owner = await session.scalar(select(User).where(User.id == user_id, User.chat_id == chat_id))
+    owner = await session.scalar(
+        select(User).where(User.id == user_id, User.chat_id == chat_id).with_for_update()
+    )
     if owner is None or not bool(getattr(owner, "suggestions_enabled", False)):
         return None
 
@@ -798,6 +800,13 @@ async def resolve_suggestion(
                 changed=False,
                 already_resolved=True,
             )
+        if not bool(getattr(owner, "suggestions_enabled", False)):
+            suggestion.status = SuggestionState.DISMISSED.value
+            suggestion.resolution = "opt_out"
+            suggestion.resolved_at = current_time
+            suggestion.revision += 1
+            adaptive_metrics.suggestions_dismissed += 1
+            return _resolution(suggestion, status="dismissed", changed=False)
         if _is_suggestion_expired(suggestion, now_utc=current_time):
             _mark_suggestion_expired(suggestion, now_utc=current_time)
             return _resolution(suggestion, status="expired", changed=False)

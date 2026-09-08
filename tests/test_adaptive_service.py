@@ -443,6 +443,71 @@ def test_opt_out_revokes_pending_suggestions_and_digest_slots(monkeypatch) -> No
     asyncio.run(scenario())
 
 
+def test_suggestion_callback_cannot_reenable_after_opt_out(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+        try:
+            user = await _add_user(session_factory, suggestions=False)
+            reminder = await _add_recurring_reminder(session_factory, user)
+            original_schedule = reminder.remind_at_utc
+            async with session_factory() as session:
+                suggestion = ReminderSuggestion(
+                    user_id=user.id,
+                    chat_id=user.chat_id,
+                    reminder_id=reminder.id,
+                    kind=adaptive_service.SUGGESTION_KIND_SCHEDULE_TIME,
+                    status="pending",
+                    revision=1,
+                    expected_reminder_revision=reminder.action_revision,
+                    current_local_minutes=8 * 60,
+                    proposed_local_minutes=9 * 60,
+                    evidence_count=3,
+                    evidence_window_start_utc=now - timedelta(days=2),
+                    evidence_window_end_utc=now,
+                    dedupe_key="test:opt-out:callback",
+                )
+                session.add(suggestion)
+                await session.commit()
+                await session.refresh(suggestion)
+
+            blocked = await resolve_suggestion(
+                user,
+                suggestion.id,
+                expected_revision=suggestion.revision,
+                action="accept",
+                now_utc=now,
+            )
+            assert blocked.status == "dismissed"
+            assert not blocked.changed
+            assert not blocked.already_resolved
+
+            repeated = await resolve_suggestion(
+                user,
+                suggestion.id,
+                expected_revision=suggestion.revision,
+                action="accept",
+                now_utc=now,
+            )
+            assert repeated.status == "dismissed"
+            assert repeated.already_resolved
+            assert not repeated.changed
+
+            async with session_factory() as session:
+                saved_suggestion = await session.get(ReminderSuggestion, suggestion.id)
+                saved_reminder = await session.get(Reminder, reminder.id)
+                assert saved_suggestion is not None
+                assert saved_suggestion.status == "dismissed"
+                assert saved_suggestion.resolution == "opt_out"
+                assert saved_reminder is not None
+                assert saved_reminder.remind_at_utc == original_schedule
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_digest_is_timezone_aware_bounded_idempotent_and_keeps_important(monkeypatch) -> None:
     async def scenario() -> None:
         engine, connection, session_factory = await _sqlite_setup(monkeypatch)()

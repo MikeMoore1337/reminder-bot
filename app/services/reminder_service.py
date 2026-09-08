@@ -734,7 +734,10 @@ async def list_active_reminders(user: User) -> list[Reminder]:
                 Reminder.state.in_(ACTIVE_STATES),
                 Reminder.status != "processing",
             )
-            .order_by(func.coalesce(Reminder.delivery_at_utc, Reminder.remind_at_utc).asc())
+            .order_by(
+                func.coalesce(Reminder.delivery_at_utc, Reminder.remind_at_utc).asc(),
+                Reminder.id.asc(),
+            )
         )
         return list(result.scalars().all())
 
@@ -1453,6 +1456,12 @@ async def snooze_reminder(
         raise ValueError("Время откладывания должно быть в будущем")
 
     async with SessionLocal() as session, session.begin():
+        owner = await session.scalar(
+            select(User).where(User.id == user.id, User.chat_id == user.chat_id).with_for_update()
+        )
+        if owner is None:
+            _invalid_action("snooze", reminder_id=reminder_id, reason="owner")
+            return None
         reminder = await _load_owned_reminder(session, user, reminder_id)
         if reminder is None:
             _invalid_action("snooze", reminder_id=reminder_id, reason="owner")
