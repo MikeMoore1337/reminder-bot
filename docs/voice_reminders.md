@@ -32,24 +32,43 @@ STT выключен, пока не задан путь к модели; remote 
 
 ## Модель и bootstrap
 
-Модель и бинарник `whisper.cpp` должны быть установлены владельцем вне Git и
-вне runtime temp directory. Используйте multilingual `base` либо
-конфигурируемый `tiny`/quantized low-resource вариант; `.en` модели для
-русского потока не подходят. В `.env` задаются:
+Модель, бинарник `whisper.cpp` и совместимый `ffmpeg` должны быть установлены
+владельцем вне Git и вне runtime temp directory. Используйте multilingual
+`base` либо конфигурируемый `tiny`/quantized low-resource вариант; `.en` модели
+для русского потока не подходят.
+
+Compose поддерживает один лёгкий host runtime bundle, например
+`/opt/reminder-bot/voice-runtime`, со структурой:
 
 ```text
-VOICE_STT_COMMAND=/opt/reminder-bot/bin/whisper-cli
-VOICE_STT_MODEL_PATH=/opt/reminder-bot/models/ggml-base.bin
+voice-runtime/
+  bin/ffmpeg
+  bin/whisper-cli
+  models/ggml-base.bin
+```
+
+Он монтируется только в bot-контейнер как read-only в `/opt/reminder-bot/voice`.
+Временные voice-каталоги bot и worker используют общий именованный volume в
+`/var/lib/reminder-bot/voice-temp`; это позволяет worker удалить orphan после
+перезапуска, не давая ему доступ к runtime bundle. Ни бинарники, ни модели не
+коммитятся в репозиторий, а provisioning этого bundle остаётся owner-only.
+В `.env` задаются container paths:
+
+```text
+VOICE_RUNTIME_DIR=/opt/reminder-bot/voice-runtime
+VOICE_STT_COMMAND=/opt/reminder-bot/voice/bin/whisper-cli
+VOICE_STT_MODEL_PATH=/opt/reminder-bot/voice/models/ggml-base.bin
 VOICE_STT_LANGUAGE=ru
 VOICE_STT_THREADS=2
+VOICE_CONVERSION_COMMAND=/opt/reminder-bot/voice/bin/ffmpeg
+VOICE_TEMP_DIR=/var/lib/reminder-bot/voice-temp
 ```
 
 `VOICE_STT_COMMAND` разбирается как argv и запускается с `shell=False`. Не
 вставляйте в него shell pipelines, secrets или пользовательские значения.
-Базовый runtime image намеренно не содержит тяжёлый optional media stack:
-owner-only production bootstrap должен provision-ить `ffmpeg` (или совместимый
-конвертер) и задать его через `VOICE_CONVERSION_COMMAND`. Команда разбирается в
-argv и не проходит через shell.
+Базовый runtime image намеренно не содержит optional media stack и не
+подменяет host bundle. Команда конвертера разбирается в argv и не проходит
+через shell.
 
 Production secrets, model installation, `DEPLOY_ENABLED`, первый deploy и
 production database operations остаются owner-only. Этот документ не является
@@ -64,9 +83,11 @@ production database operations остаются owner-only. Этот докум�
    повторение и часовой пояс с кнопками «Создать» и «Отмена».
 4. Reminder появляется только после «Создать». Повторный или stale callback
    не создаёт вторую запись.
-5. Неоднозначный результат переводится в существующий bounded clarification
-   flow; автоматического угадывания нет. `/cancel` отменяет voice draft,
-   clarification и другие активные сценарии.
+5. Неоднозначный результат переводится в bounded clarification flow с
+   сохранением voice-контекста. Ответ пользователя создаёт только новый
+   confirmation-gated voice draft; Reminder появляется лишь после точного
+   «Создать». `/cancel` отменяет voice draft, clarification и другие активные
+   сценарии.
 
 Счётчики и bounded latency buckets доступны администраторской статистике:
 download/conversion/STT/parse/confirmation/cancellation/cleanup. В метриках нет

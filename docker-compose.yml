@@ -35,6 +35,11 @@ services:
     command: python -m app.main
     env_file:
       - .env
+    environment:
+      VOICE_TEMP_DIR: ${VOICE_TEMP_DIR:-/var/lib/reminder-bot/voice-temp}
+    volumes:
+      - ${VOICE_RUNTIME_DIR:-/opt/reminder-bot/voice-runtime}:/opt/reminder-bot/voice:ro
+      - voice_temp:/var/lib/reminder-bot/voice-temp
     init: true
     stop_grace_period: 30s
     depends_on:
@@ -58,6 +63,10 @@ services:
     command: python -m app.worker_main
     env_file:
       - .env
+    environment:
+      VOICE_TEMP_DIR: ${VOICE_TEMP_DIR:-/var/lib/reminder-bot/voice-temp}
+    volumes:
+      - voice_temp:/var/lib/reminder-bot/voice-temp
     init: true
     stop_grace_period: 45s
     depends_on:
@@ -68,3 +77,5 @@ services:
 volumes:
   postgres_data:
     name: reminder_bot_postgres_data
+  voice_temp:
+    name: reminder_bot_voice_temp

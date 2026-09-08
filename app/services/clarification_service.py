@@ -6,12 +6,14 @@ from typing import Any, cast
 from sqlalchemy import delete, select
 from sqlalchemy.engine import CursorResult
 
-from app.db.models import Reminder, ReminderClarification, User
+from app.db.models import ActionDraft, Reminder, ReminderClarification, User, VoiceReminderDraft
 from app.db.session import SessionLocal
 from app.services.reminder_parser import ClarificationRequest, ParsedReminder
 
 CLARIFICATION_TTL = timedelta(minutes=15)
 MAX_CLARIFICATION_TEXT_LENGTH = 4096
+CLARIFICATION_ORIGIN_TEXT = "text"
+CLARIFICATION_ORIGIN_VOICE = "voice"
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -26,10 +28,26 @@ async def create_clarification(
     *,
     now_utc: datetime | None = None,
     expires_at: datetime | None = None,
+    origin: str = CLARIFICATION_ORIGIN_TEXT,
+    voice_transcript: str | None = None,
+    source_message_id: int | None = None,
 ) -> ReminderClarification:
     raw_text = request.raw_text.strip()
     if not raw_text or len(raw_text) > MAX_CLARIFICATION_TEXT_LENGTH:
         raise ValueError("Запрос на уточнение слишком длинный")
+    if origin not in {CLARIFICATION_ORIGIN_TEXT, CLARIFICATION_ORIGIN_VOICE}:
+        raise ValueError("Некорректный источник уточнения")
+    normalized_transcript = voice_transcript.strip() if voice_transcript is not None else None
+    if normalized_transcript and len(normalized_transcript) > MAX_CLARIFICATION_TEXT_LENGTH:
+        raise ValueError("Расшифровка голосового сообщения слишком длинная")
+    if origin == CLARIFICATION_ORIGIN_VOICE and not normalized_transcript:
+        raise ValueError("Для голосового уточнения нужна расшифровка")
+    if origin == CLARIFICATION_ORIGIN_TEXT:
+        normalized_transcript = None
+        source_message_id = None
+    normalized_source_id = (
+        source_message_id if source_message_id is not None and source_message_id > 0 else None
+    )
     current_time = _as_utc(now_utc or datetime.now(UTC))
     expiry = _as_utc(expires_at or (current_time + CLARIFICATION_TTL))
 
@@ -39,6 +57,18 @@ async def create_clarification(
         )
         if owner is None:
             raise ValueError("Пользователь не найден")
+        await session.execute(
+            delete(ActionDraft).where(
+                ActionDraft.user_id == owner.id,
+                ActionDraft.chat_id == owner.chat_id,
+            )
+        )
+        await session.execute(
+            delete(VoiceReminderDraft).where(
+                VoiceReminderDraft.user_id == owner.id,
+                VoiceReminderDraft.chat_id == owner.chat_id,
+            )
+        )
         existing = await session.scalar(
             select(ReminderClarification)
             .where(
@@ -51,6 +81,9 @@ async def create_clarification(
             existing = ReminderClarification(
                 user_id=user.id,
                 chat_id=user.chat_id,
+                origin=origin,
+                voice_transcript=normalized_transcript,
+                source_message_id=normalized_source_id,
                 raw_text=raw_text,
                 clarification_type=request.kind,
                 prompt=request.prompt,
@@ -58,6 +91,9 @@ async def create_clarification(
             )
             session.add(existing)
         else:
+            existing.origin = origin
+            existing.voice_transcript = normalized_transcript
+            existing.source_message_id = normalized_source_id
             existing.raw_text = raw_text
             existing.clarification_type = request.kind
             existing.prompt = request.prompt
@@ -118,6 +154,7 @@ async def consume_clarification_and_create_reminder(
                 ReminderClarification.id == clarification_id,
                 ReminderClarification.user_id == owner.id,
                 ReminderClarification.chat_id == owner.chat_id,
+                ReminderClarification.origin == CLARIFICATION_ORIGIN_TEXT,
                 ReminderClarification.raw_text == raw_text,
             )
             .with_for_update()

@@ -87,7 +87,7 @@ jobs:
       - name: Validate migration chain and round trip
         run: |
           test "$(alembic heads | grep -c '(head)')" -eq 1
-          test "$(alembic heads | grep -c '20260908_0007')" -eq 1
+          test "$(alembic heads | grep -c '20260908_0008')" -eq 1
           alembic upgrade head
           alembic downgrade 20260907_0003
           alembic upgrade head
@@ -116,6 +116,42 @@ jobs:
 
       - name: Build production image
         run: docker build --tag reminder-bot:ci .
+
+      - name: Smoke voice runtime and shared temp mounts
+        run: |
+          compose_config="$(docker compose config)"
+          test "$(printf '%s\n' "$compose_config" | grep -c 'target: /opt/reminder-bot/voice$')" -eq 1
+          test "$(printf '%s\n' "$compose_config" | grep -c 'target: /var/lib/reminder-bot/voice-temp$')" -eq 2
+          docker compose run --rm --no-deps --entrypoint python bot -c '
+          from pathlib import Path
+
+          assert Path("/opt/reminder-bot/voice").is_dir()
+          assert Path("/var/lib/reminder-bot/voice-temp").is_dir()
+          print("VOICE_RUNTIME_MOUNT_SMOKE_OK")
+          '
+          docker compose run --rm --no-deps --entrypoint python bot -c '
+          import os
+          import time
+          from pathlib import Path
+
+          orphan = Path("/var/lib/reminder-bot/voice-temp/reminder-bot-voice-ci")
+          orphan.mkdir()
+          old = time.time() - 3600
+          os.utime(orphan, (old, old))
+          '
+          docker compose run --rm --no-deps --entrypoint python worker -c '
+          import time
+          from pathlib import Path
+
+          from app.services.voice_media import cleanup_orphaned_voice_temp_dirs
+
+          root = Path("/var/lib/reminder-bot/voice-temp")
+          assert cleanup_orphaned_voice_temp_dirs(
+              str(root), max_age_seconds=60, now_epoch=time.time()
+          ) == 1
+          assert not (root / "reminder-bot-voice-ci").exists()
+          print("VOICE_SHARED_ORPHAN_CLEANUP_SMOKE_OK")
+          '
 
       - name: Verify runtime image has no development tools
         run: |

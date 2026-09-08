@@ -15,10 +15,11 @@ from app.callbacks import (
     ReminderCallback,
     parse_callback,
 )
-from app.db.models import Reminder, User
+from app.db.models import Reminder, User, VoiceReminderDraft
 from app.keyboards.voice import voice_draft_kb
 from app.services import reminder_service
 from app.services.clarification_service import (
+    CLARIFICATION_ORIGIN_VOICE,
     cancel_clarification,
     consume_clarification_and_create_reminder,
     create_clarification,
@@ -54,11 +55,12 @@ from app.services.voice_service import (
     bind_voice_preview_message,
     cancel_voice_reminder_draft,
     confirm_voice_draft,
+    consume_voice_clarification_to_draft,
     discard_voice_draft,
     format_voice_draft_preview,
     process_voice_message,
 )
-from app.utils.datetime_utils import from_utc_to_user, now_in_timezone
+from app.utils.datetime_utils import from_utc_to_user, now_in_timezone, utc_now
 from app.workers.reminder_worker import snooze_presets_kb
 
 logger = logging.getLogger(__name__)
@@ -116,6 +118,9 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
     if not isinstance(parsed, ParsedReminder):
         return
 
+    await cancel_active_action_drafts(user)
+    await cancel_clarification(user)
+    await cancel_voice_reminder_draft(user)
     try:
         reminder = await create_reminder(
             user=user,
@@ -142,8 +147,14 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
     )
 
 
-async def _handle_clarification(message: Message, user: User) -> bool:
-    clarification = await get_active_clarification(user)
+async def _handle_clarification(
+    message: Message,
+    user: User,
+    *,
+    now_utc: datetime | None = None,
+) -> bool:
+    current_time = now_utc or utc_now()
+    clarification = await get_active_clarification(user, now_utc=current_time)
     if clarification is None:
         return False
 
@@ -151,10 +162,28 @@ async def _handle_clarification(message: Message, user: User) -> bool:
     parsed = parse_clarification_answer(
         clarification.raw_text,
         raw_value,
-        now_local=now_in_timezone(user.timezone),
+        now_local=from_utc_to_user(current_time, user.timezone),
     )
     if not isinstance(parsed, ParsedReminder):
         await message.answer(clarification.prompt)
+        return True
+
+    if clarification.origin == CLARIFICATION_ORIGIN_VOICE:
+        try:
+            draft = await consume_voice_clarification_to_draft(
+                user=user,
+                clarification_id=clarification.id,
+                raw_text=clarification.raw_text,
+                parsed=parsed,
+                now_utc=current_time,
+            )
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return True
+        if draft is None:
+            await message.answer(CLARIFICATION_STALE_FEEDBACK)
+            return True
+        await _send_voice_preview(message, user, draft, now_utc=current_time)
         return True
 
     try:
@@ -163,6 +192,7 @@ async def _handle_clarification(message: Message, user: User) -> bool:
             clarification_id=clarification.id,
             raw_text=clarification.raw_text,
             parsed=parsed,
+            now_utc=current_time,
         )
     except ValueError as exc:
         await message.answer(str(exc))
@@ -307,6 +337,32 @@ def _voice_saved_text(reminder: Reminder, timezone_name: str) -> str:
     )
 
 
+async def _send_voice_preview(
+    message: Message,
+    user: User,
+    draft: VoiceReminderDraft,
+    *,
+    now_utc: datetime | None = None,
+) -> bool:
+    sent = await message.answer(
+        format_voice_draft_preview(draft),
+        reply_markup=voice_draft_kb(draft.id, draft.action_revision),
+    )
+    preview_message_id = getattr(sent, "message_id", None)
+    if not isinstance(preview_message_id, int) or preview_message_id <= 0:
+        return False
+    bound = await bind_voice_preview_message(
+        user,
+        draft.id,
+        revision=draft.action_revision,
+        message_id=preview_message_id,
+        now_utc=now_utc,
+    )
+    if not bound:
+        await _safe_remove_keyboard(sent)
+    return bound
+
+
 async def _handle_voice_callback(callback: CallbackQuery, parsed: ReminderCallback) -> None:
     if parsed.origin != CallbackOrigin.VOICE or parsed.action not in {
         CallbackAction.CREATE,
@@ -381,18 +437,7 @@ async def voice_reminder_handler(message: Message, bot: Bot) -> None:
             await message.answer(result.message)
         return
 
-    sent = await message.answer(
-        format_voice_draft_preview(result.draft),
-        reply_markup=voice_draft_kb(result.draft.id, result.draft.action_revision),
-    )
-    preview_message_id = getattr(sent, "message_id", None)
-    if isinstance(preview_message_id, int) and preview_message_id > 0:
-        await bind_voice_preview_message(
-            user,
-            result.draft.id,
-            revision=result.draft.action_revision,
-            message_id=preview_message_id,
-        )
+    await _send_voice_preview(message, user, result.draft)
 
 
 async def _resolve_callback_target(

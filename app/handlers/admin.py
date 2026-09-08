@@ -40,6 +40,7 @@ async def cmd_stats(message: Message) -> None:
         f"✅ Отправлено за 24 часа: <b>{stats['sent_last_24h']}</b>\n"
         f"🎙 Голосовой STT: <b>{voice['stt_success']}</b> успешно / "
         f"<b>{voice_stt_failures}</b> ошибок\n"
+        f"🛠 Исправлено голосом: <b>{voice['parse_correction']}</b>\n"
         f"✅ Подтверждено голосом: <b>{voice['confirmation_success']}</b>"
     )
 

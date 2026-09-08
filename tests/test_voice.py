@@ -5,6 +5,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.types import Voice
@@ -13,18 +14,21 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.callbacks import CallbackAction, CallbackOrigin, CallbackTarget, parse_callback
 from app.db.base import Base
-from app.db.models import Reminder, ReminderClarification, User, VoiceReminderDraft
+from app.db.models import ActionDraft, Reminder, ReminderClarification, User, VoiceReminderDraft
+from app.handlers import reminders as reminders_handler
 from app.keyboards.voice import voice_draft_kb
 from app.services import clarification_service, reminder_service, voice_service
-from app.services.reminder_parser import ParsedReminder, parse_reminder_input
+from app.services.reminder_parser import ClarificationRequest, ParsedReminder, parse_reminder_input
 from app.services.speech_to_text import (
     SpeechToTextError,
     WhisperCppSpeechToTextProvider,
 )
 from app.services.voice_media import (
+    VOICE_PCM_BYTES_PER_SECOND,
     VoiceMediaError,
     VoiceMediaLimits,
     cleanup_orphaned_voice_temp_dirs,
+    convert_voice_to_wav,
     download_voice,
     validate_voice_metadata,
 )
@@ -406,6 +410,7 @@ def test_voice_ambiguous_transcript_uses_persisted_clarification(monkeypatch, tm
                 _FakeBot(),
                 user,
                 _voice(),
+                source_message_id=7100,
                 provider=_FakeProvider("после обеда позвонить врачу"),
                 now_utc=now,
             )
@@ -414,16 +419,194 @@ def test_voice_ambiguous_transcript_uses_persisted_clarification(monkeypatch, tm
             assert result.message
             assert "время" in result.message.lower()
             assert list(tmp_path.iterdir()) == []
+            message = SimpleNamespace(
+                text="14:00",
+                answer=AsyncMock(return_value=SimpleNamespace(message_id=9100)),
+            )
+            assert await reminders_handler._handle_clarification(
+                message,
+                user,
+                now_utc=now,
+            )
             async with session_factory() as session:
                 assert await session.scalar(select(func.count()).select_from(Reminder)) == 0
+                draft = await session.scalar(select(VoiceReminderDraft))
+                assert draft is not None
+                assert draft.transcript == "после обеда позвонить врачу"
+                assert draft.source_message_id == 7100
+                clarification = await session.scalar(select(ReminderClarification))
+                assert clarification is None
+            message.answer.assert_awaited_once()
+            metrics = voice_service.get_voice_metrics()
+            assert metrics["parse_clarification"] == 1
+            assert metrics["parse_correction"] == 1
+            assert metrics["stt_success"] == 1
+
+            created = await voice_service.confirm_voice_draft(
+                user,
+                draft.id,
+                expected_revision=draft.action_revision,
+                expected_message_id=9100,
+                now_utc=now,
+            )
+            assert created is not None
+            assert (
+                await voice_service.confirm_voice_draft(
+                    user,
+                    draft.id,
+                    expected_revision=draft.action_revision,
+                    expected_message_id=9100,
+                    now_utc=now,
+                )
+                is None
+            )
+            async with session_factory() as session:
+                assert await session.scalar(select(func.count()).select_from(Reminder)) == 1
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_voice_conversion_rejects_decoded_output_over_duration_bound(monkeypatch, tmp_path):
+    async def scenario() -> None:
+        source = tmp_path / "input.ogg"
+        destination = tmp_path / "normalized.wav"
+        source.write_bytes(b"ogg")
+        limits = VoiceMediaLimits(
+            max_file_size_bytes=10_000,
+            max_duration_seconds=1,
+            download_timeout_seconds=30,
+            conversion_timeout_seconds=30,
+            conversion_command=sys.executable,
+        )
+        validate_voice_metadata(_voice(duration=1, file_size=100), limits)
+        captured: dict[str, object] = {}
+
+        class Stream:
+            def __init__(self) -> None:
+                self.chunks = [
+                    b"R" * 44,
+                    b"P" * (VOICE_PCM_BYTES_PER_SECOND + 1),
+                ]
+
+            async def read(self, _: int) -> bytes:
+                return self.chunks.pop(0) if self.chunks else b""
+
+        class Process:
+            returncode = None
+            stdout = Stream()
+            killed = False
+
+            async def wait(self) -> int:
+                if self.killed:
+                    self.returncode = -9
+                    return self.returncode
+                await asyncio.sleep(60)
+                return 0
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = Process()
+
+        async def fake_create(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return process
+
+        monkeypatch.setattr("app.services.voice_media.asyncio.create_subprocess_exec", fake_create)
+        with pytest.raises(VoiceMediaError, match="превышает допустимую длительность") as caught:
+            await convert_voice_to_wav(source, destination, limits)
+        assert caught.value.category == "duration"
+        assert process.killed
+        assert not destination.exists()
+        assert list(captured["args"])[-1] == "pipe:1"
+        assert captured["kwargs"]["stdout"] == asyncio.subprocess.PIPE
+
+    asyncio.run(scenario())
+
+
+def test_voice_flow_arbitration_clears_stale_scenarios(monkeypatch, tmp_path):
+    async def scenario() -> None:
+        engine, connection, session_factory = await _open_sqlite(monkeypatch)
+        try:
+            now = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+            monkeypatch.setattr(voice_service, "settings", _settings(tmp_path))
+            user = await _add_user(session_factory)
+            parsed = ParsedReminder(
+                local_dt=datetime(2026, 9, 8, 15, 0),
+                text="проверить сценарий",
+            )
+            clarification_request = parse_reminder_input(
+                "напомни после обеда проверить сценарий",
+                datetime(2026, 9, 8, 13, 0),
+            )
+            assert isinstance(clarification_request, ClarificationRequest)
+
+            await clarification_service.create_clarification(
+                user,
+                clarification_request,
+                now_utc=now,
+            )
+            first_voice = await voice_service.create_voice_draft(
+                user,
+                "напомни завтра в 9 проверить сценарий",
+                parsed,
+                source_message_id=7001,
+                now_utc=now,
+            )
+            assert first_voice.id
+            async with session_factory() as session:
+                assert await session.scalar(select(func.count()).select_from(ActionDraft)) == 0
+                assert (
+                    await session.scalar(select(func.count()).select_from(ReminderClarification))
+                    == 0
+                )
+
+            await clarification_service.create_clarification(
+                user,
+                clarification_request,
+                now_utc=now,
+            )
+            async with session_factory() as session:
                 assert (
                     await session.scalar(select(func.count()).select_from(VoiceReminderDraft)) == 0
                 )
-                clarification = await session.scalar(select(ReminderClarification))
-                assert clarification is not None
-            metrics = voice_service.get_voice_metrics()
-            assert metrics["parse_clarification"] == 1
-            assert metrics["stt_success"] == 1
+
+            # The action draft is created against a persisted future reminder.
+            async with session_factory() as session, session.begin():
+                reminder = await reminder_service.create_reminder_in_session(
+                    session,
+                    user,
+                    parsed.local_dt,
+                    parsed.text,
+                    now_utc=now,
+                )
+            action = await reminder_service.create_action_draft(
+                user,
+                reminder.id,
+                action_type="snooze",
+                expected_action_revision=reminder.action_revision,
+                current_step="awaiting_value",
+                now_utc=now,
+            )
+            assert action is not None
+            voice_after_action = await voice_service.create_voice_draft(
+                user,
+                "напомни завтра в 9 новый сценарий",
+                parsed,
+                source_message_id=7002,
+                now_utc=now,
+            )
+            assert voice_after_action.source_message_id == 7002
+            async with session_factory() as session:
+                assert await session.scalar(select(func.count()).select_from(ActionDraft)) == 0
+                assert (
+                    await session.scalar(select(func.count()).select_from(ReminderClarification))
+                    == 0
+                )
         finally:
             await connection.close()
             await engine.dispose()

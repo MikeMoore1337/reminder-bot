@@ -9,7 +9,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 
 from aiogram import Bot
 from aiogram.types import Voice
@@ -19,6 +19,7 @@ VOICE_PCM_SAMPLE_RATE = 16_000
 VOICE_PCM_BYTES_PER_SECOND = VOICE_PCM_SAMPLE_RATE * 2
 VOICE_WAV_HEADER_BYTES = 44
 VOICE_TEMP_DIR_PREFIX = "reminder-bot-voice-"
+VOICE_CONVERSION_READ_CHUNK_BYTES = 64 * 1024
 
 
 def _size_limit_message(max_bytes: int) -> str:
@@ -163,9 +164,62 @@ async def download_voice(
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
-        process.kill()
-    with suppress(TimeoutError, ProcessLookupError):
+        with suppress(ProcessLookupError, OSError):
+            process.kill()
+    with suppress(TimeoutError, ProcessLookupError, OSError):
         await asyncio.wait_for(process.wait(), timeout=2)
+
+
+async def _write_bounded_wav(
+    stdout: Any,
+    destination: Path,
+    max_bytes: int,
+) -> int:
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while True:
+                chunk = await stdout.read(VOICE_CONVERSION_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                next_total = total + len(chunk)
+                if next_total > max_bytes:
+                    raise VoiceMediaError(
+                        "duration",
+                        "Голосовое сообщение превышает допустимую длительность.",
+                    )
+                output.write(chunk)
+                total = next_total
+            output.flush()
+    except VoiceMediaError:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except OSError as exc:
+        raise VoiceMediaError("conversion", "Не удалось подготовить голосовое сообщение.") from exc
+    return total
+
+
+async def _cancel_task(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await task
+
+
+async def _abort_conversion(
+    process: asyncio.subprocess.Process,
+    output_task: asyncio.Task[Any],
+    wait_task: asyncio.Task[Any],
+) -> None:
+    await _terminate_process(process)
+    await _cancel_task(output_task)
+    await _cancel_task(wait_task)
+
+
+def _remove_partial_output(destination: Path) -> None:
+    with suppress(FileNotFoundError):
+        destination.unlink()
 
 
 async def convert_voice_to_wav(
@@ -192,13 +246,13 @@ async def convert_voice_to_wav(
         "-f",
         "wav",
         "-y",
-        str(destination),
+        "pipe:1",
     ]
     try:
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
     except (FileNotFoundError, PermissionError, OSError) as exc:
@@ -206,29 +260,39 @@ async def convert_voice_to_wav(
             "conversion_unavailable", "Локальная обработка голосовых сообщений сейчас недоступна."
         ) from exc
 
-    try:
-        await asyncio.wait_for(process.wait(), timeout=limits.conversion_timeout_seconds)
-    except TimeoutError as exc:
+    stdout = process.stdout
+    if stdout is None:
         await _terminate_process(process)
+        raise VoiceMediaError("conversion", "Не удалось подготовить голосовое сообщение.")
+
+    max_wav_size = VOICE_WAV_HEADER_BYTES + limits.max_duration_seconds * VOICE_PCM_BYTES_PER_SECOND
+    output_task = asyncio.create_task(_write_bounded_wav(stdout, destination, max_wav_size))
+    wait_task = asyncio.create_task(process.wait())
+    try:
+        return_code, size = await asyncio.wait_for(
+            asyncio.gather(wait_task, output_task),
+            timeout=limits.conversion_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        await _abort_conversion(process, output_task, wait_task)
+        _remove_partial_output(destination)
         raise VoiceMediaError(
             "conversion_timeout", "Обработка голосового сообщения заняла слишком много времени."
         ) from exc
+    except VoiceMediaError:
+        await _abort_conversion(process, output_task, wait_task)
+        _remove_partial_output(destination)
+        raise
     except asyncio.CancelledError:
-        await _terminate_process(process)
+        await _abort_conversion(process, output_task, wait_task)
+        _remove_partial_output(destination)
         raise
 
-    if process.returncode != 0:
+    if return_code != 0 or process.returncode != 0:
+        _remove_partial_output(destination)
         raise VoiceMediaError("conversion", "Не удалось подготовить голосовое сообщение.")
-
-    try:
-        size = destination.stat().st_size
-    except OSError as exc:
-        raise VoiceMediaError("conversion", "Не удалось подготовить голосовое сообщение.") from exc
-
-    max_wav_size = (
-        VOICE_WAV_HEADER_BYTES + limits.max_duration_seconds * VOICE_PCM_BYTES_PER_SECOND + 65_536
-    )
-    if size <= VOICE_WAV_HEADER_BYTES or size > max_wav_size:
+    if size <= VOICE_WAV_HEADER_BYTES:
+        _remove_partial_output(destination)
         raise VoiceMediaError("duration", "Голосовое сообщение превышает допустимую длительность.")
     return size
 

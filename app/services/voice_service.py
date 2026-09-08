@@ -15,9 +15,19 @@ from aiogram.types import Voice
 from sqlalchemy import delete, select
 
 from app.config import get_settings
-from app.db.models import RecurrenceType, Reminder, User, VoiceReminderDraft
+from app.db.models import (
+    ActionDraft,
+    RecurrenceType,
+    Reminder,
+    ReminderClarification,
+    User,
+    VoiceReminderDraft,
+)
 from app.db.session import SessionLocal
-from app.services.clarification_service import create_clarification
+from app.services.clarification_service import (
+    CLARIFICATION_ORIGIN_VOICE,
+    create_clarification,
+)
 from app.services.recurrence import decode_rule, encode_rule, legacy_rule
 from app.services.reminder_parser import (
     ClarificationRequest,
@@ -76,6 +86,7 @@ class VoiceMetrics:
     stt_success: int = 0
     parse_success: int = 0
     parse_clarification: int = 0
+    parse_correction: int = 0
     confirmation_success: int = 0
     confirmation_stale: int = 0
     cancellation_success: int = 0
@@ -116,6 +127,7 @@ class VoiceMetrics:
             "stt_success": self.stt_success,
             "parse_success": self.parse_success,
             "parse_clarification": self.parse_clarification,
+            "parse_correction": self.parse_correction,
             "confirmation_success": self.confirmation_success,
             "confirmation_stale": self.confirmation_stale,
             "cancellation_success": self.cancellation_success,
@@ -321,6 +333,18 @@ async def create_voice_draft(
         if owner is None:
             raise ValueError("Пользователь не найден")
 
+        await session.execute(
+            delete(ActionDraft).where(
+                ActionDraft.user_id == owner.id,
+                ActionDraft.chat_id == owner.chat_id,
+            )
+        )
+        await session.execute(
+            delete(ReminderClarification).where(
+                ReminderClarification.user_id == owner.id,
+                ReminderClarification.chat_id == owner.chat_id,
+            )
+        )
         existing = await session.scalar(
             select(VoiceReminderDraft)
             .where(
@@ -357,6 +381,99 @@ async def create_voice_draft(
         )
         session.add(draft)
         await session.flush()
+        return draft
+
+
+async def consume_voice_clarification_to_draft(
+    user: User,
+    clarification_id: int,
+    raw_text: str,
+    parsed: ParsedReminder,
+    *,
+    now_utc: datetime | None = None,
+) -> VoiceReminderDraft | None:
+    """Turn one exact voice clarification into a confirmation-gated draft."""
+
+    current_time = _as_utc(now_utc or utc_now())
+    async with SessionLocal() as session, session.begin():
+        owner = await session.scalar(
+            select(User).where(User.id == user.id, User.chat_id == user.chat_id).with_for_update()
+        )
+        if owner is None:
+            raise ValueError("Пользователь не найден")
+
+        clarification = await session.scalar(
+            select(ReminderClarification)
+            .where(
+                ReminderClarification.id == clarification_id,
+                ReminderClarification.user_id == owner.id,
+                ReminderClarification.chat_id == owner.chat_id,
+                ReminderClarification.origin == CLARIFICATION_ORIGIN_VOICE,
+                ReminderClarification.raw_text == raw_text,
+            )
+            .with_for_update()
+        )
+        if clarification is None:
+            return None
+        if _as_utc(clarification.expires_at) <= current_time:
+            await session.delete(clarification)
+            return None
+
+        (
+            initial_at_utc,
+            reminder_text,
+            recurrence_type,
+            recurrence_interval,
+            recurrence_day_of_month,
+            recurrence_rule,
+        ) = _prepare_draft_values(owner, parsed, now_utc=current_time)
+        transcript = (clarification.voice_transcript or clarification.raw_text).strip()
+        if not transcript:
+            raise ValueError("Расшифровка голосового сообщения отсутствует")
+
+        await session.execute(
+            delete(ActionDraft).where(
+                ActionDraft.user_id == owner.id,
+                ActionDraft.chat_id == owner.chat_id,
+            )
+        )
+        existing = await session.scalar(
+            select(VoiceReminderDraft)
+            .where(
+                VoiceReminderDraft.user_id == owner.id,
+                VoiceReminderDraft.chat_id == owner.chat_id,
+            )
+            .with_for_update()
+        )
+        if existing is not None:
+            await session.delete(existing)
+            await session.flush()
+
+        expiry = current_time + timedelta(
+            seconds=int(
+                getattr(settings, "voice_draft_ttl_seconds", VOICE_DRAFT_TTL.total_seconds())
+            )
+        )
+        draft = VoiceReminderDraft(
+            user_id=owner.id,
+            chat_id=owner.chat_id,
+            source_message_id=clarification.source_message_id,
+            transcript=transcript,
+            reminder_text=reminder_text,
+            remind_at_utc=initial_at_utc,
+            schedule_timezone=owner.timezone,
+            datetime_semantics=parsed.datetime_semantics,
+            recurrence_type=recurrence_type,
+            recurrence_interval=recurrence_interval,
+            recurrence_day_of_month=recurrence_day_of_month,
+            recurrence_rule=recurrence_rule,
+            action_revision=1,
+            expires_at=expiry,
+        )
+        session.add(draft)
+        await session.delete(clarification)
+        await session.flush()
+        voice_metrics.parse_correction += 1
         return draft
 
 
@@ -645,8 +762,14 @@ async def process_voice_message(
             now_local=from_utc_to_user(current_time, user.timezone),
         )
         if isinstance(parsed, ClarificationRequest):
-            await create_clarification(user, parsed, now_utc=current_time)
-            await cancel_voice_reminder_draft(user)
+            await create_clarification(
+                user,
+                parsed,
+                now_utc=current_time,
+                origin=CLARIFICATION_ORIGIN_VOICE,
+                voice_transcript=transcript,
+                source_message_id=source_message_id,
+            )
             voice_metrics.parse_clarification += 1
             return VoiceProcessResult(message=parsed.prompt)
         if not isinstance(parsed, ParsedReminder):

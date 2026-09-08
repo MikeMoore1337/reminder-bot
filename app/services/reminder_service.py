@@ -17,9 +17,11 @@ from app.db.models import (
     OccurrenceState,
     RecurrenceType,
     Reminder,
+    ReminderClarification,
     ReminderOccurrence,
     ReminderState,
     User,
+    VoiceReminderDraft,
 )
 from app.db.session import SessionLocal
 from app.services.recurrence import (
@@ -1710,6 +1712,18 @@ async def create_action_draft(
                     reason="stale",
                 )
                 return None
+        await session.execute(
+            delete(VoiceReminderDraft).where(
+                VoiceReminderDraft.user_id == owner.id,
+                VoiceReminderDraft.chat_id == owner.chat_id,
+            )
+        )
+        await session.execute(
+            delete(ReminderClarification).where(
+                ReminderClarification.user_id == owner.id,
+                ReminderClarification.chat_id == owner.chat_id,
+            )
+        )
         draft_payload = dict(payload or {})
         if expected_occurrence_id is not None:
             draft_payload.setdefault("occurrence_id", expected_occurrence_id)

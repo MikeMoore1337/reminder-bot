@@ -304,6 +304,9 @@ class ReminderClarification(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="text")
+    voice_transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     clarification_type: Mapped[str] = mapped_column(String(32), nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
