@@ -118,6 +118,16 @@ _ORDINAL_WORDS = {
     "пятая": 5,
 }
 _ORDINAL_RE = re.compile(r"(?P<ordinal>[1-5])(?:-?й|-?я|-?ая|-?ый|-?ую)?", re.IGNORECASE)
+_PERSISTENT_MODE_WORDS = r"(?:важн\w*|постоянн\w*|important|persistent)"
+_MODE_PREFIX_RE = re.compile(
+    rf"^(?P<prefix>/remind|напомни)\s+{_PERSISTENT_MODE_WORDS}"
+    rf"(?:\s+напоминание)?(?:\s*[:,-]\s*|\s+)(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_MODE_SUFFIX_RE = re.compile(
+    rf"\s+\[(?P<mode>{_PERSISTENT_MODE_WORDS})\]\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -129,6 +139,7 @@ class ParsedReminder:
     datetime_semantics: DatetimeSemantics = "wall_clock"
     recurrence_rule: dict[str, Any] | None = None
     recurrence_day_of_month: int | None = None
+    mode: str = "normal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,7 +526,22 @@ def _ambiguous_clarification(text: str) -> ClarificationRequest | None:
     )
 
 
-def parse_reminder_input(
+def _extract_mode_marker(raw_text: str) -> tuple[str, str]:
+    """Extract an explicit important/persistent marker from the command shell."""
+
+    text = raw_text.strip()
+    suffix = _MODE_SUFFIX_RE.search(text)
+    if suffix is not None:
+        return "persistent", text[: suffix.start()].rstrip()
+
+    prefix = _MODE_PREFIX_RE.match(text)
+    if prefix is not None:
+        command = prefix.group("prefix")
+        return "persistent", f"{command} {prefix.group('rest').strip()}"
+    return "normal", text
+
+
+def _parse_reminder_input(
     raw_text: str,
     now_local: datetime,
 ) -> ParsedReminder | ClarificationRequest | None:
@@ -665,6 +691,19 @@ def parse_reminder_input(
         )
 
     return _ambiguous_clarification(text)
+
+
+def parse_reminder_input(
+    raw_text: str,
+    now_local: datetime,
+) -> ParsedReminder | ClarificationRequest | None:
+    """Parse a reminder and preserve an explicit normal/persistent mode marker."""
+
+    mode, normalized_text = _extract_mode_marker(raw_text)
+    parsed = _parse_reminder_input(normalized_text, now_local)
+    if isinstance(parsed, ParsedReminder):
+        parsed.mode = mode
+    return parsed
 
 
 def _explicit_answer_datetime(value: str) -> datetime | None:

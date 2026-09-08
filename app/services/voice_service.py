@@ -228,7 +228,7 @@ def _prepare_draft_values(
     parsed: ParsedReminder,
     *,
     now_utc: datetime,
-) -> tuple[datetime, str, str, int, int | None, str | None]:
+) -> tuple[datetime, str, str, int, int | None, str | None, str]:
     reminder_text = parsed.text.strip()
     if not reminder_text or len(reminder_text) > MAX_REMINDER_TEXT_LENGTH:
         raise ValueError("Текст напоминания должен содержать от 1 до 4096 символов")
@@ -297,6 +297,7 @@ def _prepare_draft_values(
         recurrence_interval,
         recurrence_day_of_month,
         encode_rule(canonical_rule) if canonical_rule is not None else None,
+        parsed.mode,
     )
 
 
@@ -318,6 +319,7 @@ async def create_voice_draft(
         recurrence_interval,
         recurrence_day_of_month,
         recurrence_rule,
+        mode,
     ) = _prepare_draft_values(user, parsed, now_utc=current_time)
     expiry = current_time + timedelta(
         seconds=int(getattr(settings, "voice_draft_ttl_seconds", VOICE_DRAFT_TTL.total_seconds()))
@@ -376,6 +378,7 @@ async def create_voice_draft(
             recurrence_interval=recurrence_interval,
             recurrence_day_of_month=recurrence_day_of_month,
             recurrence_rule=recurrence_rule,
+            mode=mode,
             action_revision=1,
             expires_at=expiry,
         )
@@ -426,6 +429,7 @@ async def consume_voice_clarification_to_draft(
             recurrence_interval,
             recurrence_day_of_month,
             recurrence_rule,
+            mode,
         ) = _prepare_draft_values(owner, parsed, now_utc=current_time)
         transcript = (clarification.voice_transcript or clarification.raw_text).strip()
         if not transcript:
@@ -467,6 +471,7 @@ async def consume_voice_clarification_to_draft(
             recurrence_interval=recurrence_interval,
             recurrence_day_of_month=recurrence_day_of_month,
             recurrence_rule=recurrence_rule,
+            mode=mode,
             action_revision=1,
             expires_at=expiry,
         )
@@ -587,6 +592,7 @@ async def confirm_voice_draft(
             draft.recurrence_day_of_month,
             now_utc=current_time,
             schedule_timezone=draft.schedule_timezone,
+            mode=draft.mode,
         )
         await session.delete(draft)
         await session.flush()
@@ -687,6 +693,7 @@ def format_voice_draft_preview(draft: VoiceReminderDraft) -> str:
         f"<b>Текст:</b> {escape(draft.reminder_text)}\n"
         f"<b>Когда:</b> {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
         f"<b>Повтор:</b> {escape(recurrence)}\n"
+        f"<b>Режим:</b> {'важное (с повтором)' if draft.mode == 'persistent' else 'обычное'}\n"
         f"<b>Часовой пояс:</b> <code>{escape(draft.schedule_timezone)}</code>\n\n"
         "Нажми «Создать», чтобы сохранить напоминание, или «Отмена»."
     )

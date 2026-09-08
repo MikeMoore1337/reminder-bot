@@ -16,6 +16,12 @@
 | `cancelled` | The reminder/child delivery was cancelled and retained for audit. | None |
 | `failed` | Bounded delivery attempts ended in a terminal failure. | None |
 
+Persistent delivery cards also show `Выключить повторы`. For a one-off persistent
+reminder, `Snooze` schedules one ordinary delivery and ends the persistent cycle;
+`Done`, `Delete`, and the explicit disable action are terminal for the current
+cycle. A recurring series keeps its next canonical occurrence when the current
+occurrence is snoozed.
+
 For a recurring reminder, `Done` changes only the delivered occurrence. The
 canonical series remains scheduled. `Delete` cancels the canonical series and
 its active snooze children; deleting a snooze child cancels only that child and

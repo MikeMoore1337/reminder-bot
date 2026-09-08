@@ -7,6 +7,7 @@ from aiogram.types import Message
 from app.callbacks import CallbackOrigin
 from app.db.models import OccurrenceState, Reminder, User
 from app.keyboards.reply import get_main_keyboard, get_timezone_keyboard
+from app.services.persistent_policy import is_persistent_mode
 from app.services.reminder_service import (
     format_reminder_for_user,
     get_latest_occurrence,
@@ -31,6 +32,7 @@ START_TEXT = (
     "- напомни через 30 минут проверить духовку\n"
     "- напомни завтра в 9 созвон\n"
     "- напомни каждый день в 10 выпить витамины\n\n"
+    "🔔 Важное напоминание: «напомни важное завтра в 9 позвонить».\n\n"
     "Выбери действие кнопкой ниже или просто напиши напоминание текстом."
 )
 
@@ -52,6 +54,10 @@ HELP_TEXT = (
     "- напомни каждый год 15 марта в 9 годовщина\n"
     "- напомни завтра в 9 отчёт, через 3 дня после выполнения\n"
     "- повторяющиеся правила могут иметь границу «до 2026-12-31»\n\n"
+    "🔔 <b>Важный режим</b>\n"
+    "- добавь «важное» после «напомни» или [важное] в конце строки\n"
+    "- бот повторяет доставку с ограничением и учитывает тихие часы\n"
+    "- остановить повторы можно кнопкой «Выключить повторы», «Готово», «Отложить» или «Удалить»\n\n"
     "📎 <b>Контекст Telegram</b>\n"
     "Ответь на сообщение: «напомни об этом завтра в 9».\n"
     "Можно также переслать ссылку, фото, документ или сообщение без времени — бот сохранит\n"
@@ -74,6 +80,7 @@ CREATE_REMINDER_HINT = (
     "- напомни каждый день в 10 выпить витамины\n"
     "- напомни каждый понедельник и четверг в 9 отправить отчёт\n"
     "- напомни завтра в 9 отчёт, через 3 дня после выполнения\n"
+    "- напомни важное завтра в 9 позвонить\n"
     "- /remind 2026-03-31 18:30 Купить молоко"
 )
 
@@ -122,6 +129,9 @@ async def _send_actionable_reminders(
                     reminder.recurrence_type != "none"
                     and reminder.state in {"scheduled", "snoozed"}
                 )
+                or (
+                    is_persistent_mode(reminder.mode) and reminder.state in {"scheduled", "snoozed"}
+                )
             )
         ):
             occurrence = latest_occurrence
@@ -146,6 +156,7 @@ async def _send_actionable_reminders(
                 state=display_state,
                 recurrence_type=reminder.recurrence_type,
                 origin=CallbackOrigin.LIST,
+                mode=reminder.mode,
             ),
             parse_mode="HTML",
         )

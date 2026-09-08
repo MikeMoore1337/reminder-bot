@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.db.models import (
     ActionDraft,
     OccurrenceState,
@@ -19,6 +20,7 @@ from app.db.models import (
     Reminder,
     ReminderClarification,
     ReminderContext,
+    ReminderMode,
     ReminderOccurrence,
     ReminderState,
     User,
@@ -30,6 +32,16 @@ from app.services.message_context import (
     context_kind_label,
     normalize_snapshot,
     reminder_context_model_kwargs,
+)
+from app.services.persistent_policy import (
+    DEFAULT_PERSISTENT_INTERVAL_MINUTES,
+    DEFAULT_PERSISTENT_MAX_DELIVERIES,
+    DEFAULT_PERSISTENT_MAX_ESCALATIONS,
+    DEFAULT_PERSISTENT_QUIET_HOURS_END,
+    DEFAULT_PERSISTENT_QUIET_HOURS_START,
+    PersistentPolicy,
+    is_persistent_mode,
+    normalize_reminder_mode,
 )
 from app.services.recurrence import (
     advance_until_future,
@@ -58,6 +70,74 @@ ACTIVE_STATES = (
 )
 FLOW_TTL = timedelta(minutes=15)
 MAX_REMINDER_TEXT_LENGTH = 4096
+
+
+def _default_persistent_policy() -> PersistentPolicy:
+    settings = get_settings()
+    return PersistentPolicy(
+        interval_minutes=int(
+            getattr(
+                settings, "persistent_repeat_interval_minutes", DEFAULT_PERSISTENT_INTERVAL_MINUTES
+            )
+        ),
+        max_deliveries=int(
+            getattr(settings, "persistent_max_deliveries", DEFAULT_PERSISTENT_MAX_DELIVERIES)
+        ),
+        max_escalations=int(
+            getattr(settings, "persistent_max_escalations", DEFAULT_PERSISTENT_MAX_ESCALATIONS)
+        ),
+        quiet_hours_start=str(
+            getattr(settings, "persistent_quiet_hours_start", DEFAULT_PERSISTENT_QUIET_HOURS_START)
+        ),
+        quiet_hours_end=str(
+            getattr(settings, "persistent_quiet_hours_end", DEFAULT_PERSISTENT_QUIET_HOURS_END)
+        ),
+    )
+
+
+def persistent_policy_for_reminder(reminder: Reminder) -> PersistentPolicy:
+    persisted_max_escalations = cast(
+        int | None,
+        getattr(reminder, "persistent_max_escalations", None),
+    )
+    return PersistentPolicy(
+        interval_minutes=int(
+            getattr(reminder, "persistent_interval_minutes", None)
+            or DEFAULT_PERSISTENT_INTERVAL_MINUTES
+        ),
+        max_deliveries=int(
+            getattr(reminder, "persistent_max_deliveries", None)
+            or DEFAULT_PERSISTENT_MAX_DELIVERIES
+        ),
+        max_escalations=int(
+            persisted_max_escalations
+            if persisted_max_escalations is not None
+            else DEFAULT_PERSISTENT_MAX_ESCALATIONS
+        ),
+        quiet_hours_start=str(
+            getattr(reminder, "persistent_quiet_hours_start", None)
+            or DEFAULT_PERSISTENT_QUIET_HOURS_START
+        ),
+        quiet_hours_end=str(
+            getattr(reminder, "persistent_quiet_hours_end", None)
+            or DEFAULT_PERSISTENT_QUIET_HOURS_END
+        ),
+    )
+
+
+def _reset_persistent_cycle(reminder: Reminder) -> None:
+    reminder.persistent_delivery_count = 0
+    reminder.persistent_escalation_count = 0
+    reminder.persistent_exhausted_at = None
+    reminder.persistent_stop_reason = None
+
+
+def _stop_persistent_cycle(reminder: Reminder, *, now_utc: datetime, reason: str) -> None:
+    """Stop automatic repeats while retaining bounded counters for audit."""
+
+    reminder.mode = ReminderMode.NORMAL.value
+    reminder.persistent_disabled_at = now_utc
+    reminder.persistent_stop_reason = reason
 
 
 async def _copy_reminder_context(
@@ -115,6 +195,7 @@ class ActionMetrics:
     paused: int = 0
     resumed: int = 0
     cancelled: int = 0
+    persistent_disabled: int = 0
     edit_success: int = 0
     edit_failure: int = 0
     expired_draft: int = 0
@@ -134,6 +215,7 @@ class ActionMetrics:
             "paused": self.paused,
             "resumed": self.resumed,
             "cancelled": self.cancelled,
+            "persistent_disabled": self.persistent_disabled,
             "edit_success": self.edit_success,
             "edit_failure": self.edit_failure,
             "expired_draft": self.expired_draft,
@@ -415,7 +497,42 @@ async def create_reminder_in_session(
     now_utc: datetime | None = None,
     schedule_timezone: str | None = None,
     context: MessageContextSnapshot | None = None,
+    mode: str = ReminderMode.NORMAL.value,
+    persistent_interval_minutes: int | None = None,
+    persistent_max_deliveries: int | None = None,
+    persistent_max_escalations: int | None = None,
+    persistent_quiet_hours_start: str | None = None,
+    persistent_quiet_hours_end: str | None = None,
 ) -> Reminder:
+    normalized_mode = normalize_reminder_mode(mode)
+    default_policy = _default_persistent_policy()
+    persistent_policy = PersistentPolicy(
+        interval_minutes=(
+            default_policy.interval_minutes
+            if persistent_interval_minutes is None
+            else persistent_interval_minutes
+        ),
+        max_deliveries=(
+            default_policy.max_deliveries
+            if persistent_max_deliveries is None
+            else persistent_max_deliveries
+        ),
+        max_escalations=(
+            default_policy.max_escalations
+            if persistent_max_escalations is None
+            else persistent_max_escalations
+        ),
+        quiet_hours_start=(
+            default_policy.quiet_hours_start
+            if persistent_quiet_hours_start is None
+            else persistent_quiet_hours_start
+        ),
+        quiet_hours_end=(
+            default_policy.quiet_hours_end
+            if persistent_quiet_hours_end is None
+            else persistent_quiet_hours_end
+        ),
+    )
     timezone_name = schedule_timezone or user.timezone
     canonical_rule: dict[str, Any] | None = None
     if recurrence_rule is not None:
@@ -488,6 +605,15 @@ async def create_reminder_in_session(
         recurrence_day_of_month=recurrence_day_of_month,
         recurrence_rule=encode_rule(canonical_rule) if canonical_rule is not None else None,
         context_kind=normalize_snapshot(context).kind if context is not None else None,
+        mode=normalized_mode,
+        persistent_interval_minutes=persistent_policy.interval_minutes,
+        persistent_max_deliveries=persistent_policy.max_deliveries,
+        persistent_max_escalations=persistent_policy.max_escalations,
+        persistent_quiet_hours_start=persistent_policy.quiet_hours_start,
+        persistent_quiet_hours_end=persistent_policy.quiet_hours_end,
+        persistent_delivery_count=0,
+        persistent_escalation_count=0,
+        persistent_deferred_count=0,
     )
     session.add(reminder)
     await session.flush()
@@ -514,7 +640,7 @@ async def create_reminder_in_session(
                 f"reminder_id={reminder.id} user_id={user.id} "
                 f"remind_at_utc={reminder.remind_at_utc.isoformat()} "
                 f"recurrence_type={reminder.recurrence_type} "
-                f"recurrence_interval={reminder.recurrence_interval}"
+                f"recurrence_interval={reminder.recurrence_interval} mode={reminder.mode}"
             )
         },
     )
@@ -532,6 +658,12 @@ async def create_reminder(
     recurrence_day_of_month: int | None = None,
     *,
     context: MessageContextSnapshot | None = None,
+    mode: str = ReminderMode.NORMAL.value,
+    persistent_interval_minutes: int | None = None,
+    persistent_max_deliveries: int | None = None,
+    persistent_max_escalations: int | None = None,
+    persistent_quiet_hours_start: str | None = None,
+    persistent_quiet_hours_end: str | None = None,
 ) -> Reminder:
     async with SessionLocal() as session:
         async with session.begin():
@@ -546,6 +678,12 @@ async def create_reminder(
                 recurrence_rule,
                 recurrence_day_of_month,
                 context=context,
+                mode=mode,
+                persistent_interval_minutes=persistent_interval_minutes,
+                persistent_max_deliveries=persistent_max_deliveries,
+                persistent_max_escalations=persistent_max_escalations,
+                persistent_quiet_hours_start=persistent_quiet_hours_start,
+                persistent_quiet_hours_end=persistent_quiet_hours_end,
             )
         await session.refresh(reminder)
         return reminder
@@ -1136,6 +1274,109 @@ async def cancel_reminder(
         return True
 
 
+async def disable_persistent_reminder(
+    user: User,
+    reminder_id: int,
+    *,
+    expected_revision: int | None = None,
+    expected_occurrence_id: int | None = None,
+    expected_occurrence_at_utc: datetime | None = None,
+    expected_message_id: int | None = None,
+) -> bool:
+    """Turn off only the persistent loop under the same callback guards.
+
+    A delivered occurrence remains actionable after the loop is disabled, so
+    the user can still choose Done, Snooze, or Delete. A reminder that has not
+    been delivered yet becomes an ordinary scheduled reminder and is delivered
+    once at its canonical time.
+    """
+
+    async with SessionLocal() as session, session.begin():
+        reminder = await _load_owned_reminder(session, user, reminder_id)
+        if reminder is None:
+            _invalid_action("disable_persistent", reminder_id=reminder_id, reason="owner")
+            return False
+        if not is_persistent_mode(reminder.mode):
+            _invalid_action("disable_persistent", reminder_id=reminder_id, reason="state")
+            return False
+
+        occurrence: ReminderOccurrence | None = None
+        if expected_occurrence_id is not None:
+            if expected_revision is None:
+                _invalid_action("disable_persistent", reminder_id=reminder_id, reason="stale")
+                return False
+            occurrence = await _load_occurrence(session, reminder.id, expected_occurrence_id)
+            if occurrence is None or not _occurrence_is_current(
+                reminder,
+                occurrence,
+                expected_revision=expected_revision,
+                expected_message_id=expected_message_id,
+            ):
+                _invalid_action("disable_persistent", reminder_id=reminder_id, reason="stale")
+                return False
+            if expected_occurrence_at_utc is not None and _as_utc(
+                occurrence.occurrence_at_utc
+            ) != _as_utc(expected_occurrence_at_utc):
+                _invalid_action("disable_persistent", reminder_id=reminder_id, reason="stale")
+                return False
+        elif expected_message_id is not None:
+            occurrence = await _legacy_occurrence(session, reminder, expected_message_id)
+            if occurrence is None or not _occurrence_is_current(
+                reminder,
+                occurrence,
+                expected_revision=occurrence.action_revision,
+                expected_message_id=expected_message_id,
+            ):
+                _invalid_action("disable_persistent", reminder_id=reminder_id, reason="stale")
+                return False
+        elif expected_revision is not None and reminder.action_revision != expected_revision:
+            _invalid_action(
+                "disable_persistent",
+                reminder_id=reminder_id,
+                revision=expected_revision,
+                reason="stale",
+            )
+            return False
+
+        if (
+            reminder.state
+            in {
+                ReminderState.COMPLETED.value,
+                ReminderState.CANCELLED.value,
+                ReminderState.FAILED.value,
+            }
+            or reminder.status == "processing"
+        ):
+            _invalid_action("disable_persistent", reminder_id=reminder_id, reason="state")
+            return False
+
+        now_utc = utc_now()
+        reminder.mode = ReminderMode.NORMAL.value
+        reminder.persistent_disabled_at = now_utc
+        reminder.persistent_stop_reason = "user_disabled"
+        reminder.action_revision += 1
+
+        if occurrence is not None:
+            # Keep the delivered occurrence as the explicit user-facing target,
+            # but make the old callback revision stale and stop the worker
+            # schedule until the user chooses a terminal/actionable operation.
+            occurrence.action_revision = reminder.action_revision
+            reminder.state = ReminderState.DELIVERED.value
+            reminder.status = "sent"
+            reminder.delivery_at_utc = None
+            reminder.snoozed_until_utc = None
+        else:
+            reminder.state = ReminderState.SCHEDULED.value
+            reminder.status = "pending"
+            reminder.delivery_at_utc = reminder.remind_at_utc
+            reminder.snoozed_until_utc = None
+            _reset_delivery_retry(reminder)
+
+        _record_action("persistent_disabled", action="disable_persistent", reminder_id=reminder.id)
+        _record_action("action_success", action="disable_persistent", reminder_id=reminder.id)
+        return True
+
+
 async def snooze_reminder(
     user: User,
     reminder_id: int,
@@ -1225,6 +1466,7 @@ async def snooze_reminder(
             reminder.delivery_at_utc = snoozed_until_utc
             reminder.snoozed_until_utc = snoozed_until_utc
             reminder.action_revision += 1
+            _reset_persistent_cycle(reminder)
             _reset_delivery_retry(reminder)
             _clear_delivery_identity(reminder)
             _record_action("snoozed", action="snooze", reminder_id=reminder.id)
@@ -1256,6 +1498,7 @@ async def snooze_reminder(
                     recurrence_interval=1,
                     parent_reminder_id=reminder.id,
                     source_occurrence_at_utc=occurrence.occurrence_at_utc,
+                    mode=ReminderMode.NORMAL.value,
                 )
                 session.add(existing)
             else:
@@ -1266,9 +1509,41 @@ async def snooze_reminder(
                 existing.status = "pending"
                 existing.state = ReminderState.SNOOZED.value
                 existing.action_revision += 1
+                existing.mode = ReminderMode.NORMAL.value
                 _reset_delivery_retry(existing)
                 _clear_delivery_identity(existing)
             reminder.action_revision += 1
+            _reset_persistent_cycle(reminder)
+            if is_persistent_mode(reminder.mode):
+                recurrence_rule = get_recurrence_rule(reminder)
+                if is_completion_relative(recurrence_rule):
+                    reminder.state = ReminderState.DELIVERED.value
+                    reminder.status = "sent"
+                    reminder.delivery_at_utc = None
+                    reminder.snoozed_until_utc = None
+                else:
+                    next_canonical = calculate_next_occurrence(
+                        occurrence.occurrence_at_utc,
+                        reminder.recurrence_type,
+                        reminder.recurrence_interval,
+                        timezone_name=reminder.schedule_timezone,
+                        recurrence_day_of_month=reminder.recurrence_day_of_month,
+                        recurrence_rule=recurrence_rule,
+                    )
+                    if next_canonical is None:
+                        reminder.state = ReminderState.COMPLETED.value
+                        reminder.status = "sent"
+                        reminder.completed_at = now_utc
+                        reminder.delivery_at_utc = None
+                        reminder.snoozed_until_utc = None
+                    else:
+                        reminder.remind_at_utc = next_canonical
+                        reminder.delivery_at_utc = next_canonical
+                        reminder.state = ReminderState.SCHEDULED.value
+                        reminder.status = "pending"
+                        reminder.snoozed_until_utc = None
+                        reminder.completed_at = None
+                        _reset_delivery_retry(reminder)
             _clear_delivery_identity(reminder)
             await session.flush()
             await _copy_reminder_context(session, reminder, existing)
@@ -1282,6 +1557,10 @@ async def snooze_reminder(
         reminder.delivery_at_utc = snoozed_until_utc
         reminder.snoozed_until_utc = snoozed_until_utc
         reminder.action_revision += 1
+        if is_persistent_mode(reminder.mode):
+            _stop_persistent_cycle(reminder, now_utc=now_utc, reason="user_snoozed")
+        else:
+            _reset_persistent_cycle(reminder)
         _reset_delivery_retry(reminder)
         _clear_delivery_identity(reminder)
         _record_action("snoozed", action="snooze", reminder_id=reminder.id)
@@ -1354,6 +1633,7 @@ async def complete_reminder(
                     reminder.state = ReminderState.SCHEDULED.value
                     reminder.status = "pending"
                     reminder.completed_at = None
+                    _reset_persistent_cycle(reminder)
                     _reset_delivery_retry(reminder)
                     _clear_delivery_identity(reminder)
             else:
@@ -1383,6 +1663,7 @@ async def complete_reminder(
                     reminder.state = ReminderState.SCHEDULED.value
                     reminder.status = "pending"
                     reminder.completed_at = None
+                    _reset_persistent_cycle(reminder)
                     _reset_delivery_retry(reminder)
                     _clear_delivery_identity(reminder)
         else:
@@ -1430,6 +1711,7 @@ async def complete_reminder(
                         parent.state = ReminderState.SCHEDULED.value
                         parent.status = "pending"
                         parent.completed_at = None
+                        _reset_persistent_cycle(parent)
                         _reset_delivery_retry(parent)
                         _clear_delivery_identity(parent)
 
@@ -1557,6 +1839,7 @@ async def resume_reminder(user: User, reminder_id: int, *, expected_revision: in
         reminder.status = "pending"
         reminder.paused_at = None
         reminder.action_revision += 1
+        _reset_persistent_cycle(reminder)
         _reset_delivery_retry(reminder)
         _clear_delivery_identity(reminder)
         _record_action("resumed", action="resume", reminder_id=reminder.id)
@@ -1709,6 +1992,8 @@ async def edit_reminder(
             reminder.status = "pending"
         reminder.action_revision += 1
         reminder.completed_at = None
+        if schedule_changed:
+            _reset_persistent_cycle(reminder)
         _reset_delivery_retry(reminder)
         if schedule_changed:
             _clear_delivery_identity(reminder)
@@ -2107,6 +2392,18 @@ def format_state(state: str) -> str:
     }.get(state, state)
 
 
+def format_mode(reminder: Reminder) -> str:
+    if not is_persistent_mode(reminder.mode):
+        return "обычное"
+    policy = persistent_policy_for_reminder(reminder)
+    delivery_count = int(getattr(reminder, "persistent_delivery_count", None) or 0)
+    remaining = max(0, policy.max_effective_deliveries - delivery_count)
+    return (
+        "важное: повтор каждые "
+        f"{policy.interval_minutes} мин., осталось автоматических доставок: {remaining}"
+    )
+
+
 def format_reminder_for_user(
     reminder: Reminder,
     timezone_name: str,
@@ -2124,4 +2421,6 @@ def format_reminder_for_user(
     )
     if reminder.context_kind is not None:
         result += f"\nКонтекст: {escape(context_kind_label(reminder.context_kind))}"
+    if is_persistent_mode(reminder.mode):
+        result += f"\nРежим: {escape(format_mode(reminder))}"
     return result

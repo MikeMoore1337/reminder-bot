@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.services.persistent_policy import PersistentPolicy
+
 
 class Settings(BaseSettings):
     bot_token: str
@@ -28,6 +30,13 @@ class Settings(BaseSettings):
     worker_retry_base_seconds: int = Field(default=10, ge=1, le=3600)
     worker_retry_max_seconds: int = Field(default=300, ge=1, le=86400)
     worker_max_attempts: int = Field(default=3, ge=1, le=20)
+
+    persistent_repeat_interval_minutes: int = Field(default=60, ge=5, le=1440)
+    persistent_max_deliveries: int = Field(default=6, ge=1, le=100)
+    persistent_max_escalations: int = Field(default=5, ge=0, le=99)
+    persistent_quiet_hours_start: str = "22:00"
+    persistent_quiet_hours_end: str = "08:00"
+    persistent_user_cooldown_minutes: int = Field(default=1, ge=0, le=60)
 
     voice_stt_command: str = "whisper-cli"
     voice_stt_model_path: str | None = None
@@ -70,6 +79,13 @@ class Settings(BaseSettings):
                 "worker_retry_max_seconds must be greater than or equal to "
                 "worker_retry_base_seconds"
             )
+        PersistentPolicy(
+            interval_minutes=self.persistent_repeat_interval_minutes,
+            max_deliveries=self.persistent_max_deliveries,
+            max_escalations=self.persistent_max_escalations,
+            quiet_hours_start=self.persistent_quiet_hours_start,
+            quiet_hours_end=self.persistent_quiet_hours_end,
+        )
         return self
 
     @property

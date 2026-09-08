@@ -52,6 +52,7 @@ from app.services.reminder_service import (
     create_action_draft,
     create_reminder,
     delivery_at_utc,
+    disable_persistent_reminder,
     get_owned_occurrence_target,
     get_owned_reminder,
     parse_edit_schedule,
@@ -83,7 +84,8 @@ REMINDER_FORMAT_HINT = (
     "напомни завтра в 9 созвон\n"
     "напомни через 2 часа выключить духовку\n"
     "напомни каждые 10 минут проверить сервер\n"
-    "напомни каждый день в 9 выпить витамины"
+    "напомни каждый день в 9 выпить витамины\n"
+    "напомни важное завтра в 9 позвонить"
 )
 
 STALE_FEEDBACK = "Это действие уже неактуально"
@@ -126,11 +128,17 @@ def _saved_reminder_response(
     context: MessageContextSnapshot | None = None,
 ) -> str:
     local_dt = from_utc_to_user(reminder.remind_at_utc, user.timezone)
+    mode_line = (
+        f"Режим: {reminder_service.format_mode(reminder)}\n"
+        if reminder_service.is_persistent_mode(reminder.mode)
+        else ""
+    )
     response = (
         f"{prefix}\n"
         f"ID: {reminder.id}\n"
         f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
         f"Повтор: {reminder_service.format_recurrence(reminder)}\n"
+        f"{mode_line}"
         f"Текст: {escape(reminder.text)}\n"
         f"Часовой пояс: {escape(user.timezone)}"
     )
@@ -200,6 +208,7 @@ async def _create_and_answer(
             recurrence_rule=parsed.recurrence_rule,
             recurrence_day_of_month=parsed.recurrence_day_of_month,
             context=context,
+            mode=parsed.mode,
         )
     except ValueError as exc:
         await message.answer(str(exc))
@@ -406,14 +415,21 @@ async def cmd_cancel(message: Message) -> None:
 
 def _voice_saved_text(reminder: Reminder, timezone_name: str) -> str:
     local_dt = from_utc_to_user(reminder.remind_at_utc, timezone_name)
-    return (
+    mode_line = (
+        f"Режим: {reminder_service.format_mode(reminder)}\n"
+        if reminder_service.is_persistent_mode(reminder.mode)
+        else ""
+    )
+    response = (
         "Напоминание сохранено из голосового сообщения.\n"
         f"ID: {reminder.id}\n"
         f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
         f"Повтор: {reminder_service.format_recurrence(reminder)}\n"
+        f"{mode_line}"
         f"Текст: {escape(reminder.text)}\n"
         f"Часовой пояс: {escape(timezone_name)}"
     )
+    return response
 
 
 async def _send_voice_preview(
@@ -730,6 +746,23 @@ async def reminder_callback(callback: CallbackQuery) -> None:
             show_alert=False,
         )
         if resumed:
+            await _safe_remove_keyboard(callback_message)
+        return
+
+    if parsed.action == CallbackAction.DISABLE_PERSISTENT:
+        disabled = await disable_persistent_reminder(
+            user,
+            reminder_id,
+            expected_revision=parsed.revision,
+            expected_occurrence_id=occurrence_id,
+            expected_occurrence_at_utc=occurrence_at_utc,
+            expected_message_id=expected_message_id,
+        )
+        await callback.answer(
+            "Повторы выключены" if disabled else STALE_FEEDBACK,
+            show_alert=False,
+        )
+        if disabled:
             await _safe_remove_keyboard(callback_message)
         return
 

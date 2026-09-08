@@ -195,6 +195,7 @@ async def consume_clarification_and_create_reminder(
             parsed.recurrence_day_of_month,
             now_utc=current_time,
             context=context,
+            mode=parsed.mode,
         )
         await session.delete(clarification)
         await session.flush()

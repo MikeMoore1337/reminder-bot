@@ -35,3 +35,23 @@ def test_worker_lease_must_cover_send_timeout_and_safety_margin() -> None:
 def test_worker_retry_max_cannot_be_below_retry_base() -> None:
     with pytest.raises(ValidationError, match="worker_retry_max_seconds"):
         _settings(worker_retry_base_seconds=60, worker_retry_max_seconds=30)
+
+
+def test_persistent_policy_settings_are_bounded_and_validate_quiet_hours() -> None:
+    settings = _settings(
+        persistent_repeat_interval_minutes=15,
+        persistent_max_deliveries=8,
+        persistent_max_escalations=4,
+        persistent_quiet_hours_start="23:00",
+        persistent_quiet_hours_end="07:00",
+        persistent_user_cooldown_minutes=2,
+    )
+
+    assert settings.persistent_repeat_interval_minutes == 15
+    assert settings.persistent_max_deliveries == 8
+    assert settings.persistent_max_escalations == 4
+
+    with pytest.raises(ValidationError):
+        _settings(persistent_repeat_interval_minutes=4)
+    with pytest.raises(ValidationError):
+        _settings(persistent_quiet_hours_start="25:00")

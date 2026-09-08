@@ -33,6 +33,7 @@ class CallbackAction(StrEnum):
     EDIT = "edit"
     PAUSE = "pause"
     RESUME = "resume"
+    DISABLE_PERSISTENT = "disable"
     DELETE = "delete"
     CREATE = "create"
     CANCEL = "cancel"

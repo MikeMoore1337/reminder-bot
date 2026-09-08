@@ -11,6 +11,10 @@ unique `lease_token`. A claim records:
 - `attempt_count` - the number of claims for the current occurrence;
 - `retry_count` - the number of finalized delivery failures for the current occurrence;
 - `next_retry_at` - the earliest UTC time for the next transient retry.
+- Persistent reminders additionally persist their repeat policy, bounded delivery
+  and escalation counters, quiet-hour deferral count, and `delivery_at_utc`. A
+  user-row cooldown reservation prevents concurrent workers from sending a burst
+  of important reminders to one chat.
 
 `pending` rows are claimable when their effective delivery time and
 `next_retry_at` are due. `processing` rows with a missing or expired lease are
@@ -106,3 +110,5 @@ cancellation also leaves active rows lease-recoverable.
 The worker exposes in-process counters for claimed, recovered, retried, delivered,
 failed, and expired leases, plus a processing-age gauge. Structured logs include
 only reminder ID, attempt, state/error classification, counts, and processing age.
+Persistent policy deferrals and exhausted cycles are reported as bounded counters;
+reminder content and secret values are not logged.

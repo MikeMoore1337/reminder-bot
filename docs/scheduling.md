@@ -16,6 +16,10 @@
   rather than only the next UTC timestamp, is the source needed to reconstruct and
   edit a series after restart. Legacy scalar recurrence columns remain populated
   for compatibility.
+- `mode` is the canonical `normal`/`persistent` product mode. Persistent policy,
+  delivery/escalation counters, quiet-hour deferrals, and the next repeat are
+  persisted on the reminder; the user cooldown reservation is persisted on the
+  user row.
 
 The worker queries the effective delivery time, sends the current occurrence, then
 advances the canonical occurrence and resets the delivery override. Each delivery
@@ -23,6 +27,11 @@ also has a persisted `ReminderOccurrence` identity. A snooze of an already deliv
 recurring occurrence uses a linked one-off child delivery; it never rewrites the
 canonical series. This keeps a snooze local to one occurrence and makes the next
 occurrence reconstructable after restart from PostgreSQL alone.
+
+For `persistent` mode the worker keeps `remind_at_utc` fixed for the current
+occurrence and advances only `delivery_at_utc` until a user action or the bounded
+policy limit ends the cycle. See [persistent_reminders.md](persistent_reminders.md)
+for mode input, quiet hours, cooldown, and terminal-action semantics.
 
 ## Input semantics
 
