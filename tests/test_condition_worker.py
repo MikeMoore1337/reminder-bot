@@ -108,7 +108,11 @@ async def test_condition_worker_uses_short_cadence_after_bounded_drain(monkeypat
     wait_calls: list[float] = []
 
     class _Service:
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def poll_due_conditions(self, **kwargs):
+            self.calls += 1
             return ConditionCycleSummary(claimed=2, succeeded=2)
 
         async def cleanup_history(self, **kwargs):
@@ -119,9 +123,11 @@ async def test_condition_worker_uses_short_cadence_after_bounded_drain(monkeypat
         return True
 
     monkeypatch.setattr(condition_worker, "_wait_for_stop", _short_wait)
-    await condition_worker.condition_loop(service=_Service())
+    service = _Service()
+    await condition_worker.condition_loop(service=service)
 
     assert wait_calls == [1]
+    assert service.calls == 1
 
 
 @pytest.mark.asyncio

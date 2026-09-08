@@ -62,13 +62,9 @@ async def process_due_conditions(
         if cycle.disabled or cycle.claimed < batch_size:
             return summary
 
-    # Probe one more full batch so an exactly exhausted bounded drain does not
-    # switch to the short cadence unnecessarily. If it is also full, keep the
-    # next scan short while capping work per loop iteration.
-    cycle = await condition_service.poll_due_conditions(limit=batch_size, now_utc=now_utc)
-    _merge_cycle_summary(summary, cycle)
-    if cycle.disabled or cycle.claimed < batch_size:
-        return summary
+    # The configured cap is a hard limit for one loop iteration. A full final
+    # batch is sufficient evidence that more due work may remain, so switch to
+    # the short cadence without processing an additional batch.
     summary.drain_exhausted = True
     return summary
 
