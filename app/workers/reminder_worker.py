@@ -40,6 +40,7 @@ from app.services.reminder_service import (
     prepare_delivery_occurrence,
     set_last_message_id,
 )
+from app.services.voice_service import cleanup_expired_voice_drafts
 from app.utils.datetime_utils import utc_now
 
 logger = logging.getLogger(__name__)
@@ -867,6 +868,7 @@ async def _wait_for_stop(
 
 async def reminder_loop(bot: Bot, stop_event: asyncio.Event | None = None) -> None:
     logger.info("Reminder worker started")
+    last_voice_cleanup_at: datetime | None = None
     while stop_event is None or not stop_event.is_set():
         try:
             processed_count = await process_due_reminders(bot, stop_event=stop_event)
@@ -883,6 +885,19 @@ async def reminder_loop(bot: Bot, stop_event: asyncio.Event | None = None) -> No
                 "Unexpected error in reminder worker loop",
                 extra={"extra_data": f"error_type={type(exc).__name__[:80]}"},
             )
+
+        cleanup_interval = getattr(settings, "voice_draft_cleanup_interval_seconds", None)
+        current_time = utc_now()
+        if (
+            cleanup_interval is not None
+            and (stop_event is None or not stop_event.is_set())
+            and (
+                last_voice_cleanup_at is None
+                or current_time - last_voice_cleanup_at >= timedelta(seconds=cleanup_interval)
+            )
+        ):
+            await cleanup_expired_voice_drafts(now_utc=current_time)
+            last_voice_cleanup_at = current_time
         if await _wait_for_stop(stop_event, settings.worker_poll_interval_seconds):
             break
     logger.info("Reminder worker stopped")

@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from html import escape
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
@@ -15,7 +15,8 @@ from app.callbacks import (
     ReminderCallback,
     parse_callback,
 )
-from app.db.models import User
+from app.db.models import Reminder, User
+from app.keyboards.voice import voice_draft_kb
 from app.services import reminder_service
 from app.services.clarification_service import (
     cancel_clarification,
@@ -48,6 +49,15 @@ from app.services.reminder_service import (
     update_action_draft,
 )
 from app.services.timezone_service import get_or_create_user
+from app.services.voice_service import (
+    VoiceProcessingError,
+    bind_voice_preview_message,
+    cancel_voice_reminder_draft,
+    confirm_voice_draft,
+    discard_voice_draft,
+    format_voice_draft_preview,
+    process_voice_message,
+)
 from app.utils.datetime_utils import from_utc_to_user, now_in_timezone
 from app.workers.reminder_worker import snooze_presets_kb
 
@@ -266,9 +276,10 @@ async def cmd_cancel(message: Message) -> None:
     if len(parts) == 1:
         cancelled_actions = await cancel_active_action_drafts(user)
         cancelled_clarification = await cancel_clarification(user)
+        cancelled_voice = await cancel_voice_reminder_draft(user)
         await message.answer(
             "Текущий сценарий отменён"
-            if cancelled_actions or cancelled_clarification
+            if cancelled_actions or cancelled_clarification or cancelled_voice
             else "Нет активного сценария"
         )
         return
@@ -282,6 +293,106 @@ async def cmd_cancel(message: Message) -> None:
     await message.answer(
         f"Напоминание {reminder_id} удалено" if cancelled else "Напоминание с таким id не найдено"
     )
+
+
+def _voice_saved_text(reminder: Reminder, timezone_name: str) -> str:
+    local_dt = from_utc_to_user(reminder.remind_at_utc, timezone_name)
+    return (
+        "Напоминание сохранено из голосового сообщения.\n"
+        f"ID: {reminder.id}\n"
+        f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        f"Повтор: {reminder_service.format_recurrence(reminder)}\n"
+        f"Текст: {escape(reminder.text)}\n"
+        f"Часовой пояс: {escape(timezone_name)}"
+    )
+
+
+async def _handle_voice_callback(callback: CallbackQuery, parsed: ReminderCallback) -> None:
+    if parsed.origin != CallbackOrigin.VOICE or parsed.action not in {
+        CallbackAction.CREATE,
+        CallbackAction.CANCEL,
+    }:
+        await callback.answer(STALE_FEEDBACK, show_alert=False)
+        return
+    if not isinstance(callback.message, Message) or callback.from_user is None:
+        await callback.answer(STALE_FEEDBACK, show_alert=False)
+        return
+
+    callback_message = callback.message
+    user = await get_or_create_user(
+        telegram_user_id=callback.from_user.id,
+        chat_id=callback_message.chat.id,
+    )
+    if parsed.action == CallbackAction.CREATE:
+        try:
+            reminder = await confirm_voice_draft(
+                user,
+                parsed.target_id,
+                expected_revision=parsed.revision,
+                expected_message_id=callback_message.message_id,
+            )
+        except ValueError:
+            await callback.answer("Не удалось сохранить", show_alert=False)
+            await callback_message.answer(
+                "Не удалось сохранить это напоминание. Отправь новое голосовое сообщение "
+                "с будущей датой и временем."
+            )
+            return
+        if reminder is None:
+            await callback.answer(STALE_FEEDBACK, show_alert=False)
+            return
+        await callback.answer("Напоминание сохранено", show_alert=False)
+        await _safe_remove_keyboard(callback_message)
+        await callback_message.answer(_voice_saved_text(reminder, user.timezone))
+        return
+
+    cancelled = await discard_voice_draft(
+        user,
+        parsed.target_id,
+        expected_revision=parsed.revision,
+        expected_message_id=callback_message.message_id,
+    )
+    await callback.answer("Черновик отменён" if cancelled else STALE_FEEDBACK, show_alert=False)
+    if cancelled:
+        await _safe_remove_keyboard(callback_message)
+
+
+@router.message(F.voice)
+async def voice_reminder_handler(message: Message, bot: Bot) -> None:
+    ids = _message_ids(message)
+    if ids is None or message.voice is None:
+        await message.answer("Не удалось определить голосовое сообщение")
+        return
+
+    user = await get_or_create_user(telegram_user_id=ids[0], chat_id=ids[1])
+    try:
+        result = await process_voice_message(
+            bot,
+            user,
+            message.voice,
+            source_message_id=message.message_id,
+        )
+    except VoiceProcessingError as exc:
+        await message.answer(exc.public_message)
+        return
+
+    if result.draft is None:
+        if result.message:
+            await message.answer(result.message)
+        return
+
+    sent = await message.answer(
+        format_voice_draft_preview(result.draft),
+        reply_markup=voice_draft_kb(result.draft.id, result.draft.action_revision),
+    )
+    preview_message_id = getattr(sent, "message_id", None)
+    if isinstance(preview_message_id, int) and preview_message_id > 0:
+        await bind_voice_preview_message(
+            user,
+            result.draft.id,
+            revision=result.draft.action_revision,
+            message_id=preview_message_id,
+        )
 
 
 async def _resolve_callback_target(
@@ -322,6 +433,10 @@ async def reminder_callback(callback: CallbackQuery) -> None:
     if parsed is None:
         reminder_service.record_malformed_callback()
         await callback.answer(STALE_FEEDBACK, show_alert=False)
+        return
+
+    if parsed.target == CallbackTarget.VOICE_DRAFT:
+        await _handle_voice_callback(callback, parsed)
         return
 
     if not isinstance(callback.message, Message):

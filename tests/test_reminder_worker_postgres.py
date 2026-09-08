@@ -18,8 +18,9 @@ from app.db.models import (
     ReminderOccurrence,
     ReminderState,
     User,
+    VoiceReminderDraft,
 )
-from app.services import clarification_service, reminder_service
+from app.services import clarification_service, reminder_service, voice_service
 from app.services.reminder_parser import (
     ClarificationRequest,
     ParsedReminder,
@@ -63,6 +64,7 @@ async def _with_postgres(monkeypatch, scenario) -> None:
         monkeypatch.setattr(worker, "SessionLocal", session_factory)
         monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
         monkeypatch.setattr(clarification_service, "SessionLocal", session_factory)
+        monkeypatch.setattr(voice_service, "SessionLocal", session_factory)
         monkeypatch.setattr(worker, "worker_metrics", worker.WorkerMetrics())
         await scenario(session_factory)
     finally:
@@ -106,6 +108,19 @@ async def _insert_reminder(
         session.add(reminder)
         await session.commit()
         return reminder.id
+
+
+async def _insert_user(session_factory, *, telegram_user_id: int, chat_id: int) -> User:
+    async with session_factory() as session:
+        user = User(
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            timezone="Europe/Moscow",
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        return user
 
 
 async def _get_reminder(session_factory, reminder_id: int) -> Reminder:
@@ -799,5 +814,56 @@ def test_postgres_send_before_finalization_leaves_recoverable_at_least_once_boun
         assert bot.calls == 2
         saved = await _get_reminder(session_factory, reminder_id)
         assert saved.status == "sent"
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
+
+
+def test_postgres_concurrent_voice_confirmation_creates_one_reminder(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+        user = await _insert_user(session_factory, telegram_user_id=5902, chat_id=6903)
+        parsed = ParsedReminder(
+            local_dt=datetime(2026, 9, 8, 15, 0),
+            text="голосовой тест",
+        )
+        draft = await voice_service.create_voice_draft(
+            user,
+            "напомни сегодня в 15 голосовой тест",
+            parsed,
+            source_message_id=8801,
+            now_utc=now,
+        )
+        assert await voice_service.bind_voice_preview_message(
+            user,
+            draft.id,
+            revision=draft.action_revision,
+            message_id=9901,
+            now_utc=now,
+        )
+
+        results = await asyncio.gather(
+            voice_service.confirm_voice_draft(
+                user,
+                draft.id,
+                expected_revision=draft.action_revision,
+                expected_message_id=9901,
+                now_utc=now,
+            ),
+            voice_service.confirm_voice_draft(
+                user,
+                draft.id,
+                expected_revision=draft.action_revision,
+                expected_message_id=9901,
+                now_utc=now,
+            ),
+        )
+
+        assert sorted(result is not None for result in results) == [False, True]
+        async with session_factory() as session:
+            reminders = list((await session.scalars(select(Reminder))).all())
+            drafts = list((await session.scalars(select(VoiceReminderDraft))).all())
+        assert len(reminders) == 1
+        assert reminders[0].text == "голосовой тест"
+        assert drafts == []
 
     asyncio.run(_with_postgres(monkeypatch, scenario))

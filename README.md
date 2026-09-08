@@ -62,6 +62,14 @@
 - формат IANA (Europe/Moscow, Europe/Helsinki и т.д.)  
 - хранение времени в UTC  
 
+### 🎙 Голосовые напоминания
+- Telegram voice в OGG/Opus проходит bounded download и локальную конвертацию;
+- `whisper.cpp` запускается on-demand, только с multilingual/local model;
+- транскрипт проходит тот же детерминированный parser;
+- reminder сохраняется только после явного подтверждения «Создать»;
+- аудио удаляется после обработки, draft хранится в PostgreSQL ограниченное время;
+- настройка модели и CPU-only bootstrap описаны в [docs/voice_reminders.md](docs/voice_reminders.md).
+
 ---
 
 ## 🧠 UX / UI
