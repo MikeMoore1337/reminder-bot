@@ -281,6 +281,74 @@ def _snooze_history_retention() -> timedelta:
     )
 
 
+def _suggestion_expiry_cutoffs(now_utc: datetime) -> tuple[datetime, datetime]:
+    current_time = _as_utc(now_utc)
+    return (
+        current_time - SUGGESTION_RETENTION,
+        current_time - _snooze_history_retention(),
+    )
+
+
+def _is_suggestion_expired(
+    suggestion: ReminderSuggestion,
+    *,
+    now_utc: datetime,
+) -> bool:
+    created_cutoff, evidence_cutoff = _suggestion_expiry_cutoffs(now_utc)
+    created_at = getattr(suggestion, "created_at", None)
+    if created_at is not None and _as_utc(created_at) < created_cutoff:
+        return True
+    evidence_window_end = getattr(suggestion, "evidence_window_end_utc", None)
+    return evidence_window_end is not None and _as_utc(evidence_window_end) < evidence_cutoff
+
+
+def _mark_suggestion_expired(
+    suggestion: ReminderSuggestion,
+    *,
+    now_utc: datetime,
+    resolution: str = "evidence_expired",
+) -> None:
+    suggestion.status = SuggestionState.EXPIRED.value
+    suggestion.resolution = resolution[:32]
+    suggestion.resolved_at = _as_utc(now_utc)
+    suggestion.revision += 1
+
+
+async def _expire_stale_pending_suggestions(
+    session: AsyncSession,
+    *,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+    now_utc: datetime,
+) -> int:
+    created_cutoff, evidence_cutoff = _suggestion_expiry_cutoffs(now_utc)
+    filters = [
+        ReminderSuggestion.status == SuggestionState.PENDING.value,
+        or_(
+            ReminderSuggestion.created_at < created_cutoff,
+            ReminderSuggestion.evidence_window_end_utc < evidence_cutoff,
+        ),
+    ]
+    if user_id is not None:
+        filters.append(ReminderSuggestion.user_id == user_id)
+    if chat_id is not None:
+        filters.append(ReminderSuggestion.chat_id == chat_id)
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            update(ReminderSuggestion)
+            .where(*filters)
+            .values(
+                status=SuggestionState.EXPIRED.value,
+                resolution="evidence_expired",
+                resolved_at=_as_utc(now_utc),
+                revision=ReminderSuggestion.revision + 1,
+            )
+        ),
+    )
+    return int(result.rowcount or 0)
+
+
 def _reminder_rule(reminder: Reminder) -> dict[str, Any]:
     if reminder.recurrence_rule:
         decoded = decode_rule(reminder.recurrence_rule)
@@ -484,7 +552,9 @@ async def evaluate_snooze_suggestion_in_session(
         .with_for_update()
     )
     if pending is not None:
-        return pending
+        if not _is_suggestion_expired(pending, now_utc=current_time):
+            return pending
+        _mark_suggestion_expired(pending, now_utc=current_time)
 
     local_date = from_utc_to_user(current_time, reminder.schedule_timezone).date()
     dedupe_key = f"time:{reminder.id}:{proposed_minutes:04d}:{local_date.isoformat()}"
@@ -559,7 +629,14 @@ async def get_pending_suggestions(
 ) -> list[ReminderSuggestion]:
     if limit < 1:
         return []
-    async with SessionLocal() as session:
+    current_time = _as_utc(utc_now())
+    async with SessionLocal() as session, session.begin():
+        await _expire_stale_pending_suggestions(
+            session,
+            user_id=user.id,
+            chat_id=user.chat_id,
+            now_utc=current_time,
+        )
         filters = [
             ReminderSuggestion.user_id == user.id,
             ReminderSuggestion.chat_id == user.chat_id,
@@ -721,6 +798,9 @@ async def resolve_suggestion(
                 changed=False,
                 already_resolved=True,
             )
+        if _is_suggestion_expired(suggestion, now_utc=current_time):
+            _mark_suggestion_expired(suggestion, now_utc=current_time)
+            return _resolution(suggestion, status="expired", changed=False)
         if suggestion.revision != expected_revision:
             return _resolution(suggestion, status="stale", changed=False)
 
@@ -938,21 +1018,48 @@ def render_digest(
         (reminder for reminder in reminders if not is_persistent_mode(reminder.mode)),
         key=_digest_sort_key,
     )
-    for index, reminder in enumerate((*persistent_reminders, *ordinary), start=1):
+
+    def render_line(index: int, reminder: Reminder, *, compact: bool = False) -> str:
+        if compact:
+            # The identifier is a deterministic, compact representation of an
+            # important reminder. It lets every persistent item survive even
+            # when its full text cannot fit in Telegram's single-message cap.
+            return f"{index}.🔔#{reminder.id}\n"
         scheduled = reminder.delivery_at_utc or reminder.remind_at_utc
         local_scheduled = from_utc_to_user(_as_utc(scheduled), timezone_name)
         important = "🔔 ВАЖНОЕ · " if is_persistent_mode(reminder.mode) else ""
-        line = (
+        return (
             f"{index}. {important}<b>#{reminder.id}</b> "
             f"{local_scheduled.strftime('%d.%m %H:%M')} · "
             f"{_state_label(reminder.state)}\n"
             f"   {_escape_bounded(reminder.text, 360)}\n"
         )
-        current_length = len("".join(result))
+
+    persistent_full_lines = [
+        render_line(index, reminder) for index, reminder in enumerate(persistent_reminders, start=1)
+    ]
+    persistent_compact_lines = [
+        render_line(index, reminder, compact=True)
+        for index, reminder in enumerate(persistent_reminders, start=1)
+    ]
+    persistent_lines = list(persistent_compact_lines)
+    current_length = len("".join(result)) + sum(map(len, persistent_lines))
+    marker_reservation = len(DIGEST_TRUNCATION_MARKER) if ordinary else 0
+    for index, full_line in enumerate(persistent_full_lines):
+        extra = len(full_line) - len(persistent_lines[index])
+        if current_length + extra + marker_reservation <= DIGEST_MESSAGE_LIMIT:
+            persistent_lines[index] = full_line
+            current_length += extra
+    result.append("".join(persistent_lines))
+
+    for index, reminder in enumerate(ordinary, start=len(persistent_reminders) + 1):
+        line = render_line(index, reminder)
         if current_length + len(line) + len(DIGEST_TRUNCATION_MARKER) > DIGEST_MESSAGE_LIMIT:
-            result.append(DIGEST_TRUNCATION_MARKER)
+            if current_length + len(DIGEST_TRUNCATION_MARKER) <= DIGEST_MESSAGE_LIMIT:
+                result.append(DIGEST_TRUNCATION_MARKER)
             break
         result.append(line)
+        current_length += len(line)
     return "".join(result)
 
 
@@ -1009,6 +1116,18 @@ async def _create_digest_delivery(
     except IntegrityError:
         return False
     return True
+
+
+def _digest_lease_seconds() -> int:
+    configured_lease_seconds = _setting_int(
+        "digest_lease_duration_seconds",
+        _setting_int("worker_lease_duration_seconds", DEFAULT_DIGEST_LEASE_SECONDS, minimum=1),
+        minimum=1,
+    )
+    lease_floor = _setting_int("worker_send_timeout_seconds", 30, minimum=1) + _setting_int(
+        "worker_lease_safety_margin_seconds", 10, minimum=1
+    )
+    return max(configured_lease_seconds, lease_floor)
 
 
 def _digest_slot_for_now(
@@ -1192,15 +1311,7 @@ async def claim_due_digests(
         candidates = list(result.scalars())
         claimed: list[ReminderDigestDelivery] = []
         max_attempts = _setting_int("worker_max_attempts", DEFAULT_MAX_ATTEMPTS, minimum=1)
-        configured_lease_seconds = _setting_int(
-            "digest_lease_duration_seconds",
-            _setting_int("worker_lease_duration_seconds", DEFAULT_DIGEST_LEASE_SECONDS, minimum=1),
-            minimum=1,
-        )
-        lease_floor = _setting_int("worker_send_timeout_seconds", 30, minimum=1) + _setting_int(
-            "worker_lease_safety_margin_seconds", 10, minimum=1
-        )
-        lease_seconds = max(configured_lease_seconds, lease_floor)
+        lease_seconds = _digest_lease_seconds()
         for delivery in candidates:
             digest_owner = await session.scalar(select(User).where(User.id == delivery.user_id))
             if digest_owner is None:
@@ -1250,6 +1361,35 @@ async def claim_due_digests(
             claimed.append(delivery)
         adaptive_metrics.digests_claimed += len(claimed)
         return claimed
+
+
+async def renew_digest_delivery_lease(
+    delivery_id: int,
+    lease_token: str,
+    *,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Renew a still-owned digest lease immediately before Telegram send."""
+
+    if not lease_token:
+        return False
+    current_time = _as_utc(now_utc or utc_now())
+    renewed_until = current_time + timedelta(seconds=_digest_lease_seconds())
+    async with SessionLocal() as session, session.begin():
+        result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(ReminderDigestDelivery)
+                .where(
+                    ReminderDigestDelivery.id == delivery_id,
+                    ReminderDigestDelivery.state == DigestDeliveryState.PROCESSING.value,
+                    ReminderDigestDelivery.lease_token == lease_token,
+                    ReminderDigestDelivery.lease_until > current_time,
+                )
+                .values(lease_until=renewed_until)
+            ),
+        )
+        return bool(result.rowcount)
 
 
 async def _load_digest_owner(delivery: ReminderDigestDelivery) -> User | None:
@@ -1432,7 +1572,12 @@ async def finalize_digest_failure(
         base_seconds = _setting_int("worker_retry_base_seconds", 10, minimum=1)
         max_seconds = _setting_int("worker_retry_max_seconds", 300, minimum=1)
         exponential_delay = base_seconds * (2 ** min(delivery.retry_count - 1, 30))
-        delay = min(max_seconds, max(exponential_delay, retry_after_seconds or 0))
+        if retry_after_seconds is not None:
+            # Telegram's explicit rate-limit delay is provider guidance, not
+            # generic exponential backoff. Never shorten it to the generic cap.
+            delay = max(exponential_delay, retry_after_seconds)
+        else:
+            delay = min(max_seconds, exponential_delay)
         delivery.state = DigestDeliveryState.PENDING.value
         delivery.next_retry_at = current_time + timedelta(seconds=max(1, delay))
         return True
@@ -1498,6 +1643,7 @@ async def process_due_digests(
             if not owner.digests_enabled:
                 await suppress_digest_delivery(delivery.id, lease_token)
                 continue
+
             text = await build_digest_text(
                 owner,
                 delivery.period,
@@ -1517,6 +1663,11 @@ async def process_due_digests(
                 continue
             if not owner.digests_enabled:
                 await suppress_digest_delivery(delivery.id, lease_token)
+                continue
+            if not await renew_digest_delivery_lease(delivery.id, lease_token):
+                # A different worker may have reclaimed the row, or the
+                # original lease may have expired while the digest was built.
+                # Do not cross that ownership boundary with an external send.
                 continue
             sent = await asyncio.wait_for(
                 bot.send_message(chat_id=delivery.chat_id, text=text, parse_mode="HTML"),
@@ -1553,6 +1704,10 @@ async def cleanup_adaptive_data(*, now_utc: datetime | None = None) -> dict[str,
     suggestion_cutoff = current_time - SUGGESTION_RETENTION
     digest_cutoff = (current_time - DIGEST_DELIVERY_RETENTION).date()
     async with SessionLocal() as session, session.begin():
+        await _expire_stale_pending_suggestions(
+            session,
+            now_utc=current_time,
+        )
         event_result = cast(
             CursorResult[Any],
             await session.execute(

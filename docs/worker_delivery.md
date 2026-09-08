@@ -38,8 +38,9 @@ The following bounded settings are configurable through environment variables:
 - `WORKER_MAX_ATTEMPTS` (1-20, default 3).
 
 Network errors, timeouts, server errors, `429` responses, and unknown provider
-errors are transient. Retry delay is exponential and capped by
-`WORKER_RETRY_MAX_SECONDS`; Telegram `retry_after` is respected up to that cap.
+errors are transient. Generic exponential retry delay is capped by
+`WORKER_RETRY_MAX_SECONDS`; an explicit Telegram `retry_after` delay is
+honored even when it is longer than that generic cap.
 Bad requests, blocked/deactivated chats, unauthorized/not-found delivery, and
 other explicitly terminal Telegram failures become `failed` without resurrection.
 When the claim count reaches `WORKER_MAX_ATTEMPTS`, the occurrence becomes

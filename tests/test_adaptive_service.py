@@ -323,6 +323,69 @@ def test_suggestion_accept_fails_closed_while_worker_owns_reminder(monkeypatch) 
     asyncio.run(scenario())
 
 
+def test_stale_suggestion_is_not_rendered_and_callback_is_idempotently_rejected(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 10, 6, 0, tzinfo=UTC)
+        monkeypatch.setattr(adaptive_service, "utc_now", lambda: now)
+        try:
+            user = await _add_user(session_factory)
+            reminder = await _add_recurring_reminder(session_factory, user)
+            async with session_factory() as session:
+                suggestion = ReminderSuggestion(
+                    user_id=user.id,
+                    chat_id=user.chat_id,
+                    reminder_id=reminder.id,
+                    kind=adaptive_service.SUGGESTION_KIND_SCHEDULE_TIME,
+                    status="pending",
+                    revision=1,
+                    expected_reminder_revision=reminder.action_revision,
+                    current_local_minutes=8 * 60,
+                    proposed_local_minutes=9 * 60,
+                    evidence_count=3,
+                    evidence_window_start_utc=now - timedelta(days=32),
+                    evidence_window_end_utc=now - timedelta(days=31),
+                    dedupe_key="test:stale:suggestion",
+                    created_at=now - timedelta(days=31),
+                )
+                session.add(suggestion)
+                await session.commit()
+                await session.refresh(suggestion)
+                suggestion_id = suggestion.id
+                original_revision = suggestion.revision
+
+            assert await adaptive_service.get_pending_suggestions(user) == []
+            async with session_factory() as session:
+                saved = await session.get(ReminderSuggestion, suggestion_id)
+                assert saved is not None
+                assert saved.status == "expired"
+                assert saved.resolution == "evidence_expired"
+                expired_revision = saved.revision
+
+            stale_callback = await resolve_suggestion(
+                user,
+                suggestion_id,
+                expected_revision=original_revision,
+                action="accept",
+                now_utc=now,
+            )
+            assert stale_callback.status == "expired"
+            assert stale_callback.already_resolved
+            assert not stale_callback.changed
+
+            async with session_factory() as session:
+                saved = await session.get(ReminderSuggestion, suggestion_id)
+                assert saved is not None
+                assert saved.revision == expired_revision
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_opt_out_revokes_pending_suggestions_and_digest_slots(monkeypatch) -> None:
     async def scenario() -> None:
         engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
@@ -576,6 +639,31 @@ def test_render_digest_prioritizes_persistent_before_ordinary_budget() -> None:
     assert len(digest) <= adaptive_service.DIGEST_MESSAGE_LIMIT
 
 
+def test_render_digest_keeps_every_long_persistent_reminder_represented() -> None:
+    scheduled = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+    persistent = [
+        Reminder(
+            id=index,
+            text=f"важное {index} " + ("x" * 360),
+            remind_at_utc=scheduled + timedelta(minutes=index),
+            delivery_at_utc=scheduled + timedelta(minutes=index),
+            state=ReminderState.SCHEDULED.value,
+            mode="persistent",
+        )
+        for index in range(1, 13)
+    ]
+
+    digest = adaptive_service.render_digest(
+        "morning",
+        persistent,
+        timezone_name="Europe/Moscow",
+        local_date=date(2026, 9, 10),
+    )
+
+    assert len(digest) <= adaptive_service.DIGEST_MESSAGE_LIMIT
+    assert all(f"#{reminder.id}" in digest for reminder in persistent)
+
+
 def test_process_due_digest_sends_and_finalizes_with_a_bot(monkeypatch) -> None:
     async def scenario() -> None:
         engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
@@ -652,6 +740,131 @@ def test_process_due_digest_sends_and_finalizes_with_a_bot(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_process_due_digests_renews_each_item_before_batch_send(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        base = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+        clock = [base]
+        monkeypatch.setattr(adaptive_service, "utc_now", lambda: clock[0])
+        monkeypatch.setattr(
+            adaptive_service,
+            "settings",
+            SimpleNamespace(
+                digest_max_items=20,
+                digest_max_delay_minutes=360,
+                digest_morning_time="09:00",
+                digest_evening_time="20:00",
+                digest_quiet_hours_start="22:00",
+                digest_quiet_hours_end="08:00",
+                digest_lease_duration_seconds=5,
+                worker_lease_duration_seconds=5,
+                worker_send_timeout_seconds=1,
+                worker_lease_safety_margin_seconds=1,
+                worker_max_attempts=3,
+                worker_batch_size=10,
+                worker_retry_base_seconds=1,
+                worker_retry_max_seconds=10,
+            ),
+        )
+
+        try:
+            user = await _add_user(session_factory, suggestions=False, digests=True)
+            async with session_factory() as session:
+                session.add_all(
+                    [
+                        ReminderDigestDelivery(
+                            user_id=user.id,
+                            chat_id=user.chat_id,
+                            period="morning",
+                            local_date=date(2026, 9, 10),
+                            scheduled_at_utc=base,
+                            state=DigestDeliveryState.PENDING.value,
+                        ),
+                        ReminderDigestDelivery(
+                            user_id=user.id,
+                            chat_id=user.chat_id,
+                            period="evening",
+                            local_date=date(2026, 9, 10),
+                            scheduled_at_utc=base,
+                            state=DigestDeliveryState.PENDING.value,
+                        ),
+                    ]
+                )
+                await session.commit()
+
+            original_load = adaptive_service._load_digest_owner
+            load_count = 0
+
+            async def load_owner(delivery):
+                nonlocal load_count
+                load_count += 1
+                if load_count == 3:
+                    # The second claimed row is close to lease expiry by the
+                    # time the first row has completed.
+                    clock[0] = base + timedelta(seconds=4)
+                return await original_load(delivery)
+
+            monkeypatch.setattr(adaptive_service, "_load_digest_owner", load_owner)
+            original_renew = adaptive_service.renew_digest_delivery_lease
+            renew_times: list[datetime] = []
+            renew_count = 0
+
+            async def renew(delivery_id, lease_token, *, now_utc=None):
+                nonlocal renew_count
+                renew_count += 1
+                renew_times.append(clock[0])
+                result = await original_renew(
+                    delivery_id,
+                    lease_token,
+                    now_utc=clock[0],
+                )
+                if renew_count == 2:
+                    # Simulate the provider call consuming the remaining
+                    # original lease before finalization.
+                    clock[0] = base + timedelta(seconds=6)
+                return result
+
+            monkeypatch.setattr(adaptive_service, "renew_digest_delivery_lease", renew)
+
+            class FakeBot:
+                def __init__(self) -> None:
+                    self.messages: list[int] = []
+
+                async def send_message(self, *, chat_id, text, parse_mode=None):
+                    del text, parse_mode
+                    self.messages.append(chat_id)
+                    return SimpleNamespace(message_id=7100 + len(self.messages))
+
+            bot = FakeBot()
+            assert await adaptive_service.process_due_digests(bot, limit=2) == 2
+            assert len(bot.messages) == 2
+            assert renew_count == 2
+            assert renew_times[1] == base + timedelta(seconds=4)
+
+            async with session_factory() as session:
+                deliveries = list(
+                    (
+                        await session.scalars(
+                            select(ReminderDigestDelivery).order_by(ReminderDigestDelivery.id)
+                        )
+                    ).all()
+                )
+                sent_deliveries = [
+                    delivery for delivery in deliveries if delivery.local_date == date(2026, 9, 10)
+                ]
+                assert len(sent_deliveries) == 2
+                assert all(
+                    delivery.state == DigestDeliveryState.SENT.value for delivery in sent_deliveries
+                )
+                assert all(delivery.attempt_count == 1 for delivery in sent_deliveries)
+                assert all(delivery.lease_token is None for delivery in sent_deliveries)
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_process_due_digest_respects_telegram_retry_after(monkeypatch) -> None:
     async def scenario() -> None:
         engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
@@ -677,7 +890,7 @@ def test_process_due_digest_respects_telegram_retry_after(monkeypatch) -> None:
 
         retry_after_type = type("TelegramRetryAfter", (Exception,), {})
         retry_after = retry_after_type()
-        retry_after.retry_after = 42
+        retry_after.retry_after = 420
 
         class RetryAfterBot:
             async def send_message(
@@ -703,7 +916,7 @@ def test_process_due_digest_respects_telegram_retry_after(monkeypatch) -> None:
                 assert delivery.next_retry_at is not None
                 assert (
                     adaptive_service._as_utc(delivery.next_retry_at) - now
-                ).total_seconds() == 42
+                ).total_seconds() == 420
                 assert delivery.chat_id == user.chat_id
         finally:
             await connection.close()
