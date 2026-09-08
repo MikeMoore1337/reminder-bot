@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select, update
@@ -31,6 +32,7 @@ from app.services.condition_service import (
     ConditionPollOutcome,
     ConditionService,
 )
+from app.workers import condition_worker
 
 NOW = datetime(2026, 9, 8, 14, 0, tzinfo=UTC)
 
@@ -274,6 +276,47 @@ async def test_provider_failure_backoff_isolated_from_other_subscription() -> No
         assert subscriptions[0].next_retry_at_utc is not None
         assert subscriptions[1].last_state == "healthy"
         assert subscriptions[1].failure_count == 0
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_condition_worker_drains_more_due_rows_than_one_batch(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite()
+    try:
+        settings_obj = _settings(condition_poll_batch_size=2)
+        provider = _SequenceProvider("one", "two", "three", "four", "five")
+        service = _service(session_factory, provider, settings_obj=settings_obj)
+        for index in range(5):
+            await service.create_subscription(
+                user_id=1,
+                chat_id=2001,
+                provider_type="fake",
+                target=f"fake://condition/backlog/{index}",
+                next_poll_at_utc=NOW,
+            )
+        monkeypatch.setattr(
+            condition_worker,
+            "settings",
+            SimpleNamespace(
+                condition_worker_enabled=True,
+                condition_poll_batch_size=2,
+                condition_drain_max_batches=4,
+                condition_drain_interval_seconds=1,
+                condition_poll_interval_seconds=300,
+            ),
+        )
+
+        summary = await condition_worker.process_due_conditions(
+            service=service,
+            now_utc=NOW,
+        )
+
+        assert summary.claimed == 5
+        assert summary.succeeded == 5
+        assert provider.calls == 5
+        assert summary.drain_exhausted is False
     finally:
         await connection.close()
         await engine.dispose()

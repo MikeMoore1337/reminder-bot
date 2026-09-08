@@ -12,6 +12,20 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+def _merge_cycle_summary(
+    destination: ConditionCycleSummary,
+    source: ConditionCycleSummary,
+) -> None:
+    destination.claimed += source.claimed
+    destination.succeeded += source.succeeded
+    destination.failed += source.failed
+    destination.stale += source.stale
+    destination.transitions += source.transitions
+    destination.deduplicated += source.deduplicated
+    destination.disabled = destination.disabled or source.disabled
+    destination.drain_exhausted = destination.drain_exhausted or source.drain_exhausted
+
+
 async def _wait_for_stop(stop_event: asyncio.Event | None, timeout_seconds: float) -> bool:
     if stop_event is None:
         await asyncio.sleep(timeout_seconds)
@@ -33,7 +47,30 @@ async def process_due_conditions(
     if not settings.condition_worker_enabled:
         return ConditionCycleSummary(disabled=True)
     condition_service = service or ConditionService()
-    return await condition_service.poll_due_conditions(now_utc=now_utc)
+    batch_size = max(1, min(int(getattr(settings, "condition_poll_batch_size", 10)), 100))
+    max_batches = max(
+        1,
+        min(int(getattr(settings, "condition_drain_max_batches", 10)), 100),
+    )
+    summary = ConditionCycleSummary()
+    for _ in range(max_batches):
+        cycle = await condition_service.poll_due_conditions(
+            limit=batch_size,
+            now_utc=now_utc,
+        )
+        _merge_cycle_summary(summary, cycle)
+        if cycle.disabled or cycle.claimed < batch_size:
+            return summary
+
+    # Probe one more full batch so an exactly exhausted bounded drain does not
+    # switch to the short cadence unnecessarily. If it is also full, keep the
+    # next scan short while capping work per loop iteration.
+    cycle = await condition_service.poll_due_conditions(limit=batch_size, now_utc=now_utc)
+    _merge_cycle_summary(summary, cycle)
+    if cycle.disabled or cycle.claimed < batch_size:
+        return summary
+    summary.drain_exhausted = True
+    return summary
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -101,6 +138,12 @@ async def condition_loop(
                 service=condition_service,
                 last_cleanup_at_utc=last_cleanup_at_utc,
             )
-        if await _wait_for_stop(stop_event, settings.condition_poll_interval_seconds):
+        wait_seconds = settings.condition_poll_interval_seconds
+        if summary.drain_exhausted:
+            wait_seconds = min(
+                wait_seconds,
+                getattr(settings, "condition_drain_interval_seconds", 1),
+            )
+        if await _wait_for_stop(stop_event, wait_seconds):
             break
     logger.info("Condition worker stopped")

@@ -89,6 +89,7 @@ class ConditionCycleSummary:
     transitions: int = 0
     deduplicated: int = 0
     disabled: bool = False
+    drain_exhausted: bool = False
 
     def snapshot(self) -> dict[str, int | bool]:
         return {
@@ -99,6 +100,7 @@ class ConditionCycleSummary:
             "transitions": self.transitions,
             "deduplicated": self.deduplicated,
             "disabled": self.disabled,
+            "drain_exhausted": self.drain_exhausted,
         }
 
 
@@ -260,10 +262,16 @@ class ConditionService:
         validator = getattr(provider, "validate_target", None)
         if callable(validator):
             validator(target)
+        config_validator = getattr(provider, "validate_config_for_target", None)
+        if callable(config_validator):
+            config_validator(target, config=config)
         normalized_config = serialize_provider_config(
             config,
             authorization_env_allowlist=getattr(
                 self.settings, "condition_authorization_env_allowlist", ()
+            ),
+            authorization_env_bindings=getattr(
+                self.settings, "condition_authorization_env_bindings", {}
             ),
         )
         template = _validate_message_template(message_template or DEFAULT_CONDITION_MESSAGE)
@@ -552,6 +560,9 @@ class ConditionService:
                 claim.config_json,
                 authorization_env_allowlist=getattr(
                     self.settings, "condition_authorization_env_allowlist", ()
+                ),
+                authorization_env_bindings=getattr(
+                    self.settings, "condition_authorization_env_bindings", {}
                 ),
             )
             async with asyncio.timeout(self.settings.condition_request_timeout_seconds):

@@ -58,10 +58,15 @@ payload is an object containing a string `state`. It enforces:
 - no raw provider response, URL, exception text, or authorization value in
   PostgreSQL, logs, or user-facing errors;
 - optional `authorization_env_var`, which stores only a deployment-owned name
-  from `CONDITION_AUTHORIZATION_ENV_ALLOWLIST`. Built-in runtime names such as
-  `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET_TOKEN`, and `DEPLOY_ENABLED` are
-  always forbidden. The secret is read just before the request and used only
-  in an in-memory `Authorization: Bearer` header.
+  from `CONDITION_AUTHORIZATION_ENV_ALLOWLIST`. Every allowlisted name must
+  also appear in the deployment-owned
+  `CONDITION_AUTHORIZATION_ENV_BINDINGS` policy as
+  `ENV_NAME=https://approved-origin.example`; the provider rejects a target
+  whose normalized HTTPS origin does not match that binding before reading the
+  environment. Built-in runtime names such as `BOT_TOKEN`, `DATABASE_URL`,
+  `WEBHOOK_SECRET_TOKEN`, and `DEPLOY_ENABLED` are always forbidden. The
+  secret is read just before the request and used only in an in-memory
+  `Authorization: Bearer` header.
 
 Provider configuration is JSON, but the shared normalizer currently permits
 only the authorization environment-variable reference. Provider-specific
@@ -81,8 +86,9 @@ and a dedicated token reference, never a user-supplied URL.
 Condition polling is disabled by default with `CONDITION_WORKER_ENABLED=false`.
 The optional `condition_worker` loop is separate and is not wired into the
 existing time worker. Defaults are conservative: batch size 10, five-minute
-poll interval, ten-second request timeout, 64 KiB response limit, 60-second
-retry base, one-hour retry cap, and a 90-second lease. Observation cleanup runs
+poll interval, ten bounded drain batches per pass with a one-second drain
+cadence when more due work remains, ten-second request timeout, 64 KiB response
+limit, 60-second retry base, one-hour retry cap, and a 90-second lease. Observation cleanup runs
 at most once per hour by default and retains the last 90 days. Settings
 validation requires the lease to exceed the request timeout and the retry cap
 to cover the retry base. Cleanup runs in the supervised condition worker on

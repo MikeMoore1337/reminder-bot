@@ -52,6 +52,79 @@ async def test_condition_worker_uses_separate_service_when_enabled(monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_condition_worker_drains_multiple_full_batches_without_poll_sleep(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        condition_worker,
+        "settings",
+        SimpleNamespace(
+            condition_worker_enabled=True,
+            condition_poll_batch_size=2,
+            condition_drain_max_batches=4,
+            condition_drain_interval_seconds=1,
+            condition_poll_interval_seconds=300,
+        ),
+    )
+
+    class _Service:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.cycles = [
+                ConditionCycleSummary(claimed=2, succeeded=2),
+                ConditionCycleSummary(claimed=2, succeeded=1, failed=1),
+                ConditionCycleSummary(claimed=1, succeeded=1),
+            ]
+
+        async def poll_due_conditions(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.cycles.pop(0)
+
+    service = _Service()
+    summary = await condition_worker.process_due_conditions(service=service)
+
+    assert summary.claimed == 5
+    assert summary.succeeded == 4
+    assert summary.failed == 1
+    assert summary.drain_exhausted is False
+    assert len(service.calls) == 3
+    assert all(call["limit"] == 2 for call in service.calls)
+
+
+@pytest.mark.asyncio
+async def test_condition_worker_uses_short_cadence_after_bounded_drain(monkeypatch) -> None:
+    monkeypatch.setattr(
+        condition_worker,
+        "settings",
+        SimpleNamespace(
+            condition_worker_enabled=True,
+            condition_poll_batch_size=2,
+            condition_drain_max_batches=1,
+            condition_drain_interval_seconds=1,
+            condition_poll_interval_seconds=300,
+            condition_cleanup_interval_seconds=3600,
+        ),
+    )
+    wait_calls: list[float] = []
+
+    class _Service:
+        async def poll_due_conditions(self, **kwargs):
+            return ConditionCycleSummary(claimed=2, succeeded=2)
+
+        async def cleanup_history(self, **kwargs):
+            return 0
+
+    async def _short_wait(stop_event, timeout_seconds):
+        wait_calls.append(timeout_seconds)
+        return True
+
+    monkeypatch.setattr(condition_worker, "_wait_for_stop", _short_wait)
+    await condition_worker.condition_loop(service=_Service())
+
+    assert wait_calls == [1]
+
+
+@pytest.mark.asyncio
 async def test_condition_history_cleanup_is_cadenced_and_failure_isolated(monkeypatch) -> None:
     monkeypatch.setattr(
         condition_worker,

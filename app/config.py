@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     condition_worker_enabled: bool = False
     condition_poll_batch_size: int = Field(default=10, ge=1, le=100)
     condition_poll_interval_seconds: int = Field(default=300, ge=30, le=86400)
+    condition_drain_max_batches: int = Field(default=10, ge=1, le=100)
+    condition_drain_interval_seconds: int = Field(default=1, ge=1, le=60)
     condition_request_timeout_seconds: int = Field(default=10, ge=1, le=60)
     condition_max_response_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
     condition_retry_base_seconds: int = Field(default=60, ge=1, le=86_400)
@@ -76,6 +78,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "CONDITION_AUTHORIZATION_ENV_ALLOWLIST",
             "CONDITION_AUTHORIZATION_ENV_ALLOWLIST_RAW",
+        ),
+    )
+    condition_authorization_env_bindings_raw: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CONDITION_AUTHORIZATION_ENV_BINDINGS",
+            "CONDITION_AUTHORIZATION_ENV_BINDINGS_RAW",
         ),
     )
 
@@ -145,6 +154,12 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "condition_authorization_env_allowlist contains an invalid environment name"
                 )
+        from app.services.condition_provider import ConditionProviderError
+
+        try:
+            _ = self.condition_authorization_env_bindings
+        except ConditionProviderError as exc:
+            raise ValueError("condition_authorization_env_bindings is invalid") from exc
         PersistentPolicy(
             interval_minutes=self.persistent_repeat_interval_minutes,
             max_deliveries=self.persistent_max_deliveries,
@@ -177,6 +192,15 @@ class Settings(BaseSettings):
             name.strip().upper()
             for name in self.condition_authorization_env_allowlist_raw.split(",")
             if name.strip()
+        )
+
+    @property
+    def condition_authorization_env_bindings(self) -> dict[str, str]:
+        from app.services.condition_provider import normalize_authorization_bindings
+
+        return normalize_authorization_bindings(
+            self.condition_authorization_env_bindings_raw,
+            authorization_env_allowlist=self.condition_authorization_env_allowlist,
         )
 
     @property
