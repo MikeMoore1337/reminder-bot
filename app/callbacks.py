@@ -13,6 +13,7 @@ class CallbackTarget(StrEnum):
     OCCURRENCE = "o"
     VOICE_DRAFT = "v"
     DEADLINE_DRAFT = "d"
+    SUGGESTION = "s"
 
 
 class CallbackOrigin(StrEnum):
@@ -22,6 +23,7 @@ class CallbackOrigin(StrEnum):
     LIST = "l"
     VOICE = "v"
     DEADLINE = "e"
+    SUGGESTION = "s"
 
 
 class CallbackAction(StrEnum):
@@ -41,6 +43,9 @@ class CallbackAction(StrEnum):
     DELETE = "delete"
     CREATE = "create"
     CANCEL = "cancel"
+    SUGGESTION_ACCEPT = "sok"
+    SUGGESTION_REJECT = "sno"
+    SUGGESTION_DISMISS = "sdismiss"
 
 
 @dataclass(frozen=True, slots=True)

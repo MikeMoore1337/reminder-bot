@@ -32,6 +32,15 @@ def test_worker_lease_must_cover_send_timeout_and_safety_margin() -> None:
         )
 
 
+def test_digest_lease_must_cover_send_timeout_and_safety_margin() -> None:
+    with pytest.raises(ValidationError, match="digest_lease_duration_seconds"):
+        _settings(
+            digest_lease_duration_seconds=40,
+            worker_send_timeout_seconds=30,
+            worker_lease_safety_margin_seconds=10,
+        )
+
+
 def test_worker_retry_max_cannot_be_below_retry_base() -> None:
     with pytest.raises(ValidationError, match="worker_retry_max_seconds"):
         _settings(worker_retry_base_seconds=60, worker_retry_max_seconds=30)

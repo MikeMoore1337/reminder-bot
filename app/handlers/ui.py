@@ -6,7 +6,15 @@ from aiogram.types import Message
 
 from app.callbacks import CallbackOrigin
 from app.db.models import OccurrenceState, Reminder, User
+from app.keyboards.adaptive import suggestion_kb
 from app.keyboards.reply import get_main_keyboard, get_timezone_keyboard
+from app.services.adaptive_service import (
+    AdaptivePreferences,
+    format_suggestion,
+    get_adaptive_preferences,
+    get_pending_suggestions,
+    set_adaptive_preferences,
+)
 from app.services.persistent_policy import is_persistent_mode
 from app.services.reminder_service import (
     format_reminder_for_user,
@@ -71,6 +79,10 @@ HELP_TEXT = (
     "Можно также переслать ссылку, фото, документ или сообщение без времени — бот сохранит\n"
     "короткий контекст и спросит, когда напомнить.\n\n"
     "⚠️ Если время неоднозначно, бот сначала попросит уточнение.\n\n"
+    "💡 <b>Подсказки и дайджесты</b>\n"
+    "- /suggestions on|off — подсказки по повторным переносам\n"
+    "- /digest on|off — утренний и вечерний список незавершённых дел\n"
+    "- обе функции выключены по умолчанию и включаются только явно\n\n"
     "📋 <b>Команды</b>\n"
     "/list - список активных напоминаний\n"
     "/cancel ID - удалить напоминание; /cancel - отменить действие\n"
@@ -115,6 +127,57 @@ def _render_reminders(reminders: list[Reminder], timezone_name: str) -> str:
     if len(reminders) > 20:
         rendered += f"\n\nПоказаны первые 20 из {len(reminders)}"
     return rendered
+
+
+def _adaptive_status_text(preferences: AdaptivePreferences) -> str:
+    suggestions = "включены" if preferences.suggestions_enabled else "выключены"
+    digests = "включены" if preferences.digests_enabled else "выключены"
+    return (
+        "💡 <b>Настройки подсказок и дайджестов</b>\n\n"
+        f"Подсказки по переносам: <b>{suggestions}</b>\n"
+        f"Дайджесты: <b>{digests}</b>\n"
+        f"Утро: <code>{preferences.digest_morning_time}</code>, "
+        f"вечер: <code>{preferences.digest_evening_time}</code>\n"
+        "Тихие часы: "
+        f"<code>{preferences.digest_quiet_hours_start}–{preferences.digest_quiet_hours_end}</code>\n\n"
+        "Включить: <code>/suggestions on</code> или <code>/digest on</code>.\n"
+        "Выключить: <code>/suggestions off</code> или <code>/digest off</code>."
+    )
+
+
+async def _handle_adaptive_toggle(
+    message: Message,
+    command: CommandObject,
+    *,
+    feature: str,
+) -> None:
+    telegram_user_id, chat_id = _get_ids(message)
+    user = await get_or_create_user(telegram_user_id, chat_id)
+    value = (command.args or "").strip().lower()
+    enabled: bool | None
+    if value in {"on", "вкл", "включить", "да"}:
+        enabled = True
+    elif value in {"off", "выкл", "выключить", "нет"}:
+        enabled = False
+    elif value in {"", "status", "статус"}:
+        enabled = None
+    else:
+        await message.answer(
+            f"Используй: /{feature} on, /{feature} off или /{feature} status",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    if enabled is None:
+        preferences = await get_adaptive_preferences(user)
+    elif feature == "suggestions":
+        preferences = await set_adaptive_preferences(user, suggestions_enabled=enabled)
+    else:
+        preferences = await set_adaptive_preferences(user, digests_enabled=enabled)
+    if preferences is None:
+        await message.answer("Не удалось загрузить настройки")
+        return
+    await message.answer(_adaptive_status_text(preferences), parse_mode="HTML")
 
 
 async def _send_actionable_reminders(
@@ -246,6 +309,16 @@ async def cmd_timezone(message: Message, command: CommandObject) -> None:
         )
 
 
+@router.message(Command("suggestions"))
+async def cmd_suggestions(message: Message, command: CommandObject) -> None:
+    await _handle_adaptive_toggle(message, command, feature="suggestions")
+
+
+@router.message(Command("digest"))
+async def cmd_digest(message: Message, command: CommandObject) -> None:
+    await _handle_adaptive_toggle(message, command, feature="digest")
+
+
 @router.message(Command("list"))
 async def cmd_list(message: Message) -> None:
     telegram_user_id, chat_id = _get_ids(message)
@@ -263,6 +336,13 @@ async def cmd_list(message: Message) -> None:
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
     await message.answer("📋 <b>Твои активные напоминания:</b>", parse_mode="HTML")
     await _send_actionable_reminders(message, user, reminders, timezone_name)
+    for suggestion in await get_pending_suggestions(user, limit=5):
+        reminder = next((item for item in reminders if item.id == suggestion.reminder_id), None)
+        await message.answer(
+            format_suggestion(suggestion, reminder=reminder),
+            reply_markup=suggestion_kb(suggestion.id, suggestion.revision),
+            parse_mode="HTML",
+        )
     await message.answer(
         "Выбери действие кнопкой выше или обнови список командой /list.",
         reply_markup=get_main_keyboard(),
@@ -294,6 +374,13 @@ async def btn_list(message: Message) -> None:
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
     await message.answer("📋 <b>Твои активные напоминания:</b>", parse_mode="HTML")
     await _send_actionable_reminders(message, user, reminders, timezone_name)
+    for suggestion in await get_pending_suggestions(user, limit=5):
+        reminder = next((item for item in reminders if item.id == suggestion.reminder_id), None)
+        await message.answer(
+            format_suggestion(suggestion, reminder=reminder),
+            reply_markup=suggestion_kb(suggestion.id, suggestion.revision),
+            parse_mode="HTML",
+        )
     await message.answer(
         "Выбери действие кнопкой выше или обнови список командой /list.",
         reply_markup=get_main_keyboard(),

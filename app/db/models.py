@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -78,6 +80,27 @@ class DeadlineStepState(StrEnum):
     FAILED = "failed"
 
 
+class SuggestionState(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    DISMISSED = "dismissed"
+    EXPIRED = "expired"
+
+
+class DigestPeriod(StrEnum):
+    MORNING = "morning"
+    EVENING = "evening"
+
+
+class DigestDeliveryState(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SENT = "sent"
+    SUPPRESSED = "suppressed"
+    FAILED = "failed"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -99,6 +122,14 @@ class User(Base):
     next_persistent_delivery_at_utc: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    suggestions_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    digests_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    digest_morning_time: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
+    digest_evening_time: Mapped[str] = mapped_column(String(5), nullable=False, default="20:00")
+    digest_quiet_hours_start: Mapped[str] = mapped_column(
+        String(5), nullable=False, default="22:00"
+    )
+    digest_quiet_hours_end: Mapped[str] = mapped_column(String(5), nullable=False, default="08:00")
 
     reminders: Mapped[list[Reminder]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
@@ -113,6 +144,15 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     deadline_reminder_drafts: Mapped[list[DeadlineReminderDraft]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    snooze_events: Mapped[list[ReminderSnoozeEvent]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    suggestions: Mapped[list[ReminderSuggestion]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    digest_deliveries: Mapped[list[ReminderDigestDelivery]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -248,6 +288,12 @@ class Reminder(Base):
         back_populates="reminder",
         uselist=False,
         cascade="all, delete-orphan",
+    )
+    snooze_events: Mapped[list[ReminderSnoozeEvent]] = relationship(
+        back_populates="reminder", cascade="all, delete-orphan"
+    )
+    suggestions: Mapped[list[ReminderSuggestion]] = relationship(
+        back_populates="reminder", cascade="all, delete-orphan"
     )
 
 
@@ -564,3 +610,129 @@ class DeadlineReminderDraft(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     user: Mapped[User] = relationship(back_populates="deadline_reminder_drafts")
+
+
+class ReminderSnoozeEvent(Base):
+    """Minimal, bounded history used for transparent snooze suggestions."""
+
+    __tablename__ = "reminder_snooze_events"
+    __table_args__ = (
+        Index(
+            "ix_reminder_snooze_events_reminder_snoozed_at",
+            "reminder_id",
+            "snoozed_at_utc",
+        ),
+        Index("ix_reminder_snooze_events_user_snoozed_at", "user_id", "snoozed_at_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    occurrence_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reminder_occurrences.id", ondelete="SET NULL"), nullable=True
+    )
+    occurrence_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    snoozed_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    target_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    target_local_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    schedule_timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user: Mapped[User] = relationship(back_populates="snooze_events")
+    reminder: Mapped[Reminder] = relationship(back_populates="snooze_events")
+
+
+class ReminderSuggestion(Base):
+    """Explicit, user-scoped schedule suggestion awaiting a decision."""
+
+    __tablename__ = "reminder_suggestions"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_reminder_suggestions_dedupe_key"),
+        Index("ix_reminder_suggestions_user_chat_status", "user_id", "chat_id", "status"),
+        Index("ix_reminder_suggestions_reminder_status", "reminder_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=SuggestionState.PENDING.value
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    expected_reminder_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_local_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    proposed_local_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_window_start_utc: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    evidence_window_end_utc: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    resolution: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="suggestions")
+    reminder: Mapped[Reminder] = relationship(back_populates="suggestions")
+
+
+class ReminderDigestDelivery(Base):
+    """One idempotent morning/evening digest slot for one user and local date."""
+
+    __tablename__ = "reminder_digest_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "period",
+            "local_date",
+            name="uq_reminder_digest_deliveries_user_period_date",
+        ),
+        Index("ix_reminder_digest_deliveries_state_scheduled_at", "state", "scheduled_at_utc"),
+        Index("ix_reminder_digest_deliveries_user_date", "user_id", "local_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    period: Mapped[str] = mapped_column(String(8), nullable=False)
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+    scheduled_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=DigestDeliveryState.PENDING.value
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suppressed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suppression_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_text: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user: Mapped[User] = relationship(back_populates="digest_deliveries")
+
+
+# Short aliases keep the persistence vocabulary convenient for service and test callers.
+SnoozeEvent = ReminderSnoozeEvent
+DigestDelivery = ReminderDigestDelivery

@@ -35,6 +35,7 @@ from app.db.models import (
     User,
 )
 from app.db.session import SessionLocal
+from app.services.adaptive_service import cleanup_adaptive_data, process_due_digests
 from app.services.deadline_service import (
     cleanup_expired_deadline_drafts,
     finalize_deadline_delivery_failure,
@@ -1275,6 +1276,13 @@ async def reminder_loop(bot: Bot, stop_event: asyncio.Event | None = None) -> No
                     "Processed reminders",
                     extra={"extra_data": f"count={processed_count}"},
                 )
+            if bool(getattr(settings, "digest_worker_enabled", False)):
+                digest_count = await process_due_digests(bot, stop_event=stop_event)
+                if digest_count:
+                    logger.info(
+                        "Processed reminder digests",
+                        extra={"extra_data": f"count={digest_count}"},
+                    )
         except asyncio.CancelledError:
             logger.info("Reminder worker task cancelled; active claims remain lease-recoverable")
             raise
@@ -1297,6 +1305,8 @@ async def reminder_loop(bot: Bot, stop_event: asyncio.Event | None = None) -> No
             await cleanup_expired_voice_drafts(now_utc=current_time)
             await cleanup_expired_deadline_drafts(now_utc=current_time)
             await cleanup_expired_reminder_contexts(now_utc=current_time)
+            if hasattr(settings, "digest_worker_enabled"):
+                await cleanup_adaptive_data(now_utc=current_time)
             last_voice_cleanup_at = current_time
         if await _wait_for_stop(stop_event, settings.worker_poll_interval_seconds):
             break

@@ -87,7 +87,7 @@ jobs:
       - name: Validate migration chain and round trip
         run: |
           test "$(alembic heads | grep -c '(head)')" -eq 1
-          test "$(alembic heads | grep -c '20260908_0011')" -eq 1
+          test "$(alembic heads | grep -c '20260908_0012')" -eq 1
           alembic upgrade head
           alembic downgrade 20260907_0003
           alembic upgrade head

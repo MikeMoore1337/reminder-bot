@@ -13,6 +13,7 @@ from app.db.models import (
     ActionDraft,
     DeadlinePlanState,
     DeadlineStepState,
+    DigestDeliveryState,
     OccurrenceState,
     RecurrenceType,
     Reminder,
@@ -20,6 +21,7 @@ from app.db.models import (
     ReminderContext,
     ReminderDeadlinePlan,
     ReminderDeadlineStep,
+    ReminderDigestDelivery,
     ReminderKind,
     ReminderOccurrence,
     ReminderState,
@@ -27,6 +29,7 @@ from app.db.models import (
     VoiceReminderDraft,
 )
 from app.services import (
+    adaptive_service,
     clarification_service,
     deadline_service,
     message_context,
@@ -81,6 +84,7 @@ async def _with_postgres(monkeypatch, scenario) -> None:
 
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         monkeypatch.setattr(worker, "SessionLocal", session_factory)
+        monkeypatch.setattr(adaptive_service, "SessionLocal", session_factory)
         monkeypatch.setattr(deadline_service, "SessionLocal", session_factory)
         monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
         monkeypatch.setattr(clarification_service, "SessionLocal", session_factory)
@@ -173,6 +177,34 @@ async def _insert_batch_reminders(session_factory, now_utc: datetime, count: int
         session.add_all(reminders)
         await session.commit()
         return [reminder.id for reminder in reminders]
+
+
+def test_postgres_digest_claim_is_idempotent_under_concurrency(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+        async with session_factory() as session:
+            session.add(
+                User(
+                    telegram_user_id=9701,
+                    chat_id=9702,
+                    timezone="Europe/Moscow",
+                    digests_enabled=True,
+                )
+            )
+            await session.commit()
+
+        claimed_batches = await asyncio.gather(
+            adaptive_service.claim_due_digests(1, now_utc=now),
+            adaptive_service.claim_due_digests(1, now_utc=now),
+        )
+        assert sorted(len(batch) for batch in claimed_batches) == [0, 1]
+        async with session_factory() as session:
+            deliveries = list((await session.scalars(select(ReminderDigestDelivery))).all())
+            assert len(deliveries) == 1
+            assert deliveries[0].state == DigestDeliveryState.PROCESSING.value
+            assert deliveries[0].lease_token
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
 
 
 def test_postgres_workers_cannot_claim_one_occurrence_concurrently(monkeypatch) -> None:
