@@ -32,9 +32,11 @@ from app.db.models import (
     ReminderState,
 )
 from app.db.session import SessionLocal
+from app.services.recurrence import is_completion_relative
 from app.services.reminder_service import (
     advance_occurrence_until_future,
     delivery_at_utc,
+    get_recurrence_rule,
     prepare_delivery_occurrence,
     set_last_message_id,
 )
@@ -539,7 +541,18 @@ async def finalize_delivery_success(
         if reminder.last_delivery_occurrence_utc is None:
             reminder.last_delivery_occurrence_utc = current_occurrence
 
+        recurrence_rule = get_recurrence_rule(reminder)
         if reminder.recurrence_type == RecurrenceType.NONE.value:
+            reminder.status = "sent"
+            reminder.state = ReminderState.DELIVERED.value
+            reminder.delivery_at_utc = None
+            reminder.snoozed_until_utc = None
+            _clear_processing_state(reminder)
+            return True
+
+        if is_completion_relative(recurrence_rule):
+            # The next occurrence is anchored to the user's actual Done
+            # action, so leave this delivery actionable until completion.
             reminder.status = "sent"
             reminder.state = ReminderState.DELIVERED.value
             reminder.delivery_at_utc = None
@@ -554,6 +567,7 @@ async def finalize_delivery_success(
             timezone_name=reminder.schedule_timezone,
             recurrence_day_of_month=reminder.recurrence_day_of_month,
             now_utc=current_time,
+            recurrence_rule=recurrence_rule,
         )
         if next_occurrence is None:
             reminder.status = "sent"

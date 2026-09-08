@@ -17,7 +17,18 @@ from app.callbacks import (
 )
 from app.db.models import User
 from app.services import reminder_service
-from app.services.reminder_parser import parse_reminder_input
+from app.services.clarification_service import (
+    cancel_clarification,
+    consume_clarification_and_create_reminder,
+    create_clarification,
+    get_active_clarification,
+)
+from app.services.reminder_parser import (
+    ClarificationRequest,
+    ParsedReminder,
+    parse_clarification_answer,
+    parse_reminder_input,
+)
 from app.services.reminder_service import (
     apply_custom_snooze_draft,
     apply_edit_draft,
@@ -53,6 +64,7 @@ REMINDER_FORMAT_HINT = (
 )
 
 STALE_FEEDBACK = "Это действие уже неактуально"
+CLARIFICATION_STALE_FEEDBACK = "Это уточнение уже обработано или истекло"
 
 
 def _message_ids(message: Message) -> tuple[int, int] | None:
@@ -83,9 +95,15 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
     raw_text = message.text or ""
     now_local = now_in_timezone(user.timezone)
     parsed = parse_reminder_input(raw_text, now_local=now_local)
+    if isinstance(parsed, ClarificationRequest):
+        await create_clarification(user, parsed)
+        await message.answer(parsed.prompt)
+        return
     if parsed is None:
         if show_hint or raw_text.strip().lower().startswith("напомни"):
             await message.answer(REMINDER_FORMAT_HINT)
+        return
+    if not isinstance(parsed, ParsedReminder):
         return
 
     try:
@@ -96,6 +114,8 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
             recurrence_type=parsed.recurrence_type,
             recurrence_interval=parsed.recurrence_interval,
             datetime_semantics=parsed.datetime_semantics,
+            recurrence_rule=parsed.recurrence_rule,
+            recurrence_day_of_month=parsed.recurrence_day_of_month,
         )
     except ValueError as exc:
         await message.answer(str(exc))
@@ -110,6 +130,48 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
         f"Текст: {escape(reminder.text)}\n"
         f"Часовой пояс: {user.timezone}"
     )
+
+
+async def _handle_clarification(message: Message, user: User) -> bool:
+    clarification = await get_active_clarification(user)
+    if clarification is None:
+        return False
+
+    raw_value = (message.text or "").strip()
+    parsed = parse_clarification_answer(
+        clarification.raw_text,
+        raw_value,
+        now_local=now_in_timezone(user.timezone),
+    )
+    if not isinstance(parsed, ParsedReminder):
+        await message.answer(clarification.prompt)
+        return True
+
+    try:
+        reminder = await consume_clarification_and_create_reminder(
+            user=user,
+            clarification_id=clarification.id,
+            raw_text=clarification.raw_text,
+            parsed=parsed,
+        )
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return True
+
+    if reminder is None:
+        await message.answer(CLARIFICATION_STALE_FEEDBACK)
+        return True
+
+    local_dt = from_utc_to_user(reminder.remind_at_utc, user.timezone)
+    await message.answer(
+        "Напоминание сохранено после уточнения.\n"
+        f"ID: {reminder.id}\n"
+        f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        f"Повтор: {reminder_service.format_recurrence(reminder)}\n"
+        f"Текст: {escape(reminder.text)}\n"
+        f"Часовой пояс: {user.timezone}"
+    )
+    return True
 
 
 async def _handle_action_draft(message: Message, user: User) -> bool:
@@ -172,6 +234,10 @@ async def _handle_action_draft(message: Message, user: User) -> bool:
                 datetime_semantics=parsed.datetime_semantics
                 if parsed is not None
                 else "wall_clock",
+                recurrence_rule=parsed.recurrence_rule if parsed is not None else None,
+                recurrence_day_of_month=parsed.recurrence_day_of_month
+                if parsed is not None
+                else None,
             )
         except ValueError as exc:
             await message.answer(str(exc))
@@ -198,8 +264,13 @@ async def cmd_cancel(message: Message) -> None:
     user = await get_or_create_user(telegram_user_id=telegram_user_id, chat_id=chat_id)
 
     if len(parts) == 1:
-        cancelled = await cancel_active_action_drafts(user)
-        await message.answer("Текущий сценарий отменён" if cancelled else "Нет активного сценария")
+        cancelled_actions = await cancel_active_action_drafts(user)
+        cancelled_clarification = await cancel_clarification(user)
+        await message.answer(
+            "Текущий сценарий отменён"
+            if cancelled_actions or cancelled_clarification
+            else "Нет активного сценария"
+        )
         return
 
     if not parts[1].isdigit():
@@ -448,5 +519,7 @@ async def text_reminder_handler(message: Message) -> None:
     if ids is not None:
         user = await get_or_create_user(telegram_user_id=ids[0], chat_id=ids[1])
         if await _handle_action_draft(message, user):
+            return
+        if await _handle_clarification(message, user):
             return
     await _create_and_answer(message)

@@ -2,6 +2,7 @@ import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select, text, update
@@ -13,11 +14,18 @@ from app.db.models import (
     OccurrenceState,
     RecurrenceType,
     Reminder,
+    ReminderClarification,
     ReminderOccurrence,
     ReminderState,
     User,
 )
-from app.services import reminder_service
+from app.services import clarification_service, reminder_service
+from app.services.reminder_parser import (
+    ClarificationRequest,
+    ParsedReminder,
+    parse_clarification_answer,
+    parse_reminder_input,
+)
 from app.workers import reminder_worker as worker
 
 POSTGRES_URL = os.environ.get("REMINDER_BOT_TEST_DATABASE_URL")
@@ -54,6 +62,7 @@ async def _with_postgres(monkeypatch, scenario) -> None:
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         monkeypatch.setattr(worker, "SessionLocal", session_factory)
         monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
+        monkeypatch.setattr(clarification_service, "SessionLocal", session_factory)
         monkeypatch.setattr(worker, "worker_metrics", worker.WorkerMetrics())
         await scenario(session_factory)
     finally:
@@ -197,6 +206,72 @@ def test_postgres_double_done_acknowledges_one_delivery(monkeypatch) -> None:
         assert sorted(results) == [False, True]
         saved = await _get_reminder(session_factory, reminder_id)
         assert saved.state == ReminderState.COMPLETED.value
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
+
+
+def test_postgres_concurrent_clarification_answers_create_one_reminder(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now_utc = datetime(2026, 9, 7, 7, 0, tzinfo=UTC)
+        now_local = datetime(2026, 9, 7, 10, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        async with session_factory() as session:
+            user = User(
+                telegram_user_id=5010,
+                chat_id=6010,
+                timezone="Europe/Moscow",
+            )
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+
+        request = parse_reminder_input("напомни после обеда позвонить", now_local)
+        assert isinstance(request, ClarificationRequest)
+        clarification = await clarification_service.create_clarification(
+            user,
+            request,
+            now_utc=now_utc,
+        )
+        parsed = parse_clarification_answer(
+            clarification.raw_text,
+            "14:00",
+            now_local=now_local,
+        )
+        assert isinstance(parsed, ParsedReminder)
+
+        results = await asyncio.gather(
+            clarification_service.consume_clarification_and_create_reminder(
+                user,
+                clarification.id,
+                clarification.raw_text,
+                parsed,
+                now_utc=now_utc,
+            ),
+            clarification_service.consume_clarification_and_create_reminder(
+                user,
+                clarification.id,
+                clarification.raw_text,
+                parsed,
+                now_utc=now_utc,
+            ),
+        )
+
+        assert sorted(result is not None for result in results) == [False, True]
+        async with session_factory() as session:
+            reminders = list(
+                (await session.scalars(select(Reminder).where(Reminder.user_id == user.id))).all()
+            )
+            clarifications = list(
+                (
+                    await session.scalars(
+                        select(ReminderClarification).where(
+                            ReminderClarification.user_id == user.id,
+                        )
+                    )
+                ).all()
+            )
+        assert len(reminders) == 1
+        assert reminders[0].text == "позвонить"
+        assert clarifications == []
 
     asyncio.run(_with_postgres(monkeypatch, scenario))
 
