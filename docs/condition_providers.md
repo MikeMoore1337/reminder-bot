@@ -24,7 +24,9 @@ Each subscription follows this state machine:
 
 1. an active due row is claimed with a short PostgreSQL transaction and a
    lease token;
-2. the external request runs after the transaction has released its row lock;
+2. the token-owned lease is renewed immediately before the external request;
+   the condition worker claims one row at a time so queued entries cannot keep
+   an expired lease while an earlier provider call is running;
 3. success writes one observation, updates the last state, resets failure
    backoff, and schedules the next poll;
 4. a first observation establishes a baseline unless `trigger_on_initial` is
@@ -45,8 +47,9 @@ time-reminder worker.
 The first implementation is `http_json`, a bounded HTTPS JSON provider. Its
 payload is an object containing a string `state`. It enforces:
 
-- HTTPS only, no URL userinfo or fragment, default/443 port only, bounded URL
-  length, and rejection of credential-like query parameter names;
+- HTTPS only, no URL userinfo, fragment, or query string, default/443 port
+  only, and bounded URL length. Query strings are rejected before the target is
+  persisted, including non-obvious credential-bearing parameter names;
 - DNS resolution before the request, rejection of every non-global address
   (private, loopback, link-local, multicast, unspecified, reserved), and a
   pinned validated address set for the connection;
@@ -54,9 +57,11 @@ payload is an object containing a string `state`. It enforces:
   bounded chunked-body reads, and JSON content-type validation;
 - no raw provider response, URL, exception text, or authorization value in
   PostgreSQL, logs, or user-facing errors;
-- optional `authorization_env_var`, which stores only an allowlisted
-  environment variable name. The secret is read just before the request and
-  used only in an in-memory `Authorization: Bearer` header.
+- optional `authorization_env_var`, which stores only a deployment-owned name
+  from `CONDITION_AUTHORIZATION_ENV_ALLOWLIST`. Built-in runtime names such as
+  `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET_TOKEN`, and `DEPLOY_ENABLED` are
+  always forbidden. The secret is read just before the request and used only
+  in an in-memory `Authorization: Bearer` header.
 
 Provider configuration is JSON, but the shared normalizer currently permits
 only the authorization environment-variable reference. Provider-specific
@@ -77,18 +82,23 @@ Condition polling is disabled by default with `CONDITION_WORKER_ENABLED=false`.
 The optional `condition_worker` loop is separate and is not wired into the
 existing time worker. Defaults are conservative: batch size 10, five-minute
 poll interval, ten-second request timeout, 64 KiB response limit, 60-second
-retry base, one-hour retry cap, and a 90-second lease. Settings validation
-requires the lease to exceed the request timeout and the retry cap to cover
-the retry base.
+retry base, one-hour retry cap, and a 90-second lease. Observation cleanup runs
+at most once per hour by default and retains the last 90 days. Settings
+validation requires the lease to exceed the request timeout and the retry cap
+to cover the retry base. Cleanup runs in the supervised condition worker on
+its own bounded cadence; a cleanup failure is logged as a safe error and does
+not stop condition polling or the time worker, with a later cadence retry.
 
 Only bounded counters and provider/type labels should be used for metrics:
 poll attempts, successes, failures, timeouts, rate limits, transition count,
 deduplicated observations, latency, and current backoff. Never attach raw
 payloads, URLs, tokens, or response bodies to metrics or logs.
 
-`cleanup_history` removes only old observation rows. Transition and pending
-outbox records are retained so the state/trigger audit remains restart-safe;
-pending delivery rows are never removed by history cleanup.
+`cleanup_history` removes only old observation rows. The condition worker calls
+it automatically; the public method remains available for controlled
+maintenance and tests. Transition and pending outbox records are retained so
+the state/trigger audit remains restart-safe; pending delivery rows are never
+removed by history cleanup.
 
 No production secret, variable, database write, migration, deploy, volume, or
 `mtproxy` operation is performed by this feature. Enabling the optional worker

@@ -8,10 +8,10 @@ import json
 import os
 import re
 import socket
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
@@ -28,16 +28,28 @@ _PROVIDER_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,31}$")
 _STATE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,63}$")
 _ENV_NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
-_SENSITIVE_QUERY_KEYS = {
-    "access_token",
-    "api_key",
-    "apikey",
-    "auth",
-    "authorization",
-    "password",
-    "secret",
-    "token",
-}
+RESERVED_RUNTIME_ENV_NAMES = frozenset(
+    {
+        "ADMIN_IDS",
+        "APP_HOST",
+        "APP_PORT",
+        "BOT_MODE",
+        "BOT_TOKEN",
+        "CONDITION_AUTHORIZATION_ENV_ALLOWLIST",
+        "CONDITION_AUTHORIZATION_ENV_ALLOWLIST_RAW",
+        "DATABASE_URL",
+        "DEPLOY_ENABLED",
+        "DEFAULT_TIMEZONE",
+        "LOG_LEVEL",
+        "POSTGRES_DB",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_USER",
+        "POLLING_ALLOWED_UPDATES",
+        "WEBHOOK_BASE_URL",
+        "WEBHOOK_PATH",
+        "WEBHOOK_SECRET_TOKEN",
+    }
+)
 
 
 class ConditionProviderError(RuntimeError):
@@ -124,7 +136,25 @@ class ConditionProvider(Protocol):
     ) -> ConditionObservation: ...
 
 
-def normalize_provider_config(config: Mapping[str, Any] | None) -> dict[str, str]:
+def _normalize_authorization_allowlist(
+    authorization_env_allowlist: Collection[str] | None,
+) -> frozenset[str]:
+    normalized: set[str] = set()
+    for value in authorization_env_allowlist or ():
+        if not isinstance(value, str):
+            raise ConditionProviderError("invalid_authorization_allowlist")
+        name = value.strip().upper()
+        if not _ENV_NAME_PATTERN.fullmatch(name) or name in RESERVED_RUNTIME_ENV_NAMES:
+            raise ConditionProviderError("invalid_authorization_allowlist")
+        normalized.add(name)
+    return frozenset(normalized)
+
+
+def normalize_provider_config(
+    config: Mapping[str, Any] | None,
+    *,
+    authorization_env_allowlist: Collection[str] | None = None,
+) -> dict[str, str]:
     """Keep persisted provider configuration to non-secret references only."""
 
     if config is None:
@@ -145,26 +175,43 @@ def normalize_provider_config(config: Mapping[str, Any] | None) -> dict[str, str
         normalized_name
     ):
         raise ConditionProviderError("invalid_authorization_reference")
+    allowed_names = _normalize_authorization_allowlist(authorization_env_allowlist)
+    if normalized_name in RESERVED_RUNTIME_ENV_NAMES or normalized_name not in allowed_names:
+        raise ConditionProviderError("authorization_not_allowed")
     return {"authorization_env_var": normalized_name}
 
 
-def serialize_provider_config(config: Mapping[str, Any] | None) -> str:
+def serialize_provider_config(
+    config: Mapping[str, Any] | None,
+    *,
+    authorization_env_allowlist: Collection[str] | None = None,
+) -> str:
     return json.dumps(
-        normalize_provider_config(config),
+        normalize_provider_config(
+            config,
+            authorization_env_allowlist=authorization_env_allowlist,
+        ),
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
     )
 
 
-def parse_provider_config(serialized: str | None) -> dict[str, str]:
+def parse_provider_config(
+    serialized: str | None,
+    *,
+    authorization_env_allowlist: Collection[str] | None = None,
+) -> dict[str, str]:
     if not serialized:
         return {}
     try:
         value = json.loads(serialized)
     except (TypeError, ValueError, json.JSONDecodeError, RecursionError) as exc:
         raise ConditionProviderError("invalid_provider_config") from exc
-    return normalize_provider_config(value)
+    return normalize_provider_config(
+        value,
+        authorization_env_allowlist=authorization_env_allowlist,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,9 +260,8 @@ def validate_https_target(target: str) -> ValidatedConditionTarget:
     if literal_address is not None and not literal_address.is_global:
         raise ConditionProviderError("private_target")
 
-    for query_key, _ in parse_qsl(parsed.query, keep_blank_values=True):
-        if query_key.casefold() in _SENSITIVE_QUERY_KEYS:
-            raise ConditionProviderError("secret_in_target")
+    if parsed.query or "?" in target:
+        raise ConditionProviderError("query_not_allowed")
 
     return ValidatedConditionTarget(
         url=target,
@@ -359,6 +405,7 @@ class HttpConditionProvider:
         resolver: AbstractResolver | None = None,
         resolver_factory: Callable[[], AbstractResolver] | None = None,
         session_factory: Callable[..., Any] | None = None,
+        authorization_env_allowlist: Collection[str] | None = None,
     ) -> None:
         if timeout_seconds <= 0 or max_response_bytes < 1:
             raise ValueError("HTTP condition provider bounds must be positive")
@@ -367,6 +414,9 @@ class HttpConditionProvider:
         self.resolver = resolver
         self.resolver_factory = resolver_factory
         self.session_factory = session_factory or aiohttp.ClientSession
+        self.authorization_env_allowlist = _normalize_authorization_allowlist(
+            authorization_env_allowlist
+        )
 
     @staticmethod
     def validate_target(target: str) -> ValidatedConditionTarget:
@@ -512,7 +562,10 @@ class HttpConditionProvider:
         config: Mapping[str, Any] | None = None,
     ) -> ConditionObservation:
         validated_target = validate_https_target(target)
-        normalized_config = normalize_provider_config(config)
+        normalized_config = normalize_provider_config(
+            config,
+            authorization_env_allowlist=self.authorization_env_allowlist,
+        )
         headers = {"Accept": "application/json"}
         env_name = normalized_config.get("authorization_env_var")
         if env_name:
@@ -571,5 +624,6 @@ def build_default_condition_provider_registry(
     provider = HttpConditionProvider(
         timeout_seconds=settings.condition_request_timeout_seconds,
         max_response_bytes=settings.condition_max_response_bytes,
+        authorization_env_allowlist=getattr(settings, "condition_authorization_env_allowlist", ()),
     )
     return ConditionProviderRegistry({"http_json": provider, "http": provider})

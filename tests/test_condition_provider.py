@@ -104,6 +104,7 @@ class _SessionFactory:
 
 def _provider(response: _Response, *, resolver: AbstractResolver | None = None, **kwargs):
     factory = _SessionFactory(response)
+    kwargs.setdefault("authorization_env_allowlist", {"CONDITION_TEST_TOKEN"})
     provider = HttpConditionProvider(
         resolver=resolver or _PublicResolver(),
         session_factory=factory,
@@ -143,7 +144,11 @@ async def test_http_json_provider_normalizes_state_and_uses_secret_reference(mon
         ("https://example.com/status#fragment", "invalid_target"),
         ("https://example.com:8443/status", "invalid_target"),
         ("https://127.0.0.1/status", "private_target"),
-        ("https://example.com/status?access_token=secret", "secret_in_target"),
+        ("https://example.com/status?access_token=secret", "query_not_allowed"),
+        ("https://example.com/status?client_secret=secret", "query_not_allowed"),
+        ("https://example.com/status?auth_token=secret", "query_not_allowed"),
+        ("https://example.com/status?signature=secret", "query_not_allowed"),
+        ("https://example.com/status?", "query_not_allowed"),
     ],
 )
 def test_https_target_validation_fails_closed(target: str, code: str) -> None:
@@ -153,9 +158,25 @@ def test_https_target_validation_fails_closed(target: str, code: str) -> None:
 
 
 def test_provider_config_persists_only_environment_variable_reference() -> None:
-    assert normalize_provider_config({"authorization_env_var": "provider_token"}) == {
-        "authorization_env_var": "PROVIDER_TOKEN"
-    }
+    assert normalize_provider_config(
+        {"authorization_env_var": "provider_token"},
+        authorization_env_allowlist={"provider_token"},
+    ) == {"authorization_env_var": "PROVIDER_TOKEN"}
+    with pytest.raises(ConditionProviderError, match="authorization_not_allowed"):
+        normalize_provider_config(
+            {"authorization_env_var": "provider_token"},
+            authorization_env_allowlist={"other_provider_token"},
+        )
+    with pytest.raises(ConditionProviderError, match="authorization_not_allowed"):
+        normalize_provider_config(
+            {"authorization_env_var": "BOT_TOKEN"},
+            authorization_env_allowlist={"provider_token"},
+        )
+    with pytest.raises(ConditionProviderError, match="invalid_authorization_allowlist"):
+        normalize_provider_config(
+            {"authorization_env_var": "BOT_TOKEN"},
+            authorization_env_allowlist={"BOT_TOKEN"},
+        )
     with pytest.raises(ConditionProviderError, match="invalid_provider_config"):
         normalize_provider_config({"Authorization": "Bearer secret-value"})
 

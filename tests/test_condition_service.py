@@ -1,3 +1,4 @@
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -24,6 +25,7 @@ from app.services.condition_provider import (
 from app.services.condition_provider import (
     ConditionProviderError,
     ConditionProviderRegistry,
+    validate_https_target,
 )
 from app.services.condition_service import (
     ConditionPollOutcome,
@@ -48,6 +50,26 @@ class _SequenceProvider:
         if isinstance(result, ProviderObservation):
             return result
         return ProviderObservation(state=result)  # type: ignore[arg-type]
+
+
+class _ValidatingSequenceProvider(_SequenceProvider):
+    @staticmethod
+    def validate_target(target: str):
+        return validate_https_target(target)
+
+
+class _SlowSequenceProvider(_SequenceProvider):
+    async def observe(self, target: str, *, config=None) -> ProviderObservation:
+        await asyncio.sleep(0.01)
+        return await super().observe(target, config=config)
+
+
+class _MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
 
 
 def _settings(**overrides: object) -> Settings:
@@ -85,6 +107,42 @@ def _service(session_factory, provider, *, settings_obj: Settings | None = None,
         settings_obj=settings_obj or _settings(),
         now_fn=lambda: now,
     )
+
+
+@pytest.mark.asyncio
+async def test_https_query_is_rejected_before_subscription_persistence() -> None:
+    engine, connection, session_factory = await _open_sqlite()
+    try:
+        provider = _ValidatingSequenceProvider("ready")
+        service = ConditionService(
+            session_factory=session_factory,
+            registry=ConditionProviderRegistry({"http_json": provider}),
+            settings_obj=_settings(),
+            now_fn=lambda: NOW,
+        )
+        with pytest.raises(ConditionProviderError) as error:
+            await service.create_subscription(
+                user_id=1,
+                chat_id=2001,
+                provider_type="http_json",
+                target="https://example.com/status?client_secret=hidden",
+                next_poll_at_utc=NOW,
+            )
+        assert error.value.code == "query_not_allowed"
+        async with session_factory() as session:
+            assert await session.scalar(select(ConditionSubscription.id)) is None
+
+        subscription = await service.create_subscription(
+            user_id=1,
+            chat_id=2001,
+            provider_type="http_json",
+            target="https://example.com/status",
+            next_poll_at_utc=NOW,
+        )
+        assert subscription.target == "https://example.com/status"
+    finally:
+        await connection.close()
+        await engine.dispose()
 
 
 async def _subscription(session_factory, subscription_id: int) -> ConditionSubscription:
@@ -281,6 +339,72 @@ async def test_expired_lease_and_restart_cannot_duplicate_transition() -> None:
         async with session_factory() as session:
             assert len(list((await session.scalars(select(ConditionTransition))).all())) == 1
             assert len(list((await session.scalars(select(ConditionDelivery))).all())) == 1
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_batched_claims_renew_before_slow_provider_and_fence_expired_entry() -> None:
+    engine, connection, session_factory = await _open_sqlite()
+    try:
+        provider = _SlowSequenceProvider("one", "two", "three")
+        settings_obj = _settings(
+            condition_poll_batch_size=3,
+            condition_request_timeout_seconds=1,
+            condition_lease_duration_seconds=3,
+        )
+        clock = _MutableClock(NOW)
+        registry = ConditionProviderRegistry({"fake": provider})
+        service_a = ConditionService(
+            session_factory=session_factory,
+            registry=registry,
+            settings_obj=settings_obj,
+            now_fn=clock,
+        )
+        service_b = ConditionService(
+            session_factory=session_factory,
+            registry=registry,
+            settings_obj=settings_obj,
+            now_fn=clock,
+        )
+        for index in range(3):
+            await service_a.create_subscription(
+                user_id=1,
+                chat_id=2001,
+                provider_type="fake",
+                target=f"fake://condition/slow/{index}",
+                trigger_on_initial=True,
+                next_poll_at_utc=NOW,
+            )
+
+        claims = await service_a.claim_due_subscriptions(limit=3, now_utc=NOW)
+        assert len(claims) == 3
+
+        first = await service_a.process_claim(claims[0])
+        assert first.outcome == ConditionPollOutcome.SUCCESS
+        clock.value = NOW + timedelta(seconds=2)
+        second = await service_a.process_claim(claims[1])
+        assert second.outcome == ConditionPollOutcome.SUCCESS
+
+        # The third entry's original lease expired while the first two slow
+        # calls were in flight. A second worker can reclaim it once, while
+        # the stale first worker must not observe or finalize it.
+        clock.value = NOW + timedelta(seconds=4)
+        reclaimed = await service_b.claim_due_subscriptions(limit=1, now_utc=clock.value)
+        assert len(reclaimed) == 1
+        assert reclaimed[0].id == claims[2].id
+        stale = await service_a.process_claim(claims[2])
+        assert stale.outcome == ConditionPollOutcome.STALE
+        committed = await service_b.process_claim(reclaimed[0])
+        assert committed.outcome == ConditionPollOutcome.SUCCESS
+        assert provider.calls == 3
+
+        async with session_factory() as session:
+            transitions = list((await session.scalars(select(ConditionTransition))).all())
+            deliveries = list((await session.scalars(select(ConditionDelivery))).all())
+        assert len(transitions) == 3
+        assert len(deliveries) == 3
     finally:
         await connection.close()
         await engine.dispose()

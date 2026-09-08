@@ -1,4 +1,5 @@
 import os
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,11 @@ async def test_condition_worker_is_disabled_by_default(monkeypatch) -> None:
     monkeypatch.setattr(
         condition_worker,
         "settings",
-        SimpleNamespace(condition_worker_enabled=False, condition_poll_interval_seconds=30),
+        SimpleNamespace(
+            condition_worker_enabled=False,
+            condition_poll_interval_seconds=30,
+            condition_cleanup_interval_seconds=3600,
+        ),
     )
 
     class _UnexpectedService:
@@ -31,7 +36,11 @@ async def test_condition_worker_uses_separate_service_when_enabled(monkeypatch) 
     monkeypatch.setattr(
         condition_worker,
         "settings",
-        SimpleNamespace(condition_worker_enabled=True, condition_poll_interval_seconds=30),
+        SimpleNamespace(
+            condition_worker_enabled=True,
+            condition_poll_interval_seconds=30,
+            condition_cleanup_interval_seconds=3600,
+        ),
     )
     expected = ConditionCycleSummary(claimed=1, succeeded=1)
 
@@ -40,3 +49,52 @@ async def test_condition_worker_uses_separate_service_when_enabled(monkeypatch) 
             return expected
 
     assert await condition_worker.process_due_conditions(service=_Service()) == expected
+
+
+@pytest.mark.asyncio
+async def test_condition_history_cleanup_is_cadenced_and_failure_isolated(monkeypatch) -> None:
+    monkeypatch.setattr(
+        condition_worker,
+        "settings",
+        SimpleNamespace(
+            condition_worker_enabled=True,
+            condition_poll_interval_seconds=30,
+            condition_cleanup_interval_seconds=3600,
+        ),
+    )
+
+    class _CleanupService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def cleanup_history(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("cleanup failure")
+            return 1
+
+    service = _CleanupService()
+    now = datetime(2026, 9, 8, 14, 0, tzinfo=UTC)
+    last_cleanup = await condition_worker.cleanup_conditions_if_due(
+        service=service,
+        last_cleanup_at_utc=None,
+        now_utc=now,
+    )
+    assert last_cleanup == now
+    assert service.calls == 1
+
+    unchanged = await condition_worker.cleanup_conditions_if_due(
+        service=service,
+        last_cleanup_at_utc=last_cleanup,
+        now_utc=now + timedelta(minutes=30),
+    )
+    assert unchanged == last_cleanup
+    assert service.calls == 1
+
+    retried = await condition_worker.cleanup_conditions_if_due(
+        service=service,
+        last_cleanup_at_utc=last_cleanup,
+        now_utc=now + timedelta(hours=1),
+    )
+    assert retried == now + timedelta(hours=1)
+    assert service.calls == 2

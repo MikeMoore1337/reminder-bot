@@ -1,9 +1,12 @@
+import re
 from functools import lru_cache
 
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.services.persistent_policy import PersistentPolicy, parse_clock
+
+_ENV_NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 
 
 class Settings(BaseSettings):
@@ -66,7 +69,15 @@ class Settings(BaseSettings):
     condition_retry_base_seconds: int = Field(default=60, ge=1, le=86_400)
     condition_retry_max_seconds: int = Field(default=3600, ge=1, le=86_400)
     condition_lease_duration_seconds: int = Field(default=90, ge=2, le=86_400)
+    condition_cleanup_interval_seconds: int = Field(default=3600, ge=60, le=86_400)
     condition_history_retention_days: int = Field(default=90, ge=1, le=3650)
+    condition_authorization_env_allowlist_raw: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CONDITION_AUTHORIZATION_ENV_ALLOWLIST",
+            "CONDITION_AUTHORIZATION_ENV_ALLOWLIST_RAW",
+        ),
+    )
 
     voice_stt_command: str = "whisper-cli"
     voice_stt_model_path: str | None = None
@@ -128,6 +139,12 @@ class Settings(BaseSettings):
                 "condition_lease_duration_seconds must be greater than "
                 "condition_request_timeout_seconds"
             )
+        for raw_name in self.condition_authorization_env_allowlist_raw.split(","):
+            name = raw_name.strip().upper()
+            if name and not _ENV_NAME_PATTERN.fullmatch(name):
+                raise ValueError(
+                    "condition_authorization_env_allowlist contains an invalid environment name"
+                )
         PersistentPolicy(
             interval_minutes=self.persistent_repeat_interval_minutes,
             max_deliveries=self.persistent_max_deliveries,
@@ -153,6 +170,14 @@ class Settings(BaseSettings):
             if value.isdigit():
                 result.add(int(value))
         return result
+
+    @property
+    def condition_authorization_env_allowlist(self) -> frozenset[str]:
+        return frozenset(
+            name.strip().upper()
+            for name in self.condition_authorization_env_allowlist_raw.split(",")
+            if name.strip()
+        )
 
     @property
     def normalized_bot_mode(self) -> str:

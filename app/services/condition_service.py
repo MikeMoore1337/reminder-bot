@@ -260,7 +260,12 @@ class ConditionService:
         validator = getattr(provider, "validate_target", None)
         if callable(validator):
             validator(target)
-        normalized_config = serialize_provider_config(config)
+        normalized_config = serialize_provider_config(
+            config,
+            authorization_env_allowlist=getattr(
+                self.settings, "condition_authorization_env_allowlist", ()
+            ),
+        )
         template = _validate_message_template(message_template or DEFAULT_CONDITION_MESSAGE)
         interval = self._interval(poll_interval_seconds)
         now = self._now(next_poll_at_utc)
@@ -341,6 +346,33 @@ class ConditionService:
                     )
                 )
         return claims
+
+    async def renew_claim_lease(
+        self,
+        claim: ConditionClaim,
+        *,
+        now_utc: datetime | None = None,
+    ) -> bool:
+        """Renew a still-live token-owned lease immediately before provider I/O."""
+
+        now = self._now(now_utc)
+        async with self.session_factory() as session, session.begin():
+            subscription = await session.scalar(
+                select(ConditionSubscription)
+                .where(
+                    ConditionSubscription.id == claim.id,
+                    ConditionSubscription.state == ConditionSubscriptionState.ACTIVE.value,
+                    ConditionSubscription.lease_token == claim.lease_token,
+                    ConditionSubscription.lease_until_utc > now,
+                )
+                .with_for_update()
+            )
+            if subscription is None:
+                return False
+            subscription.lease_until_utc = now + timedelta(
+                seconds=self.settings.condition_lease_duration_seconds
+            )
+            return True
 
     async def _record_failure(
         self,
@@ -510,8 +542,18 @@ class ConditionService:
         started = time.monotonic()
         condition_metrics.polls += 1
         try:
+            if not await self.renew_claim_lease(claim):
+                return ConditionProcessResult(
+                    subscription_id=claim.id,
+                    outcome=ConditionPollOutcome.STALE,
+                )
             provider = self.registry.get(claim.provider_type)
-            config = parse_provider_config(claim.config_json)
+            config = parse_provider_config(
+                claim.config_json,
+                authorization_env_allowlist=getattr(
+                    self.settings, "condition_authorization_env_allowlist", ()
+                ),
+            )
             async with asyncio.timeout(self.settings.condition_request_timeout_seconds):
                 raw_observation = await provider.observe(claim.target, config=config)
             observation = _coerce_observation(raw_observation)
@@ -563,9 +605,14 @@ class ConditionService:
         now_utc: datetime | None = None,
     ) -> ConditionCycleSummary:
         summary = ConditionCycleSummary()
-        claims = await self.claim_due_subscriptions(limit=limit, now_utc=now_utc)
-        summary.claimed = len(claims)
-        for claim in claims:
+        batch_size = self.settings.condition_poll_batch_size if limit is None else int(limit)
+        batch_size = max(1, min(batch_size, 100))
+        for _ in range(batch_size):
+            claims = await self.claim_due_subscriptions(limit=1, now_utc=now_utc)
+            if not claims:
+                break
+            claim = claims[0]
+            summary.claimed += 1
             try:
                 result = await self.process_claim(claim)
             except asyncio.CancelledError:
