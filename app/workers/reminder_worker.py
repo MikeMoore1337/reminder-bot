@@ -673,12 +673,14 @@ async def finalize_delivery_success(
     reminder_id: int,
     lease_token: str,
     *,
+    occurrence_action_revision: int | None = None,
     now_utc: datetime | None = None,
 ) -> bool:
     if not lease_token:
         return False
 
     current_time = now_utc or utc_now()
+    effective_occurrence_revision = occurrence_action_revision
     async with SessionLocal() as session, session.begin():
         result = await session.execute(
             select(Reminder)
@@ -710,14 +712,22 @@ async def finalize_delivery_success(
                 occurrence_at_utc=current_occurrence,
                 delivery_at_utc=delivery_at_utc(reminder),
                 status=OccurrenceState.DELIVERED.value,
-                action_revision=reminder.action_revision,
+                action_revision=(
+                    effective_occurrence_revision
+                    if effective_occurrence_revision is not None
+                    else reminder.action_revision
+                ),
                 message_id=reminder.last_message_id,
                 delivered_at=current_time,
             )
             session.add(occurrence)
         else:
             occurrence.status = OccurrenceState.DELIVERED.value
-            occurrence.action_revision = reminder.action_revision
+            occurrence.action_revision = (
+                effective_occurrence_revision
+                if effective_occurrence_revision is not None
+                else reminder.action_revision
+            )
             occurrence.delivered_at = current_time
             occurrence.snoozed_until_utc = None
         reminder.sent_at = current_time
@@ -1243,15 +1253,22 @@ async def _process_shared_delivery(
     )
     if not delivery_status.complete:
         return False
+    if delivery_status.action_revision is None:
+        return False
     if delivery_status.owner_message_id is not None and not await set_last_message_id(
         reminder.id,
         delivery_status.owner_message_id,
         lease_token=lease_token,
         occurrence_at_utc=reminder.remind_at_utc,
+        occurrence_action_revision=delivery_status.action_revision,
         now_utc=utc_now(),
     ):
         return False
-    if not await finalize_delivery_success(reminder.id, lease_token):
+    if not await finalize_delivery_success(
+        reminder.id,
+        lease_token,
+        occurrence_action_revision=delivery_status.action_revision,
+    ):
         return False
     worker_metrics.delivered += 1
     logger.info(

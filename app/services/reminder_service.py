@@ -904,6 +904,7 @@ async def set_last_message_id(
     *,
     lease_token: str,
     occurrence_at_utc: datetime,
+    occurrence_action_revision: int | None = None,
     now_utc: datetime | None = None,
 ) -> bool:
     """Persist message and occurrence identity under the exact worker lease."""
@@ -911,6 +912,7 @@ async def set_last_message_id(
     if not lease_token:
         return False
     current_time = _as_utc(now_utc or utc_now())
+    effective_occurrence_revision = occurrence_action_revision
     async with SessionLocal() as session, session.begin():
         result = await session.execute(
             select(Reminder)
@@ -944,11 +946,19 @@ async def set_last_message_id(
                 occurrence_at_utc=occurrence_at_utc,
                 delivery_at_utc=delivery_at_utc(reminder),
                 status=OccurrenceState.DELIVERED.value,
-                action_revision=reminder.action_revision,
+                action_revision=(
+                    effective_occurrence_revision
+                    if effective_occurrence_revision is not None
+                    else reminder.action_revision
+                ),
             )
             session.add(occurrence)
         occurrence.status = OccurrenceState.DELIVERED.value
-        occurrence.action_revision = reminder.action_revision
+        occurrence.action_revision = (
+            effective_occurrence_revision
+            if effective_occurrence_revision is not None
+            else reminder.action_revision
+        )
         occurrence.message_id = message_id
         occurrence.delivered_at = current_time
         occurrence.snoozed_until_utc = None

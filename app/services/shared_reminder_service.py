@@ -110,6 +110,7 @@ class SharedDeliveryTarget:
 class SharedDeliveryStatus:
     complete: bool
     owner_message_id: int | None
+    action_revision: int | None = None
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -906,6 +907,24 @@ async def prepare_shared_delivery_recipients(
             (row.recipient_user_id, row.membership_revision): row
             for row in existing_result.scalars()
         }
+        sent_action_revisions = sorted(
+            {
+                row.action_revision
+                for row in existing.values()
+                if row.state == ReminderDeliveryState.SENT.value
+            }
+        )
+        if len(sent_action_revisions) > 1:
+            raise SharedReminderError("Несогласованные поколения доставки")
+        shared_action_revision = (
+            sent_action_revisions[0] if sent_action_revisions else occurrence.action_revision
+        )
+        # The parent revision identifies the worker claim. Once one recipient
+        # has received Telegram controls, the occurrence revision becomes the
+        # stable callback generation for every recipient of this occurrence.
+        # A retry must not rewrite the generation persisted with an already
+        # sent message.
+        occurrence.action_revision = shared_action_revision
         delivery_ids: list[int] = []
         for recipient_user_id, chat_id, membership_revision, _is_owner in specs:
             row = existing.get((recipient_user_id, membership_revision))
@@ -915,7 +934,7 @@ async def prepare_shared_delivery_recipients(
                     occurrence_id=occurrence.id,
                     recipient_user_id=recipient_user_id,
                     membership_revision=membership_revision,
-                    action_revision=occurrence.action_revision,
+                    action_revision=shared_action_revision,
                     chat_id=chat_id,
                     state=ReminderDeliveryState.PENDING.value,
                 )
@@ -923,22 +942,28 @@ async def prepare_shared_delivery_recipients(
                 await session.flush()
             else:
                 row.chat_id = chat_id
-                if row.action_revision != occurrence.action_revision:
-                    if row.state == ReminderDeliveryState.SENT.value:
-                        # A parent retry increments the reminder revision to
-                        # invalidate old callbacks. The already persisted
-                        # Telegram send must remain sent so a retry cannot
-                        # duplicate a recipient notification.
-                        row.action_revision = occurrence.action_revision
-                    else:
-                        _reset_delivery_row(row, occurrence.action_revision)
+                if row.state == ReminderDeliveryState.SENT.value:
+                    # Preserve the callback generation encoded in the
+                    # recipient's already delivered Telegram message.
+                    pass
                 elif (
-                    row.state == ReminderDeliveryState.PROCESSING.value
-                    and (row.lease_until is None or row.lease_until <= current_time)
-                ) or (
-                    row.state == ReminderDeliveryState.FAILED.value and row.error_kind != "terminal"
+                    row.state == ReminderDeliveryState.FAILED.value and row.error_kind == "terminal"
                 ):
-                    _reset_delivery_row(row, occurrence.action_revision)
+                    # A terminal recipient failure must not be retried merely
+                    # because another recipient caused a parent retry.
+                    pass
+                elif (
+                    row.action_revision != shared_action_revision
+                    or (
+                        row.state == ReminderDeliveryState.PROCESSING.value
+                        and (row.lease_until is None or row.lease_until <= current_time)
+                    )
+                    or (
+                        row.state == ReminderDeliveryState.FAILED.value
+                        and row.error_kind != "terminal"
+                    )
+                ):
+                    _reset_delivery_row(row, shared_action_revision)
             if row.state != ReminderDeliveryState.SENT.value and row.state != (
                 ReminderDeliveryState.FAILED.value
             ):
@@ -991,16 +1016,13 @@ async def claim_shared_delivery(
         )
         if delivery is None:
             return None
-        if delivery.action_revision != occurrence.action_revision:
-            if delivery.state == ReminderDeliveryState.SENT.value:
-                delivery.action_revision = occurrence.action_revision
-            else:
-                _reset_delivery_row(delivery, occurrence.action_revision)
         if delivery.state == ReminderDeliveryState.SENT.value or (
             delivery.state == ReminderDeliveryState.FAILED.value
             and delivery.error_kind == "terminal"
         ):
             return None
+        if delivery.action_revision != occurrence.action_revision:
+            _reset_delivery_row(delivery, occurrence.action_revision)
         if delivery.state == ReminderDeliveryState.PROCESSING.value and (
             delivery.lease_until is not None and _as_utc(delivery.lease_until) > current_time
         ):
@@ -1205,6 +1227,18 @@ async def get_shared_delivery_status(
         reminder = await session.get(Reminder, reminder_id)
         if reminder is None:
             return SharedDeliveryStatus(False, None)
+        occurrence = await session.scalar(
+            select(ReminderOccurrence).where(
+                ReminderOccurrence.id == occurrence_id,
+                ReminderOccurrence.reminder_id == reminder.id,
+            )
+        )
+        if occurrence is None:
+            return SharedDeliveryStatus(False, None)
+        # ``reminder.action_revision`` is the current worker claim generation.
+        # Shared callbacks use the occurrence generation, which remains stable
+        # across a partial retry after any recipient has already been sent.
+        effective_action_revision = occurrence.action_revision
         specs = await _delivery_specs(session, reminder)
         result = await session.execute(
             select(ReminderDelivery).where(ReminderDelivery.occurrence_id == occurrence_id)
@@ -1214,17 +1248,20 @@ async def get_shared_delivery_status(
         complete = True
         for recipient_user_id, _chat_id, membership_revision, is_owner in specs:
             row = rows.get((recipient_user_id, membership_revision))
-            if row is None or row.action_revision != action_revision:
+            if row is None:
+                complete = False
+                continue
+            if row.state == ReminderDeliveryState.FAILED.value and row.error_kind == "terminal":
+                continue
+            if row.action_revision != effective_action_revision:
                 complete = False
                 continue
             if row.state == ReminderDeliveryState.SENT.value and is_owner:
                 owner_message_id = row.message_id
             if row.state == ReminderDeliveryState.SENT.value:
                 continue
-            if row.state == ReminderDeliveryState.FAILED.value and row.error_kind == "terminal":
-                continue
             complete = False
-        return SharedDeliveryStatus(complete, owner_message_id)
+        return SharedDeliveryStatus(complete, owner_message_id, effective_action_revision)
 
 
 async def cleanup_expired_shared_data(
@@ -1258,12 +1295,18 @@ async def cleanup_expired_shared_data(
             ),
         )
         membership_cutoff = current_time - SHARED_MEMBERSHIP_RETENTION
+        retained_delivery = exists().where(
+            ReminderDelivery.reminder_id == SharedReminderMembership.reminder_id,
+            ReminderDelivery.recipient_user_id == SharedReminderMembership.user_id,
+            ReminderDelivery.membership_revision <= SharedReminderMembership.revision,
+        )
         deleted_memberships = cast(
             CursorResult[Any],
             await session.execute(
                 delete(SharedReminderMembership).where(
                     SharedReminderMembership.state == SharedMembershipState.REVOKED.value,
                     SharedReminderMembership.revoked_at <= membership_cutoff,
+                    ~retained_delivery,
                 )
             ),
         )
