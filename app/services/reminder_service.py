@@ -15,11 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db.models import (
     ActionDraft,
+    DeadlineReminderDraft,
     OccurrenceState,
     RecurrenceType,
     Reminder,
     ReminderClarification,
     ReminderContext,
+    ReminderKind,
     ReminderMode,
     ReminderOccurrence,
     ReminderState,
@@ -503,7 +505,22 @@ async def create_reminder_in_session(
     persistent_max_escalations: int | None = None,
     persistent_quiet_hours_start: str | None = None,
     persistent_quiet_hours_end: str | None = None,
+    kind: str = ReminderKind.ORDINARY.value,
+    deadline_at_utc: datetime | None = None,
 ) -> Reminder:
+    try:
+        reminder_kind = ReminderKind(kind).value
+    except ValueError as exc:
+        raise ValueError("Неизвестный тип напоминания") from exc
+    if reminder_kind == ReminderKind.DEADLINE.value:
+        if deadline_at_utc is None:
+            raise ValueError("Для deadline-напоминания нужен срок")
+        if recurrence_type != RecurrenceType.NONE.value or recurrence_rule is not None:
+            raise ValueError("План дедлайна не поддерживает повторение")
+        if mode != ReminderMode.NORMAL.value:
+            raise ValueError("Важный режим нельзя объединить с планом дедлайна")
+    elif deadline_at_utc is not None:
+        raise ValueError("Срок можно указать только для deadline-напоминания")
     normalized_mode = normalize_reminder_mode(mode)
     default_policy = _default_persistent_policy()
     persistent_policy = PersistentPolicy(
@@ -574,6 +591,14 @@ async def create_reminder_in_session(
     if recurrence_type == RecurrenceType.NONE.value and remind_at_utc <= current_time:
         raise ValueError("Время напоминания уже прошло")
 
+    normalized_deadline_at = _as_utc(deadline_at_utc) if deadline_at_utc is not None else None
+    if (
+        reminder_kind == ReminderKind.DEADLINE.value
+        and normalized_deadline_at is not None
+        and normalized_deadline_at <= current_time
+    ):
+        raise ValueError("Срок дедлайна уже прошёл")
+
     if recurrence_type != RecurrenceType.NONE.value:
         while remind_at_utc <= current_time:
             next_dt = calculate_next_occurrence(
@@ -605,6 +630,11 @@ async def create_reminder_in_session(
         recurrence_day_of_month=recurrence_day_of_month,
         recurrence_rule=encode_rule(canonical_rule) if canonical_rule is not None else None,
         context_kind=normalize_snapshot(context).kind if context is not None else None,
+        kind=reminder_kind,
+        deadline_at_utc=normalized_deadline_at,
+        deadline_plan_state=None,
+        deadline_plan_revision=0,
+        deadline_total_steps=0,
         mode=normalized_mode,
         persistent_interval_minutes=persistent_policy.interval_minutes,
         persistent_max_deliveries=persistent_policy.max_deliveries,
@@ -664,6 +694,8 @@ async def create_reminder(
     persistent_max_escalations: int | None = None,
     persistent_quiet_hours_start: str | None = None,
     persistent_quiet_hours_end: str | None = None,
+    kind: str = ReminderKind.ORDINARY.value,
+    deadline_at_utc: datetime | None = None,
 ) -> Reminder:
     async with SessionLocal() as session:
         async with session.begin():
@@ -684,6 +716,8 @@ async def create_reminder(
                 persistent_max_escalations=persistent_max_escalations,
                 persistent_quiet_hours_start=persistent_quiet_hours_start,
                 persistent_quiet_hours_end=persistent_quiet_hours_end,
+                kind=kind,
+                deadline_at_utc=deadline_at_utc,
             )
         await session.refresh(reminder)
         return reminder
@@ -812,11 +846,22 @@ async def prepare_delivery_occurrence(
         if reminder is None:
             return None
 
+        occurrence_at_utc = reminder.remind_at_utc
+        deadline_step_id: int | None = None
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            from app.services.deadline_service import get_current_deadline_step
+
+            deadline_step = await get_current_deadline_step(session, reminder, for_update=True)
+            if deadline_step is None:
+                return None
+            occurrence_at_utc = deadline_step.scheduled_at_utc
+            deadline_step_id = deadline_step.id
+
         result = await session.execute(
             select(ReminderOccurrence)
             .where(
                 ReminderOccurrence.reminder_id == reminder.id,
-                ReminderOccurrence.occurrence_at_utc == reminder.remind_at_utc,
+                ReminderOccurrence.occurrence_at_utc == occurrence_at_utc,
             )
             .with_for_update()
         )
@@ -826,10 +871,11 @@ async def prepare_delivery_occurrence(
         if occurrence is None:
             occurrence = ReminderOccurrence(
                 reminder_id=reminder.id,
-                occurrence_at_utc=reminder.remind_at_utc,
+                occurrence_at_utc=occurrence_at_utc,
                 delivery_at_utc=delivery_at_utc(reminder),
                 status=OccurrenceState.PROCESSING.value,
                 action_revision=reminder.action_revision,
+                deadline_step_id=deadline_step_id,
             )
             session.add(occurrence)
         else:
@@ -839,6 +885,7 @@ async def prepare_delivery_occurrence(
             occurrence.message_id = None
             occurrence.delivered_at = None
             occurrence.snoozed_until_utc = reminder.snoozed_until_utc
+            occurrence.deadline_step_id = deadline_step_id
         await session.flush()
         return occurrence.id
 
@@ -1236,6 +1283,10 @@ async def cancel_reminder(
             return False
 
         now_utc = utc_now()
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            from app.services.deadline_service import cancel_deadline_in_session
+
+            await cancel_deadline_in_session(session, reminder, now_utc=now_utc)
         reminder.state = ReminderState.CANCELLED.value
         reminder.cancelled_at = now_utc
         reminder.action_revision += 1
@@ -1404,6 +1455,9 @@ async def snooze_reminder(
         reminder = await _load_owned_reminder(session, user, reminder_id)
         if reminder is None:
             _invalid_action("snooze", reminder_id=reminder_id, reason="owner")
+            return None
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            _invalid_action("snooze", reminder_id=reminder_id, reason="state")
             return None
 
         occurrence: ReminderOccurrence | None = None
@@ -1600,6 +1654,24 @@ async def complete_reminder(
             return False
 
         now_utc = utc_now()
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            from app.services.deadline_service import complete_deadline_in_session
+
+            completed = await complete_deadline_in_session(
+                session,
+                reminder,
+                occurrence,
+                now_utc=now_utc,
+            )
+            if not completed:
+                _invalid_action(
+                    "done", reminder_id=reminder_id, revision=expected_revision, reason="state"
+                )
+                return False
+            _record_action("completed", action="done", reminder_id=reminder.id)
+            _record_action("action_success", action="done", reminder_id=reminder.id)
+            return True
+
         occurrence.status = OccurrenceState.COMPLETED.value
         occurrence.completed_at = now_utc
         occurrence.action_revision += 1
@@ -1734,6 +1806,9 @@ async def pause_reminder(
         if reminder is None:
             _invalid_action("pause", reminder_id=reminder_id, reason="owner")
             return False
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            _invalid_action("pause", reminder_id=reminder_id, reason="state")
+            return False
 
         occurrence = None
         if expected_occurrence_id is not None:
@@ -1779,6 +1854,9 @@ async def resume_reminder(user: User, reminder_id: int, *, expected_revision: in
         reminder = await _load_owned_reminder(session, user, reminder_id)
         if reminder is None:
             _invalid_action("resume", reminder_id=reminder_id, reason="owner")
+            return False
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            _invalid_action("resume", reminder_id=reminder_id, reason="state")
             return False
         if reminder.action_revision != expected_revision:
             _invalid_action("resume", reminder_id=reminder_id, reason="stale")
@@ -1870,6 +1948,9 @@ async def edit_reminder(
         reminder = await _load_owned_reminder(session, user, reminder_id)
         if reminder is None:
             _record_action("edit_failure", action="edit", reminder_id=reminder_id, reason="owner")
+            return None
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            _record_action("edit_failure", action="edit", reminder_id=reminder_id, reason="state")
             return None
         if reminder.action_revision != expected_revision:
             _record_action("edit_failure", action="edit", reminder_id=reminder_id, reason="stale")
@@ -2074,6 +2155,12 @@ async def create_action_draft(
             delete(VoiceReminderDraft).where(
                 VoiceReminderDraft.user_id == owner.id,
                 VoiceReminderDraft.chat_id == owner.chat_id,
+            )
+        )
+        await session.execute(
+            delete(DeadlineReminderDraft).where(
+                DeadlineReminderDraft.user_id == owner.id,
+                DeadlineReminderDraft.chat_id == owner.chat_id,
             )
         )
         await session.execute(
@@ -2423,4 +2510,19 @@ def format_reminder_for_user(
         result += f"\nКонтекст: {escape(context_kind_label(reminder.context_kind))}"
     if is_persistent_mode(reminder.mode):
         result += f"\nРежим: {escape(format_mode(reminder))}"
+    if reminder.kind == ReminderKind.DEADLINE.value and reminder.deadline_at_utc is not None:
+        deadline_local = from_utc_to_user(reminder.deadline_at_utc, timezone_name)
+        result += (
+            f"\nДедлайн: {deadline_local.strftime('%d.%m.%Y %H:%M')}"
+            f" ({escape(reminder.schedule_timezone)})"
+        )
+        if reminder.deadline_total_steps:
+            current = (
+                reminder.deadline_current_step_sequence + 1
+                if reminder.deadline_current_step_sequence is not None
+                else reminder.deadline_total_steps
+            )
+            result += f"\nПлан: шаг {current}/{reminder.deadline_total_steps}"
+        if reminder.deadline_current_step_label:
+            result += f"\nСледующая точка: {escape(reminder.deadline_current_step_label)}"
     return result

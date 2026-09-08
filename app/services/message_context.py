@@ -16,6 +16,7 @@ from app.db.models import Reminder, ReminderContext
 from app.db.session import SessionLocal
 from app.services.reminder_parser import (
     ClarificationRequest,
+    DeadlineRequest,
     ParsedReminder,
     parse_clarification_answer,
     parse_reminder_input,
@@ -724,11 +725,11 @@ def parse_context_reminder_input(
     raw_text: str,
     *,
     now_local: datetime,
-) -> ParsedReminder | ClarificationRequest | None:
+) -> ParsedReminder | DeadlineRequest | ClarificationRequest | None:
     candidate = _context_candidate(raw_text)
     if candidate:
         parsed = parse_reminder_input(candidate, now_local=now_local)
-        if isinstance(parsed, ParsedReminder):
+        if isinstance(parsed, (ParsedReminder, DeadlineRequest)):
             return parsed
     return parse_reminder_input(raw_text, now_local=now_local)
 

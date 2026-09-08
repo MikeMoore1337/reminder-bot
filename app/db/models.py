@@ -58,6 +58,26 @@ class ReminderMode(StrEnum):
     IMPORTANT = "persistent"
 
 
+class ReminderKind(StrEnum):
+    ORDINARY = "ordinary"
+    DEADLINE = "deadline"
+
+
+class DeadlinePlanState(StrEnum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    DISABLED = "disabled"
+    CANCELLED = "cancelled"
+    EXHAUSTED = "exhausted"
+
+
+class DeadlineStepState(StrEnum):
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -90,6 +110,9 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     voice_reminder_drafts: Mapped[list[VoiceReminderDraft]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    deadline_reminder_drafts: Mapped[list[DeadlineReminderDraft]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -167,6 +190,17 @@ class Reminder(Base):
         DateTime(timezone=True), nullable=True
     )
     context_kind: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ReminderKind.ORDINARY.value
+    )
+    deadline_at_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deadline_plan_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    deadline_plan_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deadline_current_step_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    deadline_current_step_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    deadline_current_step_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    deadline_total_steps: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deadline_overdue_after_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default=ReminderMode.NORMAL.value)
     persistent_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     persistent_max_deliveries: Mapped[int] = mapped_column(Integer, nullable=False, default=6)
@@ -209,6 +243,12 @@ class Reminder(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    deadline_plan: Mapped[ReminderDeadlinePlan | None] = relationship(
+        "ReminderDeadlinePlan",
+        back_populates="reminder",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
 
 class ReminderOccurrence(Base):
@@ -242,11 +282,102 @@ class ReminderOccurrence(Base):
     snoozed_until_utc: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    deadline_step_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reminder_deadline_steps.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     reminder: Mapped[Reminder] = relationship(back_populates="occurrences")
+
+
+class ReminderDeadlinePlan(Base):
+    """Persisted, bounded escalation plan attached to one deadline reminder."""
+
+    __tablename__ = "reminder_deadline_plans"
+    __table_args__ = (
+        UniqueConstraint("reminder_id", name="uq_reminder_deadline_plans_reminder_id"),
+        Index("ix_reminder_deadline_plans_user_chat_state", "user_id", "chat_id", "state"),
+        Index("ix_reminder_deadline_plans_deadline_at_utc", "deadline_at_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    deadline_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schedule_timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=DeadlinePlanState.ACTIVE.value
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    current_step_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_steps: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    overdue_after_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    reminder: Mapped[Reminder] = relationship(back_populates="deadline_plan")
+    steps: Mapped[list[ReminderDeadlineStep]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan"
+    )
+
+
+class ReminderDeadlineStep(Base):
+    """One idempotently persisted delivery point in a deadline plan revision."""
+
+    __tablename__ = "reminder_deadline_steps"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_id",
+            "revision",
+            "sequence",
+            name="uq_reminder_deadline_steps_plan_revision_sequence",
+        ),
+        Index(
+            "ix_reminder_deadline_steps_plan_revision_state_at",
+            "plan_id",
+            "revision",
+            "state",
+            "scheduled_at_utc",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("reminder_deadline_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    code: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    scheduled_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=DeadlineStepState.PENDING.value
+    )
+    skip_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    plan: Mapped[ReminderDeadlinePlan] = relationship(back_populates="steps")
 
 
 class ReminderContext(Base):
@@ -399,3 +530,37 @@ class ReminderClarification(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     user: Mapped[User] = relationship(back_populates="reminder_clarifications")
+
+
+class DeadlineReminderDraft(Base):
+    """Restart-safe confirmation draft for a deadline reminder and its plan."""
+
+    __tablename__ = "deadline_reminder_drafts"
+    __table_args__ = (
+        Index("uq_deadline_reminder_drafts_user_chat", "user_id", "chat_id", unique=True),
+        Index("ix_deadline_reminder_drafts_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    reminder_text: Mapped[str] = mapped_column(Text, nullable=False)
+    deadline_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schedule_timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    point_codes_json: Mapped[str] = mapped_column(Text, nullable=False)
+    overdue_after_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_json: Mapped[str] = mapped_column(Text, nullable=False)
+    context_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    preview_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    user: Mapped[User] = relationship(back_populates="deadline_reminder_drafts")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime
 from html import escape
 
@@ -15,7 +16,8 @@ from app.callbacks import (
     ReminderCallback,
     parse_callback,
 )
-from app.db.models import Reminder, User, VoiceReminderDraft
+from app.db.models import Reminder, ReminderKind, User, VoiceReminderDraft
+from app.keyboards.deadline import deadline_draft_kb
 from app.keyboards.voice import voice_draft_kb
 from app.services import reminder_service
 from app.services.clarification_service import (
@@ -24,6 +26,17 @@ from app.services.clarification_service import (
     consume_clarification_and_create_reminder,
     create_clarification,
     get_active_clarification,
+)
+from app.services.deadline_service import (
+    bind_deadline_preview_message,
+    cancel_deadline_reminder_draft,
+    confirm_deadline_draft,
+    create_deadline_draft,
+    disable_deadline_plan,
+    discard_deadline_draft,
+    edit_deadline_plan,
+    enable_deadline_plan,
+    format_deadline_draft_preview,
 )
 from app.services.message_context import (
     MessageContextSnapshot,
@@ -38,8 +51,10 @@ from app.services.message_context import (
 )
 from app.services.reminder_parser import (
     ClarificationRequest,
+    DeadlineRequest,
     ParsedReminder,
     parse_clarification_answer,
+    parse_deadline_input,
     parse_reminder_input,
 )
 from app.services.reminder_service import (
@@ -142,6 +157,12 @@ def _saved_reminder_response(
         f"Текст: {escape(reminder.text)}\n"
         f"Часовой пояс: {escape(user.timezone)}"
     )
+    if reminder.kind == ReminderKind.DEADLINE.value and reminder.deadline_at_utc is not None:
+        deadline_local = from_utc_to_user(reminder.deadline_at_utc, user.timezone)
+        response += (
+            f"\nДедлайн: {deadline_local.strftime('%d.%m.%Y %H:%M')}"
+            f" ({escape(reminder.schedule_timezone)})"
+        )
     if context is not None:
         response += f"\n\n{escape(format_context_for_delivery(context))}"
     return response
@@ -171,6 +192,40 @@ async def _create_and_answer(
         if context is not None
         else parse_reminder_input(raw_text, now_local=now_local)
     )
+    if isinstance(parsed, DeadlineRequest):
+        if context is not None and parsed.text == "__telegram_context__":
+            parsed = replace(parsed, text=context_reminder_text(context))
+        await cancel_active_action_drafts(user)
+        await cancel_clarification(user)
+        await cancel_voice_reminder_draft(user)
+        try:
+            draft = await create_deadline_draft(
+                user,
+                parsed,
+                raw_text=raw_text,
+                source_message_id=message.message_id,
+                context=context,
+            )
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        sent = await message.answer(
+            format_deadline_draft_preview(draft),
+            reply_markup=deadline_draft_kb(draft.id, draft.action_revision),
+            parse_mode="HTML",
+        )
+        preview_message_id = getattr(sent, "message_id", None)
+        if not isinstance(preview_message_id, int) or preview_message_id <= 0:
+            return
+        bound = await bind_deadline_preview_message(
+            user,
+            draft.id,
+            revision=draft.action_revision,
+            message_id=preview_message_id,
+        )
+        if not bound:
+            await _safe_remove_keyboard(sent)
+        return
     if isinstance(parsed, ClarificationRequest):
         await create_clarification(user, parsed, context_snapshot=context)
         await message.answer(
@@ -323,6 +378,43 @@ async def _handle_action_draft(message: Message, user: User) -> bool:
             await message.answer(f"Отложено до {local_dt.strftime('%d.%m.%Y %H:%M')}")
         return True
 
+    if draft.action_type == "deadline_edit":
+        parsed = parse_deadline_input(
+            raw_value,
+            now_local=now_in_timezone(user.timezone),
+        )
+        if isinstance(parsed, ClarificationRequest):
+            await message.answer(parsed.prompt)
+            return True
+        if not isinstance(parsed, DeadlineRequest):
+            await message.answer(
+                "Не понял новый план. Пример: /deadline 2026-09-10 18:00 "
+                "оплатить счёт | за день, за час, в срок"
+            )
+            return True
+        payload = reminder_service._payload_dict(draft.payload)
+        expected_occurrence_id = draft.expected_occurrence_id
+        if expected_occurrence_id is None:
+            value = payload.get("occurrence_id")
+            if isinstance(value, int):
+                expected_occurrence_id = value
+        try:
+            reminder = await edit_deadline_plan(
+                user,
+                draft.reminder_id,
+                parsed,
+                expected_revision=draft.expected_action_revision,
+                expected_occurrence_id=expected_occurrence_id,
+                expected_occurrence_at_utc=draft.expected_occurrence_at_utc,
+                expected_message_id=draft.expected_message_id,
+            )
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return True
+        await reminder_service.delete_action_draft(user, draft.id)
+        await message.answer("План дедлайна изменён" if reminder is not None else STALE_FEEDBACK)
+        return True
+
     if draft.action_type != "edit":
         return False
 
@@ -345,10 +437,10 @@ async def _handle_action_draft(message: Message, user: User) -> bool:
         return True
 
     if draft.current_step == "schedule":
-        parsed = parse_edit_schedule(raw_value, now_local=now_in_timezone(user.timezone))
+        parsed_schedule = parse_edit_schedule(raw_value, now_local=now_in_timezone(user.timezone))
         if (
             raw_value.lower() not in {"без изменений", "без изменения", "оставить"}
-            and parsed is None
+            and parsed_schedule is None
         ):
             await message.answer(
                 "Не понял расписание. Пример: 2026-09-08 18:00 или «каждый день в 9»."
@@ -358,15 +450,21 @@ async def _handle_action_draft(message: Message, user: User) -> bool:
             reminder = await apply_edit_draft(
                 user,
                 draft,
-                local_dt=parsed.local_dt if parsed is not None else None,
-                recurrence_type=parsed.recurrence_type if parsed is not None else None,
-                recurrence_interval=parsed.recurrence_interval if parsed is not None else None,
-                datetime_semantics=parsed.datetime_semantics
-                if parsed is not None
+                local_dt=parsed_schedule.local_dt if parsed_schedule is not None else None,
+                recurrence_type=parsed_schedule.recurrence_type
+                if parsed_schedule is not None
+                else None,
+                recurrence_interval=parsed_schedule.recurrence_interval
+                if parsed_schedule is not None
+                else None,
+                datetime_semantics=parsed_schedule.datetime_semantics
+                if parsed_schedule is not None
                 else "wall_clock",
-                recurrence_rule=parsed.recurrence_rule if parsed is not None else None,
-                recurrence_day_of_month=parsed.recurrence_day_of_month
-                if parsed is not None
+                recurrence_rule=parsed_schedule.recurrence_rule
+                if parsed_schedule is not None
+                else None,
+                recurrence_day_of_month=parsed_schedule.recurrence_day_of_month
+                if parsed_schedule is not None
                 else None,
             )
         except ValueError as exc:
@@ -397,9 +495,10 @@ async def cmd_cancel(message: Message) -> None:
         cancelled_actions = await cancel_active_action_drafts(user)
         cancelled_clarification = await cancel_clarification(user)
         cancelled_voice = await cancel_voice_reminder_draft(user)
+        cancelled_deadline = await cancel_deadline_reminder_draft(user)
         await message.answer(
             "Текущий сценарий отменён"
-            if cancelled_actions or cancelled_clarification or cancelled_voice
+            if cancelled_actions or cancelled_clarification or cancelled_voice or cancelled_deadline
             else "Нет активного сценария"
         )
         return
@@ -510,6 +609,59 @@ async def _handle_voice_callback(callback: CallbackQuery, parsed: ReminderCallba
         await _safe_remove_keyboard(callback_message)
 
 
+async def _handle_deadline_callback(callback: CallbackQuery, parsed: ReminderCallback) -> None:
+    if parsed.origin != CallbackOrigin.DEADLINE or parsed.action not in {
+        CallbackAction.CREATE,
+        CallbackAction.CANCEL,
+    }:
+        await callback.answer(STALE_FEEDBACK, show_alert=False)
+        return
+    if not isinstance(callback.message, Message) or callback.from_user is None:
+        await callback.answer(STALE_FEEDBACK, show_alert=False)
+        return
+
+    callback_message = callback.message
+    user = await get_or_create_user(
+        telegram_user_id=callback.from_user.id,
+        chat_id=callback_message.chat.id,
+    )
+    if parsed.action == CallbackAction.CREATE:
+        try:
+            reminder = await confirm_deadline_draft(
+                user,
+                parsed.target_id,
+                expected_revision=parsed.revision,
+                expected_message_id=callback_message.message_id,
+            )
+        except ValueError as exc:
+            await callback.answer("Не удалось сохранить", show_alert=False)
+            await callback_message.answer(str(exc))
+            return
+        if reminder is None:
+            await callback.answer(STALE_FEEDBACK, show_alert=False)
+            return
+        await callback.answer("План сохранён", show_alert=False)
+        await _safe_remove_keyboard(callback_message)
+        await callback_message.answer(
+            _saved_reminder_response(
+                reminder,
+                user,
+                prefix="Напоминание с планом дедлайна сохранено.",
+            )
+        )
+        return
+
+    cancelled = await discard_deadline_draft(
+        user,
+        parsed.target_id,
+        expected_revision=parsed.revision,
+        expected_message_id=callback_message.message_id,
+    )
+    await callback.answer("Черновик отменён" if cancelled else STALE_FEEDBACK, show_alert=False)
+    if cancelled:
+        await _safe_remove_keyboard(callback_message)
+
+
 @router.message(F.voice)
 async def voice_reminder_handler(message: Message, bot: Bot) -> None:
     ids = _message_ids(message)
@@ -579,6 +731,9 @@ async def reminder_callback(callback: CallbackQuery) -> None:
 
     if parsed.target == CallbackTarget.VOICE_DRAFT:
         await _handle_voice_callback(callback, parsed)
+        return
+    if parsed.target == CallbackTarget.DEADLINE_DRAFT:
+        await _handle_deadline_callback(callback, parsed)
         return
 
     if not isinstance(callback.message, Message):
@@ -702,6 +857,32 @@ async def reminder_callback(callback: CallbackQuery) -> None:
 
     if parsed.action == CallbackAction.EDIT:
         payload = {"occurrence_id": occurrence_id} if occurrence_id is not None else {}
+        target_reminder = await get_owned_reminder(user, reminder_id)
+        if target_reminder is None:
+            await callback.answer(STALE_FEEDBACK, show_alert=False)
+            return
+        if target_reminder.kind == ReminderKind.DEADLINE.value:
+            draft = await create_action_draft(
+                user,
+                reminder_id,
+                action_type="deadline_edit",
+                expected_action_revision=parsed.revision,
+                expected_occurrence_at_utc=occurrence_at_utc,
+                expected_message_id=expected_message_id,
+                expected_occurrence_id=occurrence_id,
+                current_step="command",
+                payload=payload,
+            )
+            if draft is None:
+                await callback.answer(STALE_FEEDBACK, show_alert=False)
+                return
+            await callback.answer("Жду новый план", show_alert=False)
+            await _safe_remove_keyboard(callback_message)
+            await callback_message.answer(
+                "Отправь новую команду, например: /deadline 2026-09-10 18:00 "
+                "оплатить счёт | за день, за час, в срок\nДля отмены: /cancel"
+            )
+            return
         draft = await create_action_draft(
             user,
             reminder_id,
@@ -722,6 +903,40 @@ async def reminder_callback(callback: CallbackQuery) -> None:
             "Отправь новый текст напоминания. Следующим сообщением можно будет изменить время.\n"
             "Для отмены: /cancel"
         )
+        return
+
+    if parsed.action == CallbackAction.DEADLINE_DISABLE:
+        disabled = await disable_deadline_plan(
+            user,
+            reminder_id,
+            expected_revision=parsed.revision,
+            expected_occurrence_id=occurrence_id,
+            expected_occurrence_at_utc=occurrence_at_utc,
+            expected_message_id=expected_message_id,
+        )
+        await callback.answer(
+            "План отключён" if disabled else STALE_FEEDBACK,
+            show_alert=False,
+        )
+        if disabled:
+            await _safe_remove_keyboard(callback_message)
+        return
+
+    if parsed.action == CallbackAction.DEADLINE_ENABLE:
+        enabled = await enable_deadline_plan(
+            user,
+            reminder_id,
+            expected_revision=parsed.revision,
+            expected_occurrence_id=occurrence_id,
+            expected_occurrence_at_utc=occurrence_at_utc,
+            expected_message_id=expected_message_id,
+        )
+        await callback.answer(
+            "План включён" if enabled else STALE_FEEDBACK,
+            show_alert=False,
+        )
+        if enabled:
+            await _safe_remove_keyboard(callback_message)
         return
 
     if parsed.action == CallbackAction.PAUSE:

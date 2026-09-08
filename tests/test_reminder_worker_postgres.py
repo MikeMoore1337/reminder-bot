@@ -11,17 +11,28 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.db.base import Base
 from app.db.models import (
     ActionDraft,
+    DeadlinePlanState,
+    DeadlineStepState,
     OccurrenceState,
     RecurrenceType,
     Reminder,
     ReminderClarification,
     ReminderContext,
+    ReminderDeadlinePlan,
+    ReminderDeadlineStep,
+    ReminderKind,
     ReminderOccurrence,
     ReminderState,
     User,
     VoiceReminderDraft,
 )
-from app.services import clarification_service, message_context, reminder_service, voice_service
+from app.services import (
+    clarification_service,
+    deadline_service,
+    message_context,
+    reminder_service,
+    voice_service,
+)
 from app.services.message_context import (
     ContextKind,
     MessageContextSnapshot,
@@ -30,6 +41,7 @@ from app.services.message_context import (
 )
 from app.services.reminder_parser import (
     ClarificationRequest,
+    DeadlineRequest,
     ParsedReminder,
     parse_clarification_answer,
     parse_reminder_input,
@@ -69,6 +81,7 @@ async def _with_postgres(monkeypatch, scenario) -> None:
 
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         monkeypatch.setattr(worker, "SessionLocal", session_factory)
+        monkeypatch.setattr(deadline_service, "SessionLocal", session_factory)
         monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
         monkeypatch.setattr(clarification_service, "SessionLocal", session_factory)
         monkeypatch.setattr(message_context, "SessionLocal", session_factory)
@@ -179,6 +192,86 @@ def test_postgres_workers_cannot_claim_one_occurrence_concurrently(monkeypatch) 
         saved = await _get_reminder(session_factory, reminder_id)
         assert saved.status == "processing"
         assert saved.lease_token == claimed[0].lease_token
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
+
+
+def test_postgres_deadline_claim_and_progress_are_concurrency_safe(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now = datetime(2026, 9, 7, 7, 0, tzinfo=UTC)
+        user = await _insert_user(session_factory, telegram_user_id=5020, chat_id=6020)
+        request = DeadlineRequest(
+            local_dt=datetime(2026, 9, 7, 12, 0),
+            text="проверить оплату",
+        )
+        draft = await deadline_service.create_deadline_draft(
+            user,
+            request,
+            raw_text="/deadline ...",
+            now_utc=now,
+        )
+        reminder = await deadline_service.confirm_deadline_draft(
+            user,
+            draft.id,
+            expected_revision=draft.action_revision,
+            expected_message_id=8100,
+            now_utc=now,
+        )
+        assert reminder is not None
+        assert reminder.kind == ReminderKind.DEADLINE.value
+        first_at = reminder.remind_at_utc
+
+        first, second = await asyncio.gather(
+            worker.claim_due_reminders(1, now_utc=first_at),
+            worker.claim_due_reminders(1, now_utc=first_at),
+        )
+        assert sorted([len(first), len(second)]) == [0, 1]
+        claimed = first or second
+        assert claimed[0].lease_token
+        claimed_reminder = claimed[0]
+
+        occurrence_id = await reminder_service.prepare_delivery_occurrence(
+            claimed_reminder.id,
+            claimed_reminder.lease_token,
+            now_utc=first_at,
+        )
+        assert occurrence_id is not None
+        assert await reminder_service.set_last_message_id(
+            claimed_reminder.id,
+            8101,
+            lease_token=claimed_reminder.lease_token,
+            occurrence_at_utc=first_at,
+            now_utc=first_at,
+        )
+        assert await worker.finalize_delivery_success(
+            claimed_reminder.id,
+            claimed_reminder.lease_token,
+            now_utc=first_at,
+        )
+
+        async with session_factory() as session:
+            saved = await session.get(Reminder, claimed_reminder.id)
+            assert saved is not None
+            assert saved.state == ReminderState.SCHEDULED.value
+            plan = await session.scalar(
+                select(ReminderDeadlinePlan).where(
+                    ReminderDeadlinePlan.reminder_id == claimed_reminder.id
+                )
+            )
+            assert plan is not None
+            assert plan.state == DeadlinePlanState.ACTIVE.value
+            steps = list(
+                (
+                    await session.scalars(
+                        select(ReminderDeadlineStep)
+                        .where(ReminderDeadlineStep.plan_id == plan.id)
+                        .order_by(ReminderDeadlineStep.sequence)
+                    )
+                ).all()
+            )
+            assert steps[0].state == DeadlineStepState.SKIPPED.value
+            assert steps[1].state == DeadlineStepState.DELIVERED.value
+            assert plan.current_step_sequence == steps[2].sequence
 
     asyncio.run(_with_postgres(monkeypatch, scenario))
 

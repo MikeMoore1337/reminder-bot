@@ -12,6 +12,7 @@ class CallbackTarget(StrEnum):
     REMINDER = "r"
     OCCURRENCE = "o"
     VOICE_DRAFT = "v"
+    DEADLINE_DRAFT = "d"
 
 
 class CallbackOrigin(StrEnum):
@@ -20,6 +21,7 @@ class CallbackOrigin(StrEnum):
     DELIVERY = "d"
     LIST = "l"
     VOICE = "v"
+    DEADLINE = "e"
 
 
 class CallbackAction(StrEnum):
@@ -34,6 +36,8 @@ class CallbackAction(StrEnum):
     PAUSE = "pause"
     RESUME = "resume"
     DISABLE_PERSISTENT = "disable"
+    DEADLINE_DISABLE = "ddis"
+    DEADLINE_ENABLE = "den"
     DELETE = "delete"
     CREATE = "create"
     CANCEL = "cancel"
