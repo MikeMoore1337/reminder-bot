@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     # worker lease longer than the old fixed 60-second digest default.
     digest_lease_duration_seconds: int | None = Field(default=None, ge=1, le=86400)
 
+    # Conditions are deliberately opt-in.  The condition poller is an
+    # extension point and must never change the existing time-reminder worker
+    # when it is not explicitly enabled.
+    condition_worker_enabled: bool = False
+    condition_poll_batch_size: int = Field(default=10, ge=1, le=100)
+    condition_poll_interval_seconds: int = Field(default=300, ge=30, le=86400)
+    condition_request_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    condition_max_response_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
+    condition_retry_base_seconds: int = Field(default=60, ge=1, le=86_400)
+    condition_retry_max_seconds: int = Field(default=3600, ge=1, le=86_400)
+    condition_lease_duration_seconds: int = Field(default=90, ge=2, le=86_400)
+    condition_history_retention_days: int = Field(default=90, ge=1, le=3650)
+
     voice_stt_command: str = "whisper-cli"
     voice_stt_model_path: str | None = None
     voice_stt_language: str = "ru"
@@ -104,6 +117,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "digest_lease_duration_seconds must be greater than "
                 "worker_send_timeout_seconds plus worker_lease_safety_margin_seconds"
+            )
+        if self.condition_retry_max_seconds < self.condition_retry_base_seconds:
+            raise ValueError(
+                "condition_retry_max_seconds must be greater than or equal to "
+                "condition_retry_base_seconds"
+            )
+        if self.condition_lease_duration_seconds <= self.condition_request_timeout_seconds:
+            raise ValueError(
+                "condition_lease_duration_seconds must be greater than "
+                "condition_request_timeout_seconds"
             )
         PersistentPolicy(
             interval_minutes=self.persistent_repeat_interval_minutes,
