@@ -200,9 +200,14 @@ def test_postgres_digest_claim_is_idempotent_under_concurrency(monkeypatch) -> N
         assert sorted(len(batch) for batch in claimed_batches) == [0, 1]
         async with session_factory() as session:
             deliveries = list((await session.scalars(select(ReminderDigestDelivery))).all())
-            assert len(deliveries) == 1
-            assert deliveries[0].state == DigestDeliveryState.PROCESSING.value
-            assert deliveries[0].lease_token
+            assert len(deliveries) == 2
+            processing = [
+                delivery
+                for delivery in deliveries
+                if delivery.state == DigestDeliveryState.PROCESSING.value
+            ]
+            assert len(processing) == 1
+            assert processing[0].lease_token
 
     asyncio.run(_with_postgres(monkeypatch, scenario))
 

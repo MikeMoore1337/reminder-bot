@@ -572,6 +572,8 @@ def test_render_digest_prioritizes_persistent_before_ordinary_budget() -> None:
     )
 
     assert "важное напоминание после длинного списка" in digest
+    assert "Список ограничен безопасным размером сообщения." in digest
+    assert len(digest) <= adaptive_service.DIGEST_MESSAGE_LIMIT
 
 
 def test_process_due_digest_sends_and_finalizes_with_a_bot(monkeypatch) -> None:
@@ -703,6 +705,137 @@ def test_process_due_digest_respects_telegram_retry_after(monkeypatch) -> None:
                     adaptive_service._as_utc(delivery.next_retry_at) - now
                 ).total_seconds() == 42
                 assert delivery.chat_id == user.chat_id
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_process_due_digest_rechecks_opt_in_before_send(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+        monkeypatch.setattr(adaptive_service, "utc_now", lambda: now)
+        monkeypatch.setattr(
+            adaptive_service,
+            "settings",
+            SimpleNamespace(
+                digest_max_items=20,
+                digest_max_delay_minutes=360,
+                digest_morning_time="09:00",
+                digest_evening_time="20:00",
+                digest_quiet_hours_start="22:00",
+                digest_quiet_hours_end="08:00",
+                digest_lease_duration_seconds=60,
+                worker_max_attempts=3,
+                worker_batch_size=10,
+                worker_send_timeout_seconds=1,
+                worker_retry_base_seconds=1,
+                worker_retry_max_seconds=10,
+            ),
+        )
+
+        original_load = adaptive_service._load_digest_owner
+        load_count = 0
+
+        async def load_owner(delivery):
+            nonlocal load_count
+            load_count += 1
+            owner = await original_load(delivery)
+            if load_count == 2 and owner is not None:
+                await set_adaptive_preferences(owner, digests_enabled=False)
+                owner.digests_enabled = False
+            return owner
+
+        monkeypatch.setattr(adaptive_service, "_load_digest_owner", load_owner)
+
+        class GuardedBot:
+            def __init__(self) -> None:
+                self.send_calls = 0
+
+            async def send_message(self, **kwargs):
+                del kwargs
+                self.send_calls += 1
+                return SimpleNamespace(message_id=7003)
+
+        bot = GuardedBot()
+        try:
+            user = await _add_user(session_factory, suggestions=False, digests=True)
+            assert await adaptive_service.process_due_digests(bot, limit=1) == 0
+            assert bot.send_calls == 0
+            async with session_factory() as session:
+                owner = await session.get(User, user.id)
+                deliveries = list((await session.scalars(select(ReminderDigestDelivery))).all())
+                assert owner is not None
+                assert not owner.digests_enabled
+                assert not owner.digest_schedule_seeded
+                assert deliveries
+                assert all(
+                    delivery.state == DigestDeliveryState.SUPPRESSED.value
+                    for delivery in deliveries
+                )
+                assert all(delivery.suppression_reason == "opt_out" for delivery in deliveries)
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_process_due_digest_terminal_telegram_error_disables_future_digests(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+        monkeypatch.setattr(adaptive_service, "utc_now", lambda: now)
+        monkeypatch.setattr(
+            adaptive_service,
+            "settings",
+            SimpleNamespace(
+                digest_max_items=20,
+                digest_max_delay_minutes=360,
+                digest_morning_time="09:00",
+                digest_evening_time="20:00",
+                digest_quiet_hours_start="22:00",
+                digest_quiet_hours_end="08:00",
+                digest_lease_duration_seconds=60,
+                worker_max_attempts=3,
+                worker_batch_size=10,
+                worker_send_timeout_seconds=1,
+                worker_retry_base_seconds=1,
+                worker_retry_max_seconds=10,
+            ),
+        )
+
+        class TelegramForbiddenError(Exception):
+            pass
+
+        class ForbiddenBot:
+            async def send_message(self, **kwargs):
+                del kwargs
+                raise TelegramForbiddenError()
+
+        try:
+            user = await _add_user(session_factory, suggestions=False, digests=True)
+            assert await adaptive_service.process_due_digests(ForbiddenBot(), limit=1) == 0
+            async with session_factory() as session:
+                owner = await session.get(User, user.id)
+                deliveries = list(
+                    (
+                        await session.scalars(
+                            select(ReminderDigestDelivery).order_by(ReminderDigestDelivery.id)
+                        )
+                    ).all()
+                )
+                assert owner is not None
+                assert not owner.digests_enabled
+                assert not owner.digest_schedule_seeded
+                assert [delivery.state for delivery in deliveries] == [
+                    DigestDeliveryState.FAILED.value,
+                    DigestDeliveryState.SUPPRESSED.value,
+                ]
+                assert deliveries[0].error_text == "TelegramForbiddenError"
+                assert deliveries[1].suppression_reason == "terminal_error"
         finally:
             await connection.close()
             await engine.dispose()

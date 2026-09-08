@@ -103,6 +103,11 @@ class DigestDeliveryState(StrEnum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        Index(
+            "ix_users_digests_enabled_schedule_seeded", "digests_enabled", "digest_schedule_seeded"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     telegram_user_id: Mapped[int] = mapped_column(
@@ -124,6 +129,7 @@ class User(Base):
     )
     suggestions_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     digests_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    digest_schedule_seeded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     digest_morning_time: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
     digest_evening_time: Mapped[str] = mapped_column(String(5), nullable=False, default="20:00")
     digest_quiet_hours_start: Mapped[str] = mapped_column(

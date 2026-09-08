@@ -11,7 +11,13 @@ from typing import Any, cast
 from uuid import uuid4
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -55,6 +61,19 @@ DEFAULT_DIGEST_MAX_ITEMS = 20
 DEFAULT_DIGEST_MAX_DELAY_MINUTES = 360
 DEFAULT_DIGEST_LEASE_SECONDS = 60
 DEFAULT_MAX_ATTEMPTS = 3
+DIGEST_MESSAGE_LIMIT = 4096
+DIGEST_TRUNCATION_MARKER = "\nСписок ограничен безопасным размером сообщения."
+TERMINAL_DIGEST_ERROR_TYPES = frozenset(
+    {
+        "TelegramBadRequest",
+        "TelegramForbiddenError",
+        "TelegramNotFound",
+        "TelegramUnauthorizedError",
+    }
+)
+REACTIVATABLE_DIGEST_SUPPRESSION_REASONS = frozenset(
+    {"opt_out", "terminal_error", "profile_changed", "chat_changed"}
+)
 ACTIVE_DIGEST_REMINDER_STATES = (
     ReminderState.SCHEDULED.value,
     ReminderState.DELIVERED.value,
@@ -212,9 +231,12 @@ async def set_adaptive_preferences(
                     )
                 )
         if digests_enabled is not None:
+            now_utc = now_utc or _as_utc(utc_now())
             owner.digests_enabled = digests_enabled
-            if not digests_enabled:
-                now_utc = now_utc or _as_utc(utc_now())
+            if digests_enabled:
+                await _ensure_digest_schedule(session, owner, now_utc=now_utc)
+            else:
+                owner.digest_schedule_seeded = False
                 await session.execute(
                     update(ReminderDigestDelivery)
                     .where(
@@ -926,9 +948,9 @@ def render_digest(
             f"{_state_label(reminder.state)}\n"
             f"   {_escape_bounded(reminder.text, 360)}\n"
         )
-        candidate = "".join(result) + line
-        if len(candidate) > 4096:
-            result.append("\nСписок ограничен безопасным размером сообщения.")
+        current_length = len("".join(result))
+        if current_length + len(line) + len(DIGEST_TRUNCATION_MARKER) > DIGEST_MESSAGE_LIMIT:
+            result.append(DIGEST_TRUNCATION_MARKER)
             break
         result.append(line)
     return "".join(result)
@@ -989,6 +1011,127 @@ async def _create_digest_delivery(
     return True
 
 
+def _digest_slot_for_now(
+    owner: User,
+    period: DigestPeriod,
+    *,
+    now_utc: datetime,
+    next_if_due: bool,
+) -> tuple[date, datetime]:
+    local_now = from_utc_to_user(_as_utc(now_utc), owner.timezone)
+    scheduled_local_time = parse_clock(_digest_time(owner, period), field_name="digest_time")
+    local_date = local_now.date()
+    if next_if_due and local_now.time().replace(tzinfo=None) >= scheduled_local_time:
+        local_date += timedelta(days=1)
+    return local_date, to_utc(
+        datetime.combine(local_date, scheduled_local_time),
+        owner.timezone,
+    )
+
+
+async def _ensure_digest_schedule(
+    session: AsyncSession,
+    owner: User,
+    *,
+    now_utc: datetime,
+    next_if_due: bool = False,
+) -> None:
+    """Keep one current/next slot per period so the worker only scans due rows.
+
+    ``digest_schedule_seeded`` is a durable bootstrap marker for users that
+    were enabled outside the command handler. Once seeded, normal worker polls
+    use the indexed delivery queue and do not walk the whole opt-in population.
+    """
+
+    def reactivate(delivery: ReminderDigestDelivery, scheduled_at_utc: datetime) -> None:
+        delivery.chat_id = owner.chat_id
+        delivery.scheduled_at_utc = scheduled_at_utc
+        delivery.state = DigestDeliveryState.PENDING.value
+        delivery.suppressed_at = None
+        delivery.suppression_reason = None
+        delivery.next_retry_at = None
+        delivery.error_text = None
+        delivery.attempt_count = 0
+        delivery.retry_count = 0
+
+    for period in (DigestPeriod.MORNING, DigestPeriod.EVENING):
+        local_date, scheduled_at_utc = _digest_slot_for_now(
+            owner,
+            period,
+            now_utc=now_utc,
+            next_if_due=next_if_due,
+        )
+        existing = await session.scalar(
+            select(ReminderDigestDelivery)
+            .where(
+                ReminderDigestDelivery.user_id == owner.id,
+                ReminderDigestDelivery.period == period.value,
+                ReminderDigestDelivery.local_date == local_date,
+            )
+            .with_for_update()
+        )
+        if existing is None:
+            await _create_digest_delivery(
+                session,
+                owner=owner,
+                period=period,
+                local_date=local_date,
+                scheduled_at_utc=scheduled_at_utc,
+                state=DigestDeliveryState.PENDING.value,
+                now_utc=now_utc,
+            )
+        elif (
+            existing.state == DigestDeliveryState.SUPPRESSED.value
+            and existing.suppression_reason in REACTIVATABLE_DIGEST_SUPPRESSION_REASONS
+        ):
+            # Re-enabling the feature or changing the delivery profile should
+            # make the withdrawn slot available with the current chat/timezone.
+            reactivate(existing, scheduled_at_utc)
+        elif (
+            existing.state
+            not in {
+                DigestDeliveryState.PENDING.value,
+                DigestDeliveryState.PROCESSING.value,
+            }
+            and not next_if_due
+        ):
+            # A historical SENT/FAILED/SUPPRESSED row is not a schedule for
+            # the next occurrence. This also lets a bounded bootstrap pass
+            # through users that already have today's delivery record.
+            next_local_date, next_scheduled_at_utc = _digest_slot_for_now(
+                owner,
+                period,
+                now_utc=now_utc,
+                next_if_due=True,
+            )
+            if next_local_date != local_date:
+                next_existing = await session.scalar(
+                    select(ReminderDigestDelivery)
+                    .where(
+                        ReminderDigestDelivery.user_id == owner.id,
+                        ReminderDigestDelivery.period == period.value,
+                        ReminderDigestDelivery.local_date == next_local_date,
+                    )
+                    .with_for_update()
+                )
+                if next_existing is None:
+                    await _create_digest_delivery(
+                        session,
+                        owner=owner,
+                        period=period,
+                        local_date=next_local_date,
+                        scheduled_at_utc=next_scheduled_at_utc,
+                        state=DigestDeliveryState.PENDING.value,
+                        now_utc=now_utc,
+                    )
+                elif (
+                    next_existing.state == DigestDeliveryState.SUPPRESSED.value
+                    and next_existing.suppression_reason in REACTIVATABLE_DIGEST_SUPPRESSION_REASONS
+                ):
+                    reactivate(next_existing, next_scheduled_at_utc)
+    owner.digest_schedule_seeded = True
+
+
 async def claim_due_digests(
     limit: int,
     *,
@@ -998,73 +1141,29 @@ async def claim_due_digests(
         return []
     current_time = _as_utc(now_utc or utc_now())
     async with SessionLocal() as session, session.begin():
-        # Walk users with a keyset cursor instead of repeatedly selecting the
-        # same lowest IDs. Existing per-user/date slots are skipped, so a
-        # later user becomes eligible on the same pass once the earlier page
-        # contains no new slots. The page keeps memory bounded; the unique
-        # per-user/date constraint makes concurrent slot creation idempotent.
-        user_page_size = max(limit * 2, limit)
-        last_user_id = 0
-        created_slots = 0
+        # Seeding is bounded and happens once per enabled user. Every normal
+        # poll after that uses the indexed delivery schedule, so an idle
+        # worker does not rescan every digest-enabled user.
+        seed_page_size = max(limit * 2, limit)
+        last_seeded_user_id = 0
         while True:
             users_result = await session.execute(
                 select(User)
-                .where(User.digests_enabled.is_(True), User.id > last_user_id)
+                .where(
+                    User.digests_enabled.is_(True),
+                    User.digest_schedule_seeded.is_(False),
+                    User.id > last_seeded_user_id,
+                )
                 .order_by(User.id.asc())
-                .limit(user_page_size)
+                .with_for_update(skip_locked=True)
+                .limit(seed_page_size)
             )
             owners = list(users_result.scalars())
             if not owners:
                 break
             for owner in owners:
-                last_user_id = owner.id
-                local_now = from_utc_to_user(current_time, owner.timezone)
-                for period in (DigestPeriod.MORNING, DigestPeriod.EVENING):
-                    scheduled_local_time = parse_clock(
-                        _digest_time(owner, period), field_name="digest_time"
-                    )
-                    if local_now.time().replace(tzinfo=None) < scheduled_local_time:
-                        continue
-                    scheduled_at = to_utc(
-                        datetime.combine(local_now.date(), scheduled_local_time), owner.timezone
-                    )
-                    existing = await session.scalar(
-                        select(ReminderDigestDelivery).where(
-                            ReminderDigestDelivery.user_id == owner.id,
-                            ReminderDigestDelivery.period == period.value,
-                            ReminderDigestDelivery.local_date == local_now.date(),
-                        )
-                    )
-                    if existing is not None:
-                        continue
-                    reason = digest_suppression_reason(
-                        owner,
-                        period,
-                        scheduled_at_utc=scheduled_at,
-                        now_utc=current_time,
-                    )
-                    created = await _create_digest_delivery(
-                        session,
-                        owner=owner,
-                        period=period,
-                        local_date=local_now.date(),
-                        scheduled_at_utc=scheduled_at,
-                        state=(
-                            DigestDeliveryState.SUPPRESSED.value
-                            if reason is not None and reason != "not_due"
-                            else DigestDeliveryState.PENDING.value
-                        ),
-                        now_utc=current_time,
-                        suppression_reason=reason if reason != "not_due" else None,
-                    )
-                    if created:
-                        created_slots += 1
-                    if created and reason in {"stale", "quiet_hours"}:
-                        adaptive_metrics.digests_suppressed += 1
-                if created_slots >= limit:
-                    break
-            if created_slots >= limit:
-                break
+                await _ensure_digest_schedule(session, owner, now_utc=current_time)
+            last_seeded_user_id = owners[-1].id
 
         due_filter = and_(
             ReminderDigestDelivery.state == DigestDeliveryState.PENDING.value,
@@ -1121,12 +1220,26 @@ async def claim_due_digests(
                 delivery.lease_token = None
                 delivery.lease_until = None
                 adaptive_metrics.digests_suppressed += 1
+                if digest_owner.digests_enabled:
+                    await _ensure_digest_schedule(
+                        session,
+                        digest_owner,
+                        now_utc=current_time,
+                        next_if_due=True,
+                    )
                 continue
             if delivery.attempt_count >= max_attempts:
                 delivery.state = DigestDeliveryState.FAILED.value
                 delivery.error_text = "attempt_limit_exhausted"
                 delivery.next_retry_at = None
                 adaptive_metrics.digests_failed += 1
+                if digest_owner.digests_enabled:
+                    await _ensure_digest_schedule(
+                        session,
+                        digest_owner,
+                        now_utc=current_time,
+                        next_if_due=True,
+                    )
                 continue
             delivery.state = DigestDeliveryState.PROCESSING.value
             delivery.processing_started_at = current_time
@@ -1167,6 +1280,16 @@ async def finalize_digest_success(
         return False
     current_time = _as_utc(now_utc or utc_now())
     async with SessionLocal() as session, session.begin():
+        delivery_user_id = await session.scalar(
+            select(ReminderDigestDelivery.user_id).where(
+                ReminderDigestDelivery.id == delivery_id,
+            )
+        )
+        if delivery_user_id is None:
+            return False
+        owner = await session.scalar(
+            select(User).where(User.id == delivery_user_id).with_for_update()
+        )
         delivery = await session.scalar(
             select(ReminderDigestDelivery)
             .where(
@@ -1185,6 +1308,46 @@ async def finalize_digest_success(
         delivery.error_text = None
         delivery.retry_count = 0
         _clear_digest_lease(delivery)
+        if owner is not None and owner.digests_enabled:
+            await _ensure_digest_schedule(session, owner, now_utc=current_time, next_if_due=True)
+        elif owner is not None:
+            owner.digest_schedule_seeded = False
+        return True
+
+
+async def suppress_digest_delivery(
+    delivery_id: int,
+    lease_token: str,
+    *,
+    reason: str = "opt_out",
+    now_utc: datetime | None = None,
+) -> bool:
+    """Suppress a claimed digest when its opt-in is withdrawn before send."""
+
+    if not lease_token:
+        return False
+    current_time = _as_utc(now_utc or utc_now())
+    safe_reason = str(reason)[:32] or "suppressed"
+    async with SessionLocal() as session, session.begin():
+        delivery = await session.scalar(
+            select(ReminderDigestDelivery)
+            .where(
+                ReminderDigestDelivery.id == delivery_id,
+                ReminderDigestDelivery.state == DigestDeliveryState.PROCESSING.value,
+                ReminderDigestDelivery.lease_token == lease_token,
+                ReminderDigestDelivery.lease_until > current_time,
+            )
+            .with_for_update()
+        )
+        if delivery is None:
+            return False
+        delivery.state = DigestDeliveryState.SUPPRESSED.value
+        delivery.suppressed_at = current_time
+        delivery.suppression_reason = safe_reason
+        delivery.next_retry_at = None
+        delivery.error_text = None
+        _clear_digest_lease(delivery)
+        adaptive_metrics.digests_suppressed += 1
         return True
 
 
@@ -1194,6 +1357,7 @@ async def finalize_digest_failure(
     error_type: str,
     *,
     retry_after_seconds: int | None = None,
+    terminal: bool = False,
     now_utc: datetime | None = None,
 ) -> bool:
     if not lease_token:
@@ -1201,6 +1365,16 @@ async def finalize_digest_failure(
     current_time = _as_utc(now_utc or utc_now())
     safe_error = str(error_type).split(" ", 1)[0][:80] or "WorkerError"
     async with SessionLocal() as session, session.begin():
+        delivery_user_id = await session.scalar(
+            select(ReminderDigestDelivery.user_id).where(
+                ReminderDigestDelivery.id == delivery_id,
+            )
+        )
+        if delivery_user_id is None:
+            return False
+        owner = await session.scalar(
+            select(User).where(User.id == delivery_user_id).with_for_update()
+        )
         delivery = await session.scalar(
             select(ReminderDigestDelivery)
             .where(
@@ -1217,9 +1391,42 @@ async def finalize_digest_failure(
         delivery.error_text = safe_error
         _clear_digest_lease(delivery)
         max_attempts = _setting_int("worker_max_attempts", DEFAULT_MAX_ATTEMPTS, minimum=1)
+        if terminal:
+            delivery.state = DigestDeliveryState.FAILED.value
+            delivery.next_retry_at = None
+            if owner is not None:
+                owner.digests_enabled = False
+                owner.digest_schedule_seeded = False
+                suppressed_result = cast(
+                    CursorResult[Any],
+                    await session.execute(
+                        update(ReminderDigestDelivery)
+                        .where(
+                            ReminderDigestDelivery.user_id == owner.id,
+                            ReminderDigestDelivery.state == DigestDeliveryState.PENDING.value,
+                        )
+                        .values(
+                            state=DigestDeliveryState.SUPPRESSED.value,
+                            suppressed_at=current_time,
+                            suppression_reason="terminal_error",
+                            next_retry_at=None,
+                            error_text=safe_error,
+                        )
+                    ),
+                )
+                adaptive_metrics.digests_suppressed += int(suppressed_result.rowcount or 0)
+            adaptive_metrics.digests_failed += 1
+            return True
         if delivery.attempt_count >= max_attempts:
             delivery.state = DigestDeliveryState.FAILED.value
             delivery.next_retry_at = None
+            if owner is not None and owner.digests_enabled:
+                await _ensure_digest_schedule(
+                    session,
+                    owner,
+                    now_utc=current_time,
+                    next_if_due=True,
+                )
             adaptive_metrics.digests_failed += 1
             return True
         base_seconds = _setting_int("worker_retry_base_seconds", 10, minimum=1)
@@ -1244,6 +1451,22 @@ def _retry_after_seconds(exc: BaseException) -> int | None:
         return max(0, math.ceil(numeric_value))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _is_terminal_digest_error(exc: BaseException) -> bool:
+    error_type = type(exc).__name__
+    return (
+        isinstance(
+            exc,
+            (
+                TelegramBadRequest,
+                TelegramForbiddenError,
+                TelegramNotFound,
+                TelegramUnauthorizedError,
+            ),
+        )
+        or error_type in TERMINAL_DIGEST_ERROR_TYPES
+    )
 
 
 async def process_due_digests(
@@ -1272,12 +1495,29 @@ async def process_due_digests(
                     "owner_missing",
                 )
                 continue
+            if not owner.digests_enabled:
+                await suppress_digest_delivery(delivery.id, lease_token)
+                continue
             text = await build_digest_text(
                 owner,
                 delivery.period,
                 local_date=delivery.local_date,
                 now_utc=utc_now(),
             )
+            # Re-read the opt-in immediately before the external provider call.
+            # The claim transaction cannot protect this decision across a
+            # network request, so this closes the normal /digest off race.
+            owner = await _load_digest_owner(delivery)
+            if owner is None:
+                await finalize_digest_failure(
+                    delivery.id,
+                    lease_token,
+                    "owner_missing",
+                )
+                continue
+            if not owner.digests_enabled:
+                await suppress_digest_delivery(delivery.id, lease_token)
+                continue
             sent = await asyncio.wait_for(
                 bot.send_message(chat_id=delivery.chat_id, text=text, parse_mode="HTML"),
                 timeout=_setting_int("worker_send_timeout_seconds", 30, minimum=1),
@@ -1296,6 +1536,7 @@ async def process_due_digests(
                 lease_token,
                 type(exc).__name__,
                 retry_after_seconds=_retry_after_seconds(exc),
+                terminal=_is_terminal_digest_error(exc),
             )
             logger.warning(
                 "Digest delivery failed",

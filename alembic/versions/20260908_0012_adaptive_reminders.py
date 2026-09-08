@@ -27,6 +27,10 @@ def upgrade() -> None:
     )
     op.add_column(
         "users",
+        sa.Column("digest_schedule_seeded", sa.Boolean(), nullable=True, server_default=sa.false()),
+    )
+    op.add_column(
+        "users",
         sa.Column(
             "digest_morning_time",
             sa.String(length=5),
@@ -67,6 +71,7 @@ def upgrade() -> None:
             UPDATE users
             SET suggestions_enabled = false,
                 digests_enabled = false,
+                digest_schedule_seeded = false,
                 digest_morning_time = '09:00',
                 digest_evening_time = '20:00',
                 digest_quiet_hours_start = '22:00',
@@ -76,10 +81,16 @@ def upgrade() -> None:
     )
     op.alter_column("users", "suggestions_enabled", nullable=False, server_default=None)
     op.alter_column("users", "digests_enabled", nullable=False, server_default=None)
+    op.alter_column("users", "digest_schedule_seeded", nullable=False, server_default=None)
     op.alter_column("users", "digest_morning_time", nullable=False, server_default=None)
     op.alter_column("users", "digest_evening_time", nullable=False, server_default=None)
     op.alter_column("users", "digest_quiet_hours_start", nullable=False, server_default=None)
     op.alter_column("users", "digest_quiet_hours_end", nullable=False, server_default=None)
+    op.create_index(
+        "ix_users_digests_enabled_schedule_seeded",
+        "users",
+        ["digests_enabled", "digest_schedule_seeded"],
+    )
 
     op.create_table(
         "reminder_snooze_events",
@@ -231,9 +242,11 @@ def downgrade() -> None:
     )
     op.drop_table("reminder_snooze_events")
 
+    op.drop_index("ix_users_digests_enabled_schedule_seeded", table_name="users")
     op.drop_column("users", "digest_quiet_hours_end")
     op.drop_column("users", "digest_quiet_hours_start")
     op.drop_column("users", "digest_evening_time")
     op.drop_column("users", "digest_morning_time")
     op.drop_column("users", "digests_enabled")
+    op.drop_column("users", "digest_schedule_seeded")
     op.drop_column("users", "suggestions_enabled")
