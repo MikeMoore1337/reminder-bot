@@ -286,24 +286,28 @@ async def _send_actionable_reminders(
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject) -> None:
+    payload = (command.args or "").strip()
+    if (
+        payload.startswith(shared_reminder_service.SHARED_INVITE_PREFIX)
+        and getattr(message.chat, "type", None) != "private"
+    ):
+        await message.answer("❌ Приглашение можно принять только в личном чате с ботом.")
+        return
+
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
 
     text = f"{START_TEXT}\n\n🕒 <b>Твой часовой пояс:</b> <code>{timezone_name}</code>"
 
-    payload = (command.args or "").strip()
     if payload.startswith(shared_reminder_service.SHARED_INVITE_PREFIX):
-        if getattr(message.chat, "type", None) != "private":
-            text = "❌ Приглашение можно принять только в личном чате с ботом.\n\n" + text
+        acceptance = await shared_reminder_service.accept_invite(user, payload)
+        if acceptance.accepted:
+            text = "✅ Доступ к общему напоминанию предоставлен. Открой /shared.\n\n" + text
+        elif acceptance.already_member:
+            text = "ℹ️ Ты уже участник этого общего напоминания. Открой /shared.\n\n" + text
         else:
-            acceptance = await shared_reminder_service.accept_invite(user, payload)
-            if acceptance.accepted:
-                text = "✅ Доступ к общему напоминанию предоставлен. Открой /shared.\n\n" + text
-            elif acceptance.already_member:
-                text = "ℹ️ Ты уже участник этого общего напоминания. Открой /shared.\n\n" + text
-            else:
-                text = "❌ Приглашение недействительно, отозвано или истекло.\n\n" + text
+            text = "❌ Приглашение недействительно, отозвано или истекло.\n\n" + text
 
     await message.answer(
         text,

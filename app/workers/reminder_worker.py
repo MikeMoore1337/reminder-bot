@@ -1173,6 +1173,13 @@ async def _process_shared_delivery(
                 had_transient_failure |= recorded and failure.kind == DeliveryErrorKind.TRANSIENT
                 continue
 
+        if not await shared_reminder_service.validate_shared_delivery_before_send(
+            target,
+            reminder_lease_token=lease_token,
+            now_utc=utc_now(),
+        ):
+            continue
+
         try:
             sent = await asyncio.wait_for(
                 _send_delivery(

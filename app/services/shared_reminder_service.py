@@ -1039,6 +1039,78 @@ async def claim_shared_delivery(
         )
 
 
+async def validate_shared_delivery_before_send(
+    target: SharedDeliveryTarget,
+    *,
+    reminder_lease_token: str,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Revalidate a claimed row after other shared state may have changed."""
+
+    if not reminder_lease_token or not target.lease_token:
+        return False
+    current_time = _as_utc(now_utc or utc_now())
+    async with SessionLocal() as session, session.begin():
+        reminder = await session.scalar(
+            select(Reminder)
+            .where(
+                Reminder.id == target.reminder_id,
+                Reminder.status == "processing",
+                Reminder.lease_token == reminder_lease_token,
+                Reminder.lease_until > current_time,
+            )
+            .with_for_update()
+        )
+        if reminder is None:
+            return False
+        occurrence = await session.scalar(
+            select(ReminderOccurrence).where(
+                ReminderOccurrence.id == target.occurrence_id,
+                ReminderOccurrence.reminder_id == reminder.id,
+                ReminderOccurrence.status == OccurrenceState.PROCESSING.value,
+                ReminderOccurrence.action_revision == target.action_revision,
+            )
+        )
+        if occurrence is None:
+            return False
+        delivery = await session.scalar(
+            select(ReminderDelivery)
+            .where(
+                ReminderDelivery.id == target.delivery_id,
+                ReminderDelivery.reminder_id == reminder.id,
+                ReminderDelivery.occurrence_id == occurrence.id,
+                ReminderDelivery.recipient_user_id == target.recipient_user_id,
+                ReminderDelivery.membership_revision == target.membership_revision,
+                ReminderDelivery.action_revision == target.action_revision,
+                ReminderDelivery.chat_id == target.chat_id,
+                ReminderDelivery.state == ReminderDeliveryState.PROCESSING.value,
+                ReminderDelivery.lease_token == target.lease_token,
+                ReminderDelivery.lease_until > current_time,
+            )
+            .with_for_update()
+        )
+        if delivery is None:
+            return False
+
+        is_owner = (
+            delivery.recipient_user_id == reminder.user_id and delivery.membership_revision == 0
+        )
+        if is_owner != target.is_owner:
+            return False
+        if is_owner:
+            return True
+
+        membership = await session.scalar(
+            select(SharedReminderMembership).where(
+                SharedReminderMembership.reminder_id == reminder.id,
+                SharedReminderMembership.user_id == delivery.recipient_user_id,
+                SharedReminderMembership.revision == delivery.membership_revision,
+                SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
+            )
+        )
+        return membership is not None
+
+
 async def record_shared_delivery_success(
     target: SharedDeliveryTarget,
     message_id: int,
