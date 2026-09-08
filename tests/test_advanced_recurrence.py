@@ -158,6 +158,20 @@ def test_repeat_until_is_persisted_in_the_canonical_rule() -> None:
     }
 
 
+def test_russian_repeat_until_takes_precedence_over_deadline_parsing() -> None:
+    parsed = parse_reminder_input(
+        "напомни каждый день в 9 отправить отчёт до 10 сентября",
+        MOSCOW_NOW,
+    )
+
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.text == "отправить отчёт"
+    assert parsed.recurrence_type == "daily"
+    assert parsed.local_dt.replace(tzinfo=None) == datetime(2026, 9, 8, 9, 0)
+    assert parsed.recurrence_rule is not None
+    assert parsed.recurrence_rule["until"] == "2026-09-10"
+
+
 def test_completion_relative_parser_supports_marker_before_or_after_text() -> None:
     before = parse_reminder_input(
         "напомни завтра в 9, через 3 дня после выполнения: отчёт",

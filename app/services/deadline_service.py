@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from html import escape
 from typing import cast
@@ -640,14 +640,29 @@ async def confirm_deadline_draft(
             await session.delete(draft)
             return None
 
-        steps = _deserialize_plan(draft.plan_json)
-        first = next(
-            (step for step in steps if step.state == DeadlineStepState.PENDING.value),
+        steps = list(_deserialize_plan(draft.plan_json))
+        for index, step in enumerate(steps):
+            if (
+                step.state == DeadlineStepState.PENDING.value
+                and _as_utc(step.scheduled_at_utc) <= current_time
+            ):
+                steps[index] = replace(
+                    step,
+                    state=DeadlineStepState.SKIPPED.value,
+                    skip_reason="missed_before_confirmation",
+                )
+        first_index = next(
+            (
+                index
+                for index, step in enumerate(steps)
+                if step.state == DeadlineStepState.PENDING.value
+            ),
             None,
         )
-        if first is None:
+        if first_index is None or _as_utc(draft.deadline_at_utc) <= current_time:
             await session.delete(draft)
             return None
+        first = steps[first_index]
         context = deserialize_context_snapshot(draft.context_snapshot)
         local_first = from_utc_to_user(first.scheduled_at_utc, draft.schedule_timezone).replace(
             tzinfo=None
@@ -671,7 +686,7 @@ async def confirm_deadline_draft(
             schedule_timezone=draft.schedule_timezone,
             state=DeadlinePlanState.ACTIVE.value,
             revision=1,
-            current_step_sequence=steps.index(first),
+            current_step_sequence=first_index,
             total_steps=len(steps),
             overdue_after_minutes=draft.overdue_after_minutes,
         )
@@ -694,7 +709,7 @@ async def confirm_deadline_draft(
         current_row = ReminderDeadlineStep(
             plan_id=plan.id,
             revision=1,
-            sequence=steps.index(first),
+            sequence=first_index,
             code=first.code,
             kind=first.kind,
             label=first.label,
@@ -829,6 +844,36 @@ async def get_current_deadline_step(
     return cast(ReminderDeadlineStep | None, await session.scalar(step_query))
 
 
+async def _get_next_pending_deadline_step(
+    session: AsyncSession,
+    plan: ReminderDeadlinePlan,
+    *,
+    after_sequence: int,
+) -> ReminderDeadlineStep | None:
+    return cast(
+        ReminderDeadlineStep | None,
+        await session.scalar(
+            select(ReminderDeadlineStep)
+            .where(
+                ReminderDeadlineStep.plan_id == plan.id,
+                ReminderDeadlineStep.revision == plan.revision,
+                ReminderDeadlineStep.sequence > after_sequence,
+                ReminderDeadlineStep.state == DeadlineStepState.PENDING.value,
+            )
+            .order_by(ReminderDeadlineStep.sequence.asc())
+            .limit(1)
+            .with_for_update()
+        ),
+    )
+
+
+def _clear_deadline_claim_state(reminder: Reminder) -> None:
+    reminder.processing_started_at = None
+    reminder.lease_until = None
+    reminder.lease_token = None
+    reminder.next_retry_at = None
+
+
 async def reconcile_deadline_for_claim(
     session: AsyncSession,
     reminder: Reminder,
@@ -853,6 +898,29 @@ async def reconcile_deadline_for_claim(
         reminder.snoozed_until_utc = None
         return False
     step = await get_current_deadline_step(session, reminder, for_update=True)
+    skipped_count = 0
+    while step is not None and _as_utc(step.scheduled_at_utc) < _as_utc(now_utc):
+        step.state = DeadlineStepState.SKIPPED.value
+        step.skip_reason = "missed_before_delivery"
+        skipped_count += 1
+        step = await _get_next_pending_deadline_step(
+            session,
+            plan,
+            after_sequence=step.sequence,
+        )
+    if skipped_count:
+        _record_deadline_event(
+            "skipped",
+            reminder_id=reminder.id,
+            plan_revision=plan.revision,
+            count=skipped_count,
+        )
+        _record_deadline_event(
+            "bounded_suppression",
+            reminder_id=reminder.id,
+            plan_revision=plan.revision,
+            count=skipped_count,
+        )
     if step is None:
         plan.state = DeadlinePlanState.EXHAUSTED.value
         plan.stop_reason = "no_pending_steps"
@@ -863,10 +931,20 @@ async def reconcile_deadline_for_claim(
         reminder.delivery_at_utc = None
         reminder.snoozed_until_utc = None
         return False
+    plan.current_step_sequence = step.sequence
     _set_deadline_mirror(reminder, plan, step)
     if _as_utc(reminder.remind_at_utc) != _as_utc(step.scheduled_at_utc):
         reminder.remind_at_utc = step.scheduled_at_utc
         reminder.delivery_at_utc = step.scheduled_at_utc
+    if skipped_count:
+        # The candidate query ran against the old, elapsed timestamp. Commit
+        # the reconciliation first; a later poll may claim only this future
+        # step instead of sending a stale checkpoint immediately.
+        reminder.status = "pending"
+        reminder.state = ReminderState.SCHEDULED.value
+        reminder.snoozed_until_utc = None
+        _clear_deadline_claim_state(reminder)
+        return False
     return True
 
 

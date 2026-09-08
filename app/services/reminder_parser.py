@@ -83,7 +83,10 @@ _TIME_WITH_TAIL_RE = re.compile(
     r"^напомни\s+(.+?)\s+в\s+(\d{1,2})(?::(\d{2}))?\s+(.+)$", re.IGNORECASE
 )
 _UNTIL_RE = re.compile(
-    r"(?:повторять\s+)?до\s+(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})\b",
+    r"(?:повторять\s+)?до\s+("
+    r"\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|"
+    r"\d{1,2}\s+[а-яё]+(?:\s+\d{4})?"
+    r")(?:$|(?=[\s,;:]))",
     re.IGNORECASE,
 )
 _COMPLETION_RE = re.compile(
@@ -215,13 +218,33 @@ def _timezone_name(now_local: datetime) -> str:
     return str(getattr(now_local.tzinfo, "key", None) or "UTC")
 
 
-def _parse_bound(value: str) -> date | None:
+def _parse_bound(value: str, *, default_year: int | None = None) -> date | None:
     for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
         try:
             return datetime.strptime(value, fmt).date()
         except ValueError:
             continue
-    return None
+    parts = " ".join(value.lower().replace("ё", "е").split()).split()
+    if len(parts) not in {2, 3} or not parts[0].isdigit():
+        return None
+    month = next(
+        (month_number for stem, month_number in _DEADLINE_MONTH_STEMS if parts[1].startswith(stem)),
+        None,
+    )
+    if month is None:
+        return None
+    if len(parts) == 3:
+        if not parts[2].isdigit():
+            return None
+        year = int(parts[2])
+    else:
+        if default_year is None:
+            return None
+        year = default_year
+    try:
+        return date(year, month, int(parts[0]))
+    except ValueError:
+        return None
 
 
 _DEADLINE_MONTH_STEMS: tuple[tuple[str, int], ...] = (
@@ -308,11 +331,15 @@ def _parse_deadline_datetime(
     )
 
 
-def _extract_until(value: str) -> tuple[str, date | None, bool]:
+def _extract_until(
+    value: str,
+    *,
+    default_year: int | None = None,
+) -> tuple[str, date | None, bool]:
     match = _UNTIL_RE.search(value)
     if match is None:
         return value, None, False
-    until = _parse_bound(match.group(1))
+    until = _parse_bound(match.group(1), default_year=default_year)
     return f"{value[: match.start()]} {value[match.end() :]}".strip(), until, True
 
 
@@ -494,7 +521,10 @@ def _parse_completion_relative(
             raw_text=text[:MAX_INPUT_LENGTH],
         )
 
-    cleaned_schedule, until, had_until = _extract_until(raw_schedule)
+    cleaned_schedule, until, had_until = _extract_until(
+        raw_schedule,
+        default_year=now_local.year,
+    )
     if had_until and until is None:
         return ClarificationRequest(
             kind="completion_until",
@@ -547,8 +577,14 @@ def _parse_advanced_recurrence(
     if target_time is None:
         return None
 
-    cleaned_prefix, until, had_until = _extract_until(prefix)
-    cleaned_tail, tail_until, tail_had_until = _extract_until(tail)
+    cleaned_prefix, until, had_until = _extract_until(
+        prefix,
+        default_year=now_local.year,
+    )
+    cleaned_tail, tail_until, tail_had_until = _extract_until(
+        tail,
+        default_year=now_local.year,
+    )
     if (had_until and until is None) or (tail_had_until and tail_until is None):
         return ClarificationRequest(
             kind="recurrence_until",
@@ -799,6 +835,10 @@ def _parse_reminder_input(
     if not text or len(text) > MAX_INPUT_LENGTH:
         return None
 
+    advanced = _parse_advanced_recurrence(text, now_local)
+    if advanced is not _NO_MATCH:
+        return advanced if isinstance(advanced, (ParsedReminder, ClarificationRequest)) else None
+
     deadline = _parse_deadline_input(text, now_local)
     if deadline is not _NO_MATCH:
         return (
@@ -873,10 +913,6 @@ def _parse_reminder_input(
             text=reminder_text.strip(),
             datetime_semantics="instant",
         )
-
-    advanced = _parse_advanced_recurrence(text, now_local)
-    if advanced is not _NO_MATCH:
-        return advanced if isinstance(advanced, (ParsedReminder, ClarificationRequest)) else None
 
     m = EVERY_DAY_RE.match(text)
     if m:

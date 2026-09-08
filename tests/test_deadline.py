@@ -213,6 +213,130 @@ def test_deadline_draft_confirm_persists_plan_and_is_restart_safe(monkeypatch) -
     asyncio.run(scenario())
 
 
+def test_deadline_confirmation_skips_steps_elapsed_since_preview(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _open_sqlite(monkeypatch)
+        draft_time = datetime(2026, 9, 9, 14, 55, tzinfo=UTC)
+        confirm_time = datetime(2026, 9, 9, 15, 5, tzinfo=UTC)
+        try:
+            user = await _add_user(session_factory)
+            request = DeadlineRequest(
+                local_dt=datetime(2026, 9, 10, 18, 0),
+                text="оплатить счёт",
+                point_codes=("day_before", "before_deadline", "at_deadline"),
+            )
+            draft = await create_deadline_draft(
+                user,
+                request,
+                raw_text="/deadline ...",
+                now_utc=draft_time,
+            )
+            reminder = await confirm_deadline_draft(
+                user,
+                draft.id,
+                expected_revision=draft.action_revision,
+                expected_message_id=903,
+                now_utc=confirm_time,
+            )
+            assert reminder is not None
+            assert reminder.remind_at_utc == to_utc(
+                datetime(2026, 9, 10, 17, 0),
+                "Europe/Moscow",
+            )
+
+            async with session_factory() as session:
+                plan = await session.scalar(
+                    select(ReminderDeadlinePlan).where(
+                        ReminderDeadlinePlan.reminder_id == reminder.id
+                    )
+                )
+                assert plan is not None
+                steps = list(
+                    (
+                        await session.scalars(
+                            select(ReminderDeadlineStep)
+                            .where(ReminderDeadlineStep.plan_id == plan.id)
+                            .order_by(ReminderDeadlineStep.sequence)
+                        )
+                    ).all()
+                )
+                assert steps[0].state == DeadlineStepState.SKIPPED.value
+                assert steps[0].skip_reason == "missed_before_confirmation"
+                assert steps[1].state == DeadlineStepState.PENDING.value
+                assert plan.current_step_sequence == steps[1].sequence
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_deadline_worker_skips_elapsed_current_step_before_claiming(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _open_sqlite(monkeypatch)
+        start = datetime(2026, 9, 9, 14, 55, tzinfo=UTC)
+        missed_at = datetime(2026, 9, 9, 15, 5, tzinfo=UTC)
+        next_step_at = to_utc(datetime(2026, 9, 10, 17, 0), "Europe/Moscow")
+        try:
+            user = await _add_user(session_factory)
+            request = DeadlineRequest(
+                local_dt=datetime(2026, 9, 10, 18, 0),
+                text="оплатить счёт",
+                point_codes=("day_before", "before_deadline", "at_deadline"),
+            )
+            draft = await create_deadline_draft(
+                user,
+                request,
+                raw_text="/deadline ...",
+                now_utc=start,
+            )
+            reminder = await confirm_deadline_draft(
+                user,
+                draft.id,
+                expected_revision=draft.action_revision,
+                expected_message_id=904,
+                now_utc=start,
+            )
+            assert reminder is not None
+
+            assert await worker.claim_due_reminders(1, now_utc=missed_at) == []
+
+            async with session_factory() as session:
+                saved = await session.get(Reminder, reminder.id)
+                assert saved is not None
+                assert saved.status == "pending"
+                assert saved.state == ReminderState.SCHEDULED.value
+                assert saved.remind_at_utc.replace(tzinfo=UTC) == next_step_at
+                plan = await session.scalar(
+                    select(ReminderDeadlinePlan).where(
+                        ReminderDeadlinePlan.reminder_id == reminder.id
+                    )
+                )
+                assert plan is not None
+                steps = list(
+                    (
+                        await session.scalars(
+                            select(ReminderDeadlineStep)
+                            .where(ReminderDeadlineStep.plan_id == plan.id)
+                            .order_by(ReminderDeadlineStep.sequence)
+                        )
+                    ).all()
+                )
+                assert steps[0].state == DeadlineStepState.SKIPPED.value
+                assert steps[0].skip_reason == "missed_before_delivery"
+                assert steps[1].state == DeadlineStepState.PENDING.value
+                assert plan.current_step_sequence == steps[1].sequence
+
+            claimed = await worker.claim_due_reminders(1, now_utc=next_step_at)
+            assert len(claimed) == 1
+            assert claimed[0].id == reminder.id
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_deadline_worker_advances_one_step_and_done_stops_remaining_plan(monkeypatch) -> None:
     async def scenario() -> None:
         engine, connection, session_factory = await _open_sqlite(monkeypatch)

@@ -2511,7 +2511,10 @@ def format_reminder_for_user(
     if is_persistent_mode(reminder.mode):
         result += f"\nРежим: {escape(format_mode(reminder))}"
     if reminder.kind == ReminderKind.DEADLINE.value and reminder.deadline_at_utc is not None:
-        deadline_local = from_utc_to_user(reminder.deadline_at_utc, timezone_name)
+        deadline_local = from_utc_to_user(
+            reminder.deadline_at_utc,
+            reminder.schedule_timezone,
+        )
         result += (
             f"\nДедлайн: {deadline_local.strftime('%d.%m.%Y %H:%M')}"
             f" ({escape(reminder.schedule_timezone)})"
