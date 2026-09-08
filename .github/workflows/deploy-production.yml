@@ -233,6 +233,9 @@ jobs:
         run: |
           set -euo pipefail
           printf -v remote_command 'REMINDER_BOT_IMAGE=%q bash -s -- %q %q' "reminder-bot:${DEPLOY_SHA}" "${PROD_APP_DIR}" "${DEPLOY_SHA}"
+          remote_log="$(mktemp "${RUNNER_TEMP}/reminder-bot-deploy.XXXXXX.log")"
+          trap 'rm -f -- "${remote_log}"' EXIT
+          set +e
           ssh \
             -i "${HOME}/.ssh/reminder_bot_deploy" \
             -p "${PROD_SSH_PORT}" \
@@ -253,7 +256,22 @@ jobs:
             -o ServerAliveCountMax=3 \
             "${PROD_SSH_USER}@${PROD_SSH_HOST}" \
             "${remote_command}" \
-            < scripts/deploy_production.sh
+            < scripts/deploy_production.sh 2>&1 |
+            tee "${remote_log}"
+          pipeline_statuses=("${PIPESTATUS[@]}")
+          set -e
+          ssh_status="${pipeline_statuses[0]}"
+          tee_status="${pipeline_statuses[1]}"
+          if (( ssh_status != 0 || tee_status != 0 )); then
+            echo "Remote production deploy failed (ssh=${ssh_status}, tee=${tee_status})" >&2
+            exit 1
+          fi
+          expected_verdict="Deployment verdict: ACTIVE ${DEPLOY_SHA}"
+          if ! grep -Fqx -- "${expected_verdict}" "${remote_log}"; then
+            echo "Remote production deploy did not emit exact ACTIVE verdict for ${DEPLOY_SHA}" >&2
+            exit 1
+          fi
+          echo "Verified remote deployment verdict for ${DEPLOY_SHA}"
 
       - name: Remove ephemeral SSH material
         if: ${{ always() }}

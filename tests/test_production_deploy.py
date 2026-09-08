@@ -51,6 +51,24 @@ def _service_block(compose: str, service: str) -> str:
     return "\n".join(lines[start:end])
 
 
+def _workflow_step_script(step_name: str) -> str:
+    lines = WORKFLOW.read_text(encoding="utf-8").splitlines(keepends=True)
+    marker = f"      - name: {step_name}\n"
+    start = lines.index(marker)
+    run_start = lines.index("        run: |\n", start) + 1
+    body = []
+    for line in lines[run_start:]:
+        if line.startswith("      - name:"):
+            break
+        if line.startswith("          "):
+            body.append(line[10:])
+        elif line.strip():
+            raise AssertionError(f"unexpected workflow indentation in {step_name}: {line!r}")
+        else:
+            body.append(line)
+    return "".join(body)
+
+
 def test_production_workflow_is_fail_closed_and_disabled_by_default() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
@@ -86,6 +104,14 @@ def test_production_workflow_is_fail_closed_and_disabled_by_default() -> None:
         "PROD_SSH_KNOWN_HOSTS",
         "PROD_APP_DIR",
         "< scripts/deploy_production.sh",
+        'remote_log="$(mktemp',
+        "trap 'rm -f -- \"${remote_log}\"' EXIT",
+        "2>&1 |",
+        'tee "${remote_log}"',
+        'pipeline_statuses=("${PIPESTATUS[@]}")',
+        'expected_verdict="Deployment verdict: ACTIVE ${DEPLOY_SHA}"',
+        'grep -Fqx -- "${expected_verdict}" "${remote_log}"',
+        "Remote production deploy did not emit exact ACTIVE verdict",
     )
     for fragment in required_fragments:
         assert fragment in workflow
@@ -158,6 +184,9 @@ def test_remote_deploy_script_contains_the_production_safety_contract() -> None:
         "postgres:17",
         "--format=custom",
         "pg_dump",
+        "exec --interactive=false -T db",
+        "exec --interactive=false -T bot",
+        "/dev/null",
         "pre-deploy_",
         'backup_tmp="$(mktemp',
         'mv -f -- "${backup_tmp}"',
@@ -197,6 +226,9 @@ def test_remote_deploy_script_contains_the_production_safety_contract() -> None:
     compose_invocations = re.findall(r"(?m)^compose(?:_tools)?=\(docker compose.*$", script)
     assert compose_invocations
     assert all('-p "${compose_project}"' in invocation for invocation in compose_invocations)
+    assert script.count("exec --interactive=false -T") == 2
+    assert script.count("</dev/null") == 2
+    assert "exec -T" not in script
 
 
 def test_bootstrap_documentation_covers_legacy_env_and_restricted_ssh() -> None:
@@ -393,6 +425,11 @@ if [[ "${1:-}" == "inspect" ]]; then
 fi
 
 if [[ "${1:-}" == "compose" ]]; then
+  if [[ "${CONSUME_UNSAFE_STDIN:-0}" == "1" \
+    && "$*" == *" exec "* \
+    && "$*" != *"--interactive=false"* ]]; then
+    cat >/dev/null
+  fi
   if [[ "$*" == *"config --images"* ]]; then
     printf 'postgres:17\n%s\n%s\n%s\n' "${EXPECTED_IMAGE}" "${EXPECTED_IMAGE}" "${EXPECTED_IMAGE}"
     exit 0
@@ -432,7 +469,7 @@ if [[ "${1:-}" == "compose" ]]; then
     fi
     exit 0
   fi
-  if [[ "$*" == *"exec -T bot"* ]]; then
+  if [[ "$*" == *"exec --interactive=false -T bot"* || "$*" == *"exec -T bot"* ]]; then
     [[ "${READY_FAIL:-0}" != "1" ]] || exit 42
     exit 0
   fi
@@ -490,6 +527,24 @@ def _run_deploy(
     )
 
 
+def _run_streamed_deploy(
+    fixture: tuple[dict[str, Path], str, dict[str, str]],
+    **overrides: str,
+) -> subprocess.CompletedProcess[str]:
+    paths, exact_sha, base_env = fixture
+    env = base_env.copy()
+    env.update(overrides)
+    return subprocess.run(
+        ["bash", "-s", "--", str(paths["app"]), exact_sha],
+        cwd=ROOT,
+        env=env,
+        input=DEPLOY_SCRIPT.read_text(encoding="utf-8"),
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+
 @pytest.mark.skipif(
     not UNIX_DEPLOY_TOOLS, reason="behavioral deployment contract requires Unix bash/flock/git"
 )
@@ -531,6 +586,86 @@ def test_deploy_success_uses_exact_image_project_volume_backup_and_marker(tmp_pa
         for line in calls.splitlines()
         if line.startswith("compose")
     )
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS, reason="behavioral deployment contract requires Unix bash/flock/git"
+)
+def test_streamed_deploy_cannot_be_truncated_by_compose_exec_stdin(tmp_path: Path) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, exact_sha, _ = fixture
+
+    result = _run_streamed_deploy(fixture, CONSUME_UNSAFE_STDIN="1")
+
+    assert result.returncode == 0, result.stderr
+    assert f"Deployment verdict: ACTIVE {exact_sha}" in result.stdout
+    assert (paths["state"] / "deployed-sha").read_text(encoding="utf-8") == f"{exact_sha}\n"
+    calls = paths["calls"].read_text(encoding="utf-8")
+    assert "migrate" in calls
+    assert "bot worker" in calls
+    assert "exec --interactive=false -T db" in calls
+    assert "exec --interactive=false -T bot" in calls
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS, reason="workflow shell contract requires Unix bash/flock/git"
+)
+@pytest.mark.parametrize(
+    ("remote_output", "expected_returncode"),
+    (
+        ("Deployment verdict: ACTIVE {sha}\n", 0),
+        ("remote script exited 0 without a terminal verdict\n", 1),
+        ("Deployment verdict: ACTIVE {other_sha}\n", 1),
+    ),
+)
+def test_workflow_requires_exact_active_verdict(
+    tmp_path: Path, remote_output: str, expected_returncode: int
+) -> None:
+    exact_sha = "a" * 40
+    remote_output = remote_output.format(sha=exact_sha, other_sha="b" * 40)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "cat >/dev/null\n"
+        "printf '%s' \"${FAKE_SSH_OUTPUT}\"\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    runner_home = tmp_path / "home"
+    runner_temp = tmp_path / "runner-temp"
+    runner_home.mkdir()
+    runner_temp.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            "DEPLOY_SHA": exact_sha,
+            "PROD_SSH_HOST": "example.invalid",
+            "PROD_SSH_PORT": "22",
+            "PROD_SSH_USER": "reminder-deploy",
+            "PROD_APP_DIR": "/opt/reminder-bot",
+            "HOME": str(runner_home),
+            "RUNNER_TEMP": str(runner_temp),
+            "FAKE_SSH_OUTPUT": remote_output,
+        }
+    )
+
+    result = _run(
+        ["bash", "-c", _workflow_step_script("Deploy exact protected master SHA")],
+        cwd=ROOT,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode, result.stderr
+    if expected_returncode:
+        assert "did not emit exact ACTIVE verdict" in result.stderr
+    else:
+        assert remote_output in result.stdout
+        assert "Verified remote deployment verdict" in result.stdout
 
 
 @pytest.mark.skipif(
