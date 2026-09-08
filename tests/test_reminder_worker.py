@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -458,6 +459,56 @@ def test_cancel_after_claim_prevents_external_send(monkeypatch) -> None:
             bot = FakeBot()
             assert not await worker.process_claimed_reminder(bot, claimed)
             assert bot.calls == 0
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_context_load_failure_is_retryable_and_does_not_send_without_context(monkeypatch) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def send_message(self, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(message_id=9250)
+
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
+        try:
+            monkeypatch.setattr(worker, "settings", _worker_settings())
+            monkeypatch.setattr(worker, "utc_now", lambda: now)
+            reminder_id = await _insert_reminder(session_factory, now)
+            async with session_factory() as session:
+                await session.execute(
+                    update(Reminder)
+                    .where(Reminder.id == reminder_id)
+                    .values(context_kind="forwarded")
+                )
+                await session.commit()
+
+            claimed = (await worker.claim_due_reminders(1, now_utc=now))[0]
+            context_loader = AsyncMock(side_effect=ConnectionError("database unavailable"))
+            monkeypatch.setattr(worker, "get_context_for_delivery", context_loader)
+
+            bot = FakeBot()
+            assert not await worker.process_claimed_reminder(bot, claimed)
+            assert bot.calls == 0
+            assert context_loader.await_count == 1
+
+            saved = await _get_reminder(session_factory, reminder_id)
+            assert saved.status == "pending"
+            assert saved.state == "scheduled"
+            assert saved.lease_token is None
+            assert saved.lease_until is None
+            assert saved.retry_count == 1
+            assert saved.attempt_count == 1
+            assert saved.next_retry_at is not None
+            assert _utc(saved.next_retry_at) > now
+            assert saved.error_text == "ConnectionError (transient)"
         finally:
             await connection.close()
             await engine.dispose()

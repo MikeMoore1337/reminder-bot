@@ -15,12 +15,19 @@ from app.db.models import (
     RecurrenceType,
     Reminder,
     ReminderClarification,
+    ReminderContext,
     ReminderOccurrence,
     ReminderState,
     User,
     VoiceReminderDraft,
 )
-from app.services import clarification_service, reminder_service, voice_service
+from app.services import clarification_service, message_context, reminder_service, voice_service
+from app.services.message_context import (
+    ContextKind,
+    MessageContextSnapshot,
+    cleanup_expired_reminder_contexts,
+    get_context_for_delivery,
+)
 from app.services.reminder_parser import (
     ClarificationRequest,
     ParsedReminder,
@@ -64,6 +71,7 @@ async def _with_postgres(monkeypatch, scenario) -> None:
         monkeypatch.setattr(worker, "SessionLocal", session_factory)
         monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
         monkeypatch.setattr(clarification_service, "SessionLocal", session_factory)
+        monkeypatch.setattr(message_context, "SessionLocal", session_factory)
         monkeypatch.setattr(voice_service, "SessionLocal", session_factory)
         monkeypatch.setattr(worker, "worker_metrics", worker.WorkerMetrics())
         await scenario(session_factory)
@@ -287,6 +295,68 @@ def test_postgres_concurrent_clarification_answers_create_one_reminder(monkeypat
         assert len(reminders) == 1
         assert reminders[0].text == "позвонить"
         assert clarifications == []
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
+
+
+def test_postgres_message_context_is_scoped_and_ttl_cleanup_keeps_reminder(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now_utc = datetime(2026, 9, 7, 7, 0, tzinfo=UTC)
+        async with session_factory() as session:
+            owner = User(
+                telegram_user_id=8010,
+                chat_id=9010,
+                timezone="Europe/Moscow",
+            )
+            other = User(
+                telegram_user_id=8011,
+                chat_id=9011,
+                timezone="Europe/Moscow",
+            )
+            session.add_all([owner, other])
+            await session.flush()
+            reminder = await reminder_service.create_reminder_in_session(
+                session,
+                owner,
+                datetime(2026, 9, 10, 10, 0),
+                "Прочитать источник",
+                now_utc=now_utc,
+                context=MessageContextSnapshot(
+                    kind=ContextKind.FORWARDED.value,
+                    source_chat_id=-10077,
+                    source_message_id=44,
+                    source_text="Приватный источник",
+                ),
+            )
+            await session.commit()
+
+        restored = await get_context_for_delivery(
+            reminder.id,
+            owner.id,
+            owner.chat_id,
+            now_utc=now_utc,
+        )
+        assert restored is not None
+        assert restored.source_text == "Приватный источник"
+        assert (
+            await get_context_for_delivery(
+                reminder.id,
+                other.id,
+                other.chat_id,
+                now_utc=now_utc,
+            )
+            is None
+        )
+
+        assert (
+            await cleanup_expired_reminder_contexts(
+                now_utc=now_utc + timedelta(days=31),
+            )
+            == 1
+        )
+        async with session_factory() as session:
+            assert await session.get(Reminder, reminder.id) is not None
+            assert await session.scalar(select(ReminderContext)) is None
 
     asyncio.run(_with_postgres(monkeypatch, scenario))
 

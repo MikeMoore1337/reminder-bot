@@ -68,7 +68,14 @@
 - транскрипт проходит тот же детерминированный parser;
 - reminder сохраняется только после явного подтверждения «Создать»;
 - аудио удаляется после обработки, draft хранится в PostgreSQL ограниченное время;
-- настройка модели и CPU-only bootstrap описаны в [docs/voice_reminders.md](docs/voice_reminders.md).
+- настройка модели и CPU-only bootstrap описаны в [docs/voice_reminders.md](docs/voice_reminders.md),
+  а правила контекстных reminders — в [docs/message_context.md](docs/message_context.md).
+
+### 📎 Контекст Telegram
+- reply, forward, пост канала, ссылка, фото и документ сохраняются как bounded snapshot/reference;
+- медиа не скачивается: при наличии `file_id` worker отправляет его через Telegram, иначе использует text fallback;
+- обычный reminder без Telegram-контекста остаётся без дополнительных данных;
+- контекст хранится 30 дней, не логируется raw и удаляется worker-ом по TTL.
 
 ---
 

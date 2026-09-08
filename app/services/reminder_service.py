@@ -18,12 +18,19 @@ from app.db.models import (
     RecurrenceType,
     Reminder,
     ReminderClarification,
+    ReminderContext,
     ReminderOccurrence,
     ReminderState,
     User,
     VoiceReminderDraft,
 )
 from app.db.session import SessionLocal
+from app.services.message_context import (
+    MessageContextSnapshot,
+    context_kind_label,
+    normalize_snapshot,
+    reminder_context_model_kwargs,
+)
 from app.services.recurrence import (
     advance_until_future,
     decode_rule,
@@ -51,6 +58,50 @@ ACTIVE_STATES = (
 )
 FLOW_TTL = timedelta(minutes=15)
 MAX_REMINDER_TEXT_LENGTH = 4096
+
+
+async def _copy_reminder_context(
+    session: AsyncSession,
+    source: Reminder,
+    target: Reminder,
+) -> None:
+    if source.context_kind is None:
+        return
+    source_context = await session.scalar(
+        select(ReminderContext).where(ReminderContext.reminder_id == source.id).with_for_update()
+    )
+    if source_context is None:
+        target.context_kind = source.context_kind
+        return
+    target.context_kind = source_context.kind
+    target_context = await session.scalar(
+        select(ReminderContext).where(ReminderContext.reminder_id == target.id).with_for_update()
+    )
+    if target_context is None:
+        session.add(
+            ReminderContext(
+                reminder_id=target.id,
+                user_id=source_context.user_id,
+                chat_id=source_context.chat_id,
+                kind=source_context.kind,
+                source_chat_id=source_context.source_chat_id,
+                source_chat_username=source_context.source_chat_username,
+                source_message_id=source_context.source_message_id,
+                source_thread_id=source_context.source_thread_id,
+                source_sender_label=source_context.source_sender_label,
+                source_text=source_context.source_text,
+                source_caption=source_context.source_caption,
+                source_url=source_context.source_url,
+                media_kind=source_context.media_kind,
+                media_file_id=source_context.media_file_id,
+                media_file_name=source_context.media_file_name,
+                media_mime_type=source_context.media_mime_type,
+                media_size=source_context.media_size,
+                source_date_utc=source_context.source_date_utc,
+                created_at=source_context.created_at,
+                expires_at=source_context.expires_at,
+            )
+        )
 
 
 @dataclass
@@ -363,6 +414,7 @@ async def create_reminder_in_session(
     *,
     now_utc: datetime | None = None,
     schedule_timezone: str | None = None,
+    context: MessageContextSnapshot | None = None,
 ) -> Reminder:
     timezone_name = schedule_timezone or user.timezone
     canonical_rule: dict[str, Any] | None = None
@@ -435,9 +487,25 @@ async def create_reminder_in_session(
         recurrence_interval=recurrence_interval,
         recurrence_day_of_month=recurrence_day_of_month,
         recurrence_rule=encode_rule(canonical_rule) if canonical_rule is not None else None,
+        context_kind=normalize_snapshot(context).kind if context is not None else None,
     )
     session.add(reminder)
     await session.flush()
+
+    if context is not None:
+        normalized_context = normalize_snapshot(context)
+        session.add(
+            ReminderContext(
+                **reminder_context_model_kwargs(
+                    normalized_context,
+                    reminder_id=reminder.id,
+                    user_id=user.id,
+                    chat_id=user.chat_id,
+                    now_utc=current_time,
+                )
+            )
+        )
+        await session.flush()
 
     logger.info(
         "Created reminder",
@@ -462,6 +530,8 @@ async def create_reminder(
     datetime_semantics: DatetimeSemantics = "wall_clock",
     recurrence_rule: Mapping[str, Any] | str | None = None,
     recurrence_day_of_month: int | None = None,
+    *,
+    context: MessageContextSnapshot | None = None,
 ) -> Reminder:
     async with SessionLocal() as session:
         async with session.begin():
@@ -475,6 +545,7 @@ async def create_reminder(
                 datetime_semantics,
                 recurrence_rule,
                 recurrence_day_of_month,
+                context=context,
             )
         await session.refresh(reminder)
         return reminder
@@ -1199,6 +1270,8 @@ async def snooze_reminder(
                 _clear_delivery_identity(existing)
             reminder.action_revision += 1
             _clear_delivery_identity(reminder)
+            await session.flush()
+            await _copy_reminder_context(session, reminder, existing)
             await session.flush()
             _record_action("snoozed", action="snooze", reminder_id=reminder.id)
             _record_action("action_success", action="snooze", reminder_id=reminder.id)
@@ -2042,10 +2115,13 @@ def format_reminder_for_user(
     display_at_utc: datetime | None = None,
 ) -> str:
     local_dt = from_utc_to_user(display_at_utc or delivery_at_utc(reminder), timezone_name)
-    return (
+    result = (
         f"ID: {reminder.id}\n"
         f"Состояние: {format_state(display_state or reminder.state)}\n"
         f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
         f"Повтор: {format_recurrence(reminder)}\n"
         f"Текст: {escape(reminder.text)}"
     )
+    if reminder.context_kind is not None:
+        result += f"\nКонтекст: {escape(context_kind_label(reminder.context_kind))}"
+    return result

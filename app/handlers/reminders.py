@@ -25,6 +25,17 @@ from app.services.clarification_service import (
     create_clarification,
     get_active_clarification,
 )
+from app.services.message_context import (
+    MessageContextSnapshot,
+    build_context_clarification,
+    context_reminder_text,
+    deserialize_context_snapshot,
+    extract_message_context,
+    format_context_for_delivery,
+    is_contextual_message,
+    parse_context_clarification_answer,
+    parse_context_reminder_input,
+)
 from app.services.reminder_parser import (
     ClarificationRequest,
     ParsedReminder,
@@ -95,7 +106,45 @@ async def _safe_remove_keyboard(message: Message) -> None:
         )
 
 
-async def _create_and_answer(message: Message, *, show_hint: bool = False) -> None:
+def _message_input_text(message: Message) -> str:
+    return (message.text or message.caption or "").strip()
+
+
+def _context_response(context: MessageContextSnapshot) -> str:
+    return (
+        "Контекст сохранён.\n"
+        f"{escape(format_context_for_delivery(context))}\n\n"
+        "Когда напомнить? Например: «завтра в 9» или «через 2 часа»."
+    )
+
+
+def _saved_reminder_response(
+    reminder: Reminder,
+    user: User,
+    *,
+    prefix: str,
+    context: MessageContextSnapshot | None = None,
+) -> str:
+    local_dt = from_utc_to_user(reminder.remind_at_utc, user.timezone)
+    response = (
+        f"{prefix}\n"
+        f"ID: {reminder.id}\n"
+        f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        f"Повтор: {reminder_service.format_recurrence(reminder)}\n"
+        f"Текст: {escape(reminder.text)}\n"
+        f"Часовой пояс: {escape(user.timezone)}"
+    )
+    if context is not None:
+        response += f"\n\n{escape(format_context_for_delivery(context))}"
+    return response
+
+
+async def _create_and_answer(
+    message: Message,
+    *,
+    show_hint: bool = False,
+    context: MessageContextSnapshot | None = None,
+) -> None:
     ids = _message_ids(message)
     if ids is None:
         await message.answer("Не удалось определить пользователя")
@@ -104,19 +153,38 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
     telegram_user_id, chat_id = ids
     user = await get_or_create_user(telegram_user_id=telegram_user_id, chat_id=chat_id)
 
-    raw_text = message.text or ""
+    if context is None and is_contextual_message(message):
+        context = extract_message_context(message)
+
+    raw_text = _message_input_text(message)
     now_local = now_in_timezone(user.timezone)
-    parsed = parse_reminder_input(raw_text, now_local=now_local)
+    parsed = (
+        parse_context_reminder_input(raw_text, now_local=now_local)
+        if context is not None
+        else parse_reminder_input(raw_text, now_local=now_local)
+    )
     if isinstance(parsed, ClarificationRequest):
-        await create_clarification(user, parsed)
-        await message.answer(parsed.prompt)
+        await create_clarification(user, parsed, context_snapshot=context)
+        await message.answer(
+            f"{parsed.prompt}\n\n{escape(format_context_for_delivery(context))}"
+            if context is not None
+            else parsed.prompt
+        )
         return
     if parsed is None:
+        if context is not None:
+            request = build_context_clarification()
+            await create_clarification(user, request, context_snapshot=context)
+            await message.answer(_context_response(context))
+            return
         if show_hint or raw_text.strip().lower().startswith("напомни"):
             await message.answer(REMINDER_FORMAT_HINT)
         return
     if not isinstance(parsed, ParsedReminder):
         return
+
+    if context is not None and parsed.text == "__telegram_context__":
+        parsed.text = context_reminder_text(context)
 
     await cancel_active_action_drafts(user)
     await cancel_clarification(user)
@@ -131,19 +199,19 @@ async def _create_and_answer(message: Message, *, show_hint: bool = False) -> No
             datetime_semantics=parsed.datetime_semantics,
             recurrence_rule=parsed.recurrence_rule,
             recurrence_day_of_month=parsed.recurrence_day_of_month,
+            context=context,
         )
     except ValueError as exc:
         await message.answer(str(exc))
         return
 
-    local_dt = from_utc_to_user(reminder.remind_at_utc, user.timezone)
     await message.answer(
-        "Напоминание сохранено.\n"
-        f"ID: {reminder.id}\n"
-        f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
-        f"Повтор: {reminder_service.format_recurrence(reminder)}\n"
-        f"Текст: {escape(reminder.text)}\n"
-        f"Часовой пояс: {user.timezone}"
+        _saved_reminder_response(
+            reminder,
+            user,
+            prefix="Напоминание сохранено.",
+            context=context,
+        )
     )
 
 
@@ -158,15 +226,27 @@ async def _handle_clarification(
     if clarification is None:
         return False
 
-    raw_value = (message.text or "").strip()
-    parsed = parse_clarification_answer(
-        clarification.raw_text,
-        raw_value,
-        now_local=from_utc_to_user(current_time, user.timezone),
+    raw_value = _message_input_text(message)
+    context = deserialize_context_snapshot(clarification.context_snapshot)
+    parsed = (
+        parse_context_clarification_answer(
+            clarification.raw_text,
+            raw_value,
+            now_local=from_utc_to_user(current_time, user.timezone),
+        )
+        if context is not None
+        else parse_clarification_answer(
+            clarification.raw_text,
+            raw_value,
+            now_local=from_utc_to_user(current_time, user.timezone),
+        )
     )
     if not isinstance(parsed, ParsedReminder):
         await message.answer(clarification.prompt)
         return True
+
+    if context is not None and parsed.text == "__telegram_context__":
+        parsed.text = context_reminder_text(context)
 
     if clarification.origin == CLARIFICATION_ORIGIN_VOICE:
         try:
@@ -202,14 +282,13 @@ async def _handle_clarification(
         await message.answer(CLARIFICATION_STALE_FEEDBACK)
         return True
 
-    local_dt = from_utc_to_user(reminder.remind_at_utc, user.timezone)
     await message.answer(
-        "Напоминание сохранено после уточнения.\n"
-        f"ID: {reminder.id}\n"
-        f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
-        f"Повтор: {reminder_service.format_recurrence(reminder)}\n"
-        f"Текст: {escape(reminder.text)}\n"
-        f"Часовой пояс: {user.timezone}"
+        _saved_reminder_response(
+            reminder,
+            user,
+            prefix="Напоминание сохранено после уточнения.",
+            context=context,
+        )
     )
     return True
 
@@ -682,4 +761,7 @@ async def text_reminder_handler(message: Message) -> None:
             return
         if await _handle_clarification(message, user):
             return
+    if is_contextual_message(message):
+        await _create_and_answer(message, context=extract_message_context(message))
+        return
     await _create_and_answer(message)

@@ -155,6 +155,7 @@ class Reminder(Base):
     source_occurrence_at_utc: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    context_kind: Mapped[str | None] = mapped_column(String(24), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="reminders")
     parent_reminder: Mapped[Reminder | None] = relationship(
@@ -170,6 +171,12 @@ class Reminder(Base):
     )
     occurrences: Mapped[list[ReminderOccurrence]] = relationship(
         back_populates="reminder", cascade="all, delete-orphan"
+    )
+    context: Mapped[ReminderContext | None] = relationship(
+        "ReminderContext",
+        back_populates="reminder",
+        uselist=False,
+        cascade="all, delete-orphan",
     )
 
 
@@ -209,6 +216,45 @@ class ReminderOccurrence(Base):
     )
 
     reminder: Mapped[Reminder] = relationship(back_populates="occurrences")
+
+
+class ReminderContext(Base):
+    """Bounded source snapshot/reference attached to one reminder."""
+
+    __tablename__ = "reminder_contexts"
+    __table_args__ = (
+        UniqueConstraint("reminder_id", name="uq_reminder_contexts_reminder_id"),
+        Index("ix_reminder_contexts_user_chat", "user_id", "chat_id"),
+        Index("ix_reminder_contexts_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    source_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_chat_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_thread_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_sender_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    media_file_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    media_mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    media_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_date_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    reminder: Mapped[Reminder] = relationship(back_populates="context")
 
 
 class ActionDraft(Base):
@@ -307,6 +353,7 @@ class ReminderClarification(Base):
     origin: Mapped[str] = mapped_column(String(16), nullable=False, default="text")
     voice_transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    context_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     clarification_type: Mapped[str] = mapped_column(String(32), nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
