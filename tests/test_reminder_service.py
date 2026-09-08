@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.base import Base
-from app.db.models import RecurrenceType, Reminder, User
+from app.db.models import RecurrenceType, Reminder, ReminderKind, User
 from app.services import reminder_service
 from app.services.reminder_parser import parse_reminder_input
 from app.services.reminder_service import (
@@ -13,6 +13,7 @@ from app.services.reminder_service import (
     build_snooze_state,
     calculate_next_occurrence,
     delivery_at_utc,
+    format_reminder_for_user,
 )
 from app.utils.datetime_utils import to_utc
 
@@ -224,3 +225,21 @@ def test_recurring_reminder_keeps_persisted_timezone_after_profile_change() -> N
     assert profile_timezone == "Europe/Moscow"
     assert reminder.schedule_timezone == "Europe/Helsinki"
     assert next_occurrence == datetime(2026, 3, 29, 6, 0, tzinfo=UTC)
+
+
+def test_deadline_display_uses_persisted_schedule_timezone() -> None:
+    reminder = Reminder(
+        id=42,
+        text="проверить оплату",
+        remind_at_utc=to_utc(datetime(2026, 9, 10, 17, 0), "Europe/Moscow"),
+        delivery_at_utc=to_utc(datetime(2026, 9, 10, 17, 0), "Europe/Moscow"),
+        schedule_timezone="Europe/Moscow",
+        kind=ReminderKind.DEADLINE.value,
+        deadline_at_utc=to_utc(datetime(2026, 9, 10, 18, 0), "Europe/Moscow"),
+        recurrence_type=RecurrenceType.NONE.value,
+        recurrence_interval=1,
+    )
+
+    rendered = format_reminder_for_user(reminder, "Asia/Tokyo")
+
+    assert "Дедлайн: 10.09.2026 18:00 (Europe/Moscow)" in rendered

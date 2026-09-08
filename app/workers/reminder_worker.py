@@ -25,14 +25,22 @@ from sqlalchemy.engine import CursorResult
 from app.callbacks import CallbackAction, CallbackOrigin, CallbackTarget, encode_callback
 from app.config import get_settings
 from app.db.models import (
+    DeadlinePlanState,
     OccurrenceState,
     RecurrenceType,
     Reminder,
+    ReminderKind,
     ReminderOccurrence,
     ReminderState,
     User,
 )
 from app.db.session import SessionLocal
+from app.services.deadline_service import (
+    cleanup_expired_deadline_drafts,
+    finalize_deadline_delivery_failure,
+    finalize_deadline_delivery_success,
+    reconcile_deadline_for_claim,
+)
 from app.services.message_context import (
     MessageContextSnapshot,
     cleanup_expired_reminder_contexts,
@@ -55,7 +63,7 @@ from app.services.reminder_service import (
     set_last_message_id,
 )
 from app.services.voice_service import cleanup_expired_voice_drafts
-from app.utils.datetime_utils import utc_now
+from app.utils.datetime_utils import from_utc_to_user, utc_now
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -114,6 +122,8 @@ def reminder_actions_kb(
     include_snooze: bool = True,
     origin: CallbackOrigin | str = CallbackOrigin.DELIVERY,
     mode: str = "normal",
+    reminder_kind: str = ReminderKind.ORDINARY.value,
+    deadline_plan_state: str | None = None,
 ) -> InlineKeyboardMarkup:
     # Keep the old helper call useful for callers that only want a compact
     # cancellation button. Real delivery cards always pass an occurrence id.
@@ -151,29 +161,39 @@ def reminder_actions_kb(
         )
 
     rows: list[list[InlineKeyboardButton]] = []
+    is_deadline = reminder_kind == ReminderKind.DEADLINE.value
     if state == ReminderState.DELIVERED.value:
         rows.append([button("✅ Готово", CallbackAction.DONE)])
-        if include_snooze:
+        if include_snooze and not is_deadline:
             rows.append([button("⏰ Отложить", CallbackAction.SNOOZE)])
         rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
-        if recurrence_type != RecurrenceType.NONE.value:
+        if recurrence_type != RecurrenceType.NONE.value and not is_deadline:
             rows.append([button("⏸ Пауза", CallbackAction.PAUSE)])
-        if is_persistent_mode(mode):
+        if is_deadline and deadline_plan_state == DeadlinePlanState.ACTIVE.value:
+            rows.append([button("🔕 Выключить план", CallbackAction.DEADLINE_DISABLE)])
+        elif is_deadline and deadline_plan_state == DeadlinePlanState.DISABLED.value:
+            rows.append([button("▶️ Включить план", CallbackAction.DEADLINE_ENABLE)])
+        elif is_persistent_mode(mode):
             rows.append([button("🔕 Выключить повторы", CallbackAction.DISABLE_PERSISTENT)])
         rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
     elif state == ReminderState.PAUSED.value:
-        rows.append([button("▶️ Продолжить", CallbackAction.RESUME)])
+        if is_deadline:
+            rows.append([button("▶️ Включить план", CallbackAction.DEADLINE_ENABLE)])
+        else:
+            rows.append([button("▶️ Продолжить", CallbackAction.RESUME)])
         rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
-        if is_persistent_mode(mode):
+        if not is_deadline and is_persistent_mode(mode):
             rows.append([button("🔕 Выключить повторы", CallbackAction.DISABLE_PERSISTENT)])
         rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
     elif state in {ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value}:
-        if include_snooze:
+        if include_snooze and not is_deadline:
             rows.append([button("⏰ Отложить", CallbackAction.SNOOZE)])
         rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
-        if recurrence_type != RecurrenceType.NONE.value:
+        if recurrence_type != RecurrenceType.NONE.value and not is_deadline:
             rows.append([button("⏸ Пауза", CallbackAction.PAUSE)])
-        if is_persistent_mode(mode):
+        if is_deadline and deadline_plan_state == DeadlinePlanState.ACTIVE.value:
+            rows.append([button("🔕 Выключить план", CallbackAction.DEADLINE_DISABLE)])
+        elif not is_deadline and is_persistent_mode(mode):
             rows.append([button("🔕 Выключить повторы", CallbackAction.DISABLE_PERSISTENT)])
         rows.append([button("🗑 Удалить", CallbackAction.DELETE)])
     else:
@@ -448,6 +468,16 @@ async def claim_due_reminders(
 
         for reminder in candidates:
             if (
+                reminder.kind == ReminderKind.DEADLINE.value
+                and not await reconcile_deadline_for_claim(
+                    session,
+                    reminder,
+                    now_utc=current_time,
+                )
+            ):
+                continue
+
+            if (
                 reminder.parent_reminder_id is not None
                 and reminder.source_occurrence_at_utc is not None
             ):
@@ -502,6 +532,14 @@ async def claim_due_reminders(
 
             was_recovery = reminder.status == "processing"
             if reminder.attempt_count >= settings.worker_max_attempts:
+                if reminder.kind == ReminderKind.DEADLINE.value:
+                    await finalize_deadline_delivery_failure(
+                        session,
+                        reminder,
+                        None,
+                        now_utc=current_time,
+                        terminal=True,
+                    )
                 reminder.status = "failed"
                 reminder.state = ReminderState.FAILED.value
                 reminder.retry_count = max(reminder.retry_count, reminder.attempt_count)
@@ -680,6 +718,18 @@ async def finalize_delivery_success(
         if reminder.last_delivery_occurrence_utc is None:
             reminder.last_delivery_occurrence_utc = current_occurrence
 
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            finalized = await finalize_deadline_delivery_success(
+                session,
+                reminder,
+                occurrence,
+                now_utc=current_time,
+            )
+            if not finalized:
+                return False
+            _clear_processing_state(reminder)
+            return True
+
         if is_persistent_mode(reminder.mode):
             policy = persistent_policy_for_reminder(reminder)
             reminder.persistent_delivery_count += 1
@@ -811,6 +861,14 @@ async def finalize_delivery_failure(
         else:
             occurrence.status = OccurrenceState.FAILED.value
             occurrence.message_id = None
+        if reminder.kind == ReminderKind.DEADLINE.value:
+            await finalize_deadline_delivery_failure(
+                session,
+                reminder,
+                occurrence,
+                now_utc=current_time,
+                terminal=terminal,
+            )
         if terminal:
             reminder.status = "failed"
             reminder.state = ReminderState.FAILED.value
@@ -891,7 +949,34 @@ def _delivery_text(
     *,
     media_unavailable: bool = False,
 ) -> str:
-    if is_persistent_mode(reminder.mode):
+    if reminder.kind == ReminderKind.DEADLINE.value:
+        current_step = (
+            reminder.deadline_current_step_sequence + 1
+            if reminder.deadline_current_step_sequence is not None
+            else None
+        )
+        step_text = (
+            f"Шаг {current_step}/{reminder.deadline_total_steps}: "
+            f"{escape(reminder.deadline_current_step_label or 'защита дедлайна')}"
+            if current_step is not None and reminder.deadline_total_steps
+            else "Точка плана дедлайна"
+        )
+        deadline_text = ""
+        if reminder.deadline_at_utc is not None:
+            deadline_local = from_utc_to_user(
+                reminder.deadline_at_utc,
+                reminder.schedule_timezone,
+            )
+            deadline_text = (
+                f"\nДедлайн: {deadline_local.strftime('%d.%m.%Y %H:%M')} "
+                f"({escape(reminder.schedule_timezone)})"
+            )
+        prefix = (
+            f"⏳ Дедлайн-напоминание\n\n{step_text}{deadline_text}\n\n"
+            "Нажми «Готово», чтобы завершить план. Можно изменить, отключить план "
+            "или удалить напоминание.\n\n"
+        )
+    elif is_persistent_mode(reminder.mode):
         policy = persistent_policy_for_reminder(reminder)
         delivery_count = int(getattr(reminder, "persistent_delivery_count", None) or 0)
         delivery_number = delivery_count + 1
@@ -1074,8 +1159,10 @@ async def process_claimed_reminder(
                     revision=reminder.action_revision,
                     state=ReminderState.DELIVERED.value,
                     recurrence_type=reminder.recurrence_type,
-                    include_snooze=True,
+                    include_snooze=reminder.kind != ReminderKind.DEADLINE.value,
                     mode=reminder.mode,
+                    reminder_kind=reminder.kind,
+                    deadline_plan_state=reminder.deadline_plan_state,
                 ),
             ),
             timeout=settings.worker_send_timeout_seconds,
@@ -1208,6 +1295,7 @@ async def reminder_loop(bot: Bot, stop_event: asyncio.Event | None = None) -> No
             )
         ):
             await cleanup_expired_voice_drafts(now_utc=current_time)
+            await cleanup_expired_deadline_drafts(now_utc=current_time)
             await cleanup_expired_reminder_contexts(now_utc=current_time)
             last_voice_cleanup_at = current_time
         if await _wait_for_stop(stop_event, settings.worker_poll_interval_seconds):

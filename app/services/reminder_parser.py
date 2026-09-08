@@ -43,6 +43,22 @@ REMIND_ISO_RE = re.compile(
     r"^напомни\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})\s+(.+)$",
     flags=re.IGNORECASE,
 )
+_DEADLINE_RE = re.compile(
+    r"^(?P<prefix>/(?:deadline|remind_deadline)|/remind\s+(?:до|дедлайн\w*|deadline)|"
+    r"напомни\s+(?:до|дедлайн\w*|deadline))\s+"
+    r"(?P<date>\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|"
+    r"\d{1,2}\s+[а-яё]+\s+\d{4}|сегодня|завтра)\s+"
+    r"(?:(?:в\s+)?(?P<time>\d{1,2}:\d{2})\s+)?(?P<tail>.+)$",
+    flags=re.IGNORECASE,
+)
+_NATURAL_DEADLINE_RE = re.compile(
+    r"^(?P<task>.+?)\s+(?:до|к)\s+"
+    r"(?P<date>\d{1,2}\.\d{1,2}(?:\.\d{4})?|"
+    r"\d{1,2}\s+[а-яё]+(?:\s+\d{4})?|сегодня|завтра)"
+    r"(?:\s+(?:в|к)\s*)?(?P<time>\d{1,2}:\d{2})?"
+    r"(?:\s*\|\s*(?P<options>.+))?$",
+    flags=re.IGNORECASE,
+)
 
 TODAY_RE = re.compile(r"^напомни\s+сегодня\s+в\s+(\d{1,2})(?::(\d{2}))?\s+(.+)$", re.IGNORECASE)
 TOMORROW_RE = re.compile(r"^напомни\s+завтра\s+в\s+(\d{1,2})(?::(\d{2}))?\s+(.+)$", re.IGNORECASE)
@@ -67,7 +83,10 @@ _TIME_WITH_TAIL_RE = re.compile(
     r"^напомни\s+(.+?)\s+в\s+(\d{1,2})(?::(\d{2}))?\s+(.+)$", re.IGNORECASE
 )
 _UNTIL_RE = re.compile(
-    r"(?:повторять\s+)?до\s+(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})\b",
+    r"(?:повторять\s+)?до\s+("
+    r"\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|"
+    r"\d{1,2}\s+[а-яё]+(?:\s+\d{4})?"
+    r")(?:$|(?=[\s,;:]))",
     re.IGNORECASE,
 )
 _COMPLETION_RE = re.compile(
@@ -152,6 +171,21 @@ class ClarificationRequest:
     mode: str = "normal"
 
 
+DEFAULT_DEADLINE_POINT_CODES = ("day_before", "before_deadline", "at_deadline")
+
+
+@dataclass(frozen=True, slots=True)
+class DeadlineRequest:
+    """A deadline request that must be previewed and explicitly confirmed."""
+
+    local_dt: datetime
+    text: str
+    point_codes: tuple[str, ...] = DEFAULT_DEADLINE_POINT_CODES
+    overdue_after_minutes: int | None = None
+    datetime_semantics: DatetimeSemantics = "wall_clock"
+    mode: str = "normal"
+
+
 def restore_clarification_mode(parsed: ParsedReminder, mode: str) -> ParsedReminder:
     """Keep a persisted persistent-mode request through an ambiguous answer."""
 
@@ -184,20 +218,128 @@ def _timezone_name(now_local: datetime) -> str:
     return str(getattr(now_local.tzinfo, "key", None) or "UTC")
 
 
-def _parse_bound(value: str) -> date | None:
+def _parse_bound(value: str, *, default_year: int | None = None) -> date | None:
     for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
         try:
             return datetime.strptime(value, fmt).date()
         except ValueError:
             continue
-    return None
+    parts = " ".join(value.lower().replace("ё", "е").split()).split()
+    if len(parts) not in {2, 3} or not parts[0].isdigit():
+        return None
+    month = next(
+        (month_number for stem, month_number in _DEADLINE_MONTH_STEMS if parts[1].startswith(stem)),
+        None,
+    )
+    if month is None:
+        return None
+    if len(parts) == 3:
+        if not parts[2].isdigit():
+            return None
+        year = int(parts[2])
+    else:
+        if default_year is None:
+            return None
+        year = default_year
+    try:
+        return date(year, month, int(parts[0]))
+    except ValueError:
+        return None
 
 
-def _extract_until(value: str) -> tuple[str, date | None, bool]:
+_DEADLINE_MONTH_STEMS: tuple[tuple[str, int], ...] = (
+    ("январ", 1),
+    ("феврал", 2),
+    ("март", 3),
+    ("апрел", 4),
+    ("май", 5),
+    ("мая", 5),
+    ("июн", 6),
+    ("июл", 7),
+    ("август", 8),
+    ("сентябр", 9),
+    ("октябр", 10),
+    ("ноябр", 11),
+    ("декабр", 12),
+)
+
+
+def _parse_deadline_datetime(
+    date_part: str,
+    time_part: str | None,
+    *,
+    now_local: datetime,
+) -> datetime | None:
+    normalized_date = date_part.lower().replace("ё", "е")
+    if normalized_date in {"сегодня", "завтра"}:
+        base_date = now_local.date() + timedelta(days=normalized_date == "завтра")
+        return _build_time(
+            datetime.combine(base_date, time.min),
+            *(time_part.split(":") if time_part else ("23", "59")),
+        )
+
+    if "." in date_part:
+        date_parts = date_part.split(".")
+        if len(date_parts) == 2:
+            try:
+                candidate = date(now_local.year, int(date_parts[1]), int(date_parts[0]))
+            except ValueError:
+                return None
+            if candidate < now_local.date():
+                candidate = date(now_local.year + 1, int(date_parts[1]), int(date_parts[0]))
+            base_date = candidate
+        else:
+            parsed_date = _parse_bound(date_part)
+            if parsed_date is None:
+                return None
+            base_date = parsed_date
+        return _build_time(
+            datetime.combine(base_date, time.min),
+            *(time_part.split(":") if time_part else ("23", "59")),
+        )
+    if "-" in date_part:
+        if not time_part:
+            time_part = "23:59"
+        return _parse_datetime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M")
+
+    date_parts = normalized_date.split()
+    if len(date_parts) not in {2, 3} or not date_parts[0].isdigit():
+        return None
+    month = next(
+        (
+            month_number
+            for stem, month_number in _DEADLINE_MONTH_STEMS
+            if date_parts[1].startswith(stem)
+        ),
+        None,
+    )
+    if month is None:
+        return None
+    try:
+        year = int(date_parts[2]) if len(date_parts) == 3 else now_local.year
+        base_date = date(year, month, int(date_parts[0]))
+    except ValueError:
+        return None
+    if len(date_parts) == 2 and base_date < now_local.date():
+        try:
+            base_date = date(year + 1, month, int(date_parts[0]))
+        except ValueError:
+            return None
+    return _build_time(
+        datetime.combine(base_date, time.min),
+        *(time_part.split(":") if time_part else ("23", "59")),
+    )
+
+
+def _extract_until(
+    value: str,
+    *,
+    default_year: int | None = None,
+) -> tuple[str, date | None, bool]:
     match = _UNTIL_RE.search(value)
     if match is None:
         return value, None, False
-    until = _parse_bound(match.group(1))
+    until = _parse_bound(match.group(1), default_year=default_year)
     return f"{value[: match.start()]} {value[match.end() :]}".strip(), until, True
 
 
@@ -379,7 +521,10 @@ def _parse_completion_relative(
             raw_text=text[:MAX_INPUT_LENGTH],
         )
 
-    cleaned_schedule, until, had_until = _extract_until(raw_schedule)
+    cleaned_schedule, until, had_until = _extract_until(
+        raw_schedule,
+        default_year=now_local.year,
+    )
     if had_until and until is None:
         return ClarificationRequest(
             kind="completion_until",
@@ -432,8 +577,14 @@ def _parse_advanced_recurrence(
     if target_time is None:
         return None
 
-    cleaned_prefix, until, had_until = _extract_until(prefix)
-    cleaned_tail, tail_until, tail_had_until = _extract_until(tail)
+    cleaned_prefix, until, had_until = _extract_until(
+        prefix,
+        default_year=now_local.year,
+    )
+    cleaned_tail, tail_until, tail_had_until = _extract_until(
+        tail,
+        default_year=now_local.year,
+    )
     if (had_until and until is None) or (tail_had_until and tail_until is None):
         return ClarificationRequest(
             kind="recurrence_until",
@@ -550,13 +701,151 @@ def _extract_mode_marker(raw_text: str) -> tuple[str, str]:
     return "normal", text
 
 
+def _deadline_policy_request(
+    options: str,
+    *,
+    raw_text: str,
+) -> tuple[tuple[str, ...], int | None] | ClarificationRequest:
+    normalized = " ".join(options.lower().replace("ё", "е").split())
+    if not normalized:
+        return DEFAULT_DEADLINE_POINT_CODES, None
+    if normalized in {"без эскалации", "только дедлайн", "только в срок"}:
+        return ("at_deadline",), None
+
+    codes: list[str] = []
+    overdue_after_minutes: int | None = None
+    segments = [
+        segment.strip() for segment in re.split(r"\s*,\s*|\s+и\s+", normalized) if segment.strip()
+    ]
+    for segment in segments:
+        if re.search(r"за\s+недел\w*|недел\w*\s+до", segment):
+            code = "week_before"
+        elif re.search(r"за\s+день|накануне|день\s+до", segment):
+            code = "day_before"
+        elif re.search(r"утр\w*|утро\s+дедлайна", segment):
+            code = "deadline_morning"
+        elif re.search(r"за\s+час|час\s+до|перед\s+дедлайном", segment):
+            code = "before_deadline"
+        elif re.search(r"в\s+срок|в\s+момент\s+дедлайна|в\s+дедлайн", segment):
+            code = "at_deadline"
+        elif re.search(r"просроч|после\s+(?:срока|дедлайна)", segment):
+            match = re.search(
+                r"через\s+(\d+)\s+(минут\w*|час\w*|дн\w*)",
+                segment,
+            )
+            if match is None:
+                overdue_after_minutes = 60
+            else:
+                count = int(match.group(1))
+                unit = match.group(2)
+                multiplier = 1 if unit.startswith("мин") else 60 if unit.startswith("час") else 1440
+                overdue_after_minutes = count * multiplier
+            code = "overdue"
+        else:
+            return ClarificationRequest(
+                kind="deadline_policy",
+                prompt=(
+                    "Не понял точки защиты дедлайна. Используй после символа |: "
+                    "«за день, за час, в срок» или «за день, в срок, просрочено через час»."
+                ),
+                raw_text=raw_text[:MAX_INPUT_LENGTH],
+            )
+        if code in codes:
+            return ClarificationRequest(
+                kind="deadline_policy",
+                prompt="Каждую точку дедлайна можно указать только один раз. Повтори команду.",
+                raw_text=raw_text[:MAX_INPUT_LENGTH],
+            )
+        codes.append(code)
+
+    if "at_deadline" not in codes:
+        codes.append("at_deadline")
+    return tuple(codes), overdue_after_minutes
+
+
+def _parse_deadline_input(
+    raw_text: str,
+    now_local: datetime,
+) -> DeadlineRequest | ClarificationRequest | object:
+    normalized_text = raw_text.strip()
+    match = _DEADLINE_RE.match(normalized_text)
+    natural_match = None if match is not None else _NATURAL_DEADLINE_RE.match(normalized_text)
+    if match is None and natural_match is None:
+        return _NO_MATCH
+
+    if match is not None:
+        date_part = match.group("date")
+        time_part = match.group("time")
+        tail = match.group("tail").strip()
+    else:
+        assert natural_match is not None
+        date_part = natural_match.group("date")
+        time_part = natural_match.group("time")
+        tail = natural_match.group("task").strip()
+        options_from_match = natural_match.group("options")
+        if options_from_match:
+            tail = f"{tail} | {options_from_match.strip()}"
+        if tail.lower().startswith("напомни "):
+            tail = tail[8:].strip()
+
+    local_dt = _parse_deadline_datetime(date_part, time_part, now_local=now_local)
+    if local_dt is None:
+        return ClarificationRequest(
+            kind="deadline_datetime",
+            prompt="Не смог разобрать дату дедлайна. Укажи её как 2026-09-10 18:00.",
+            raw_text=raw_text[:MAX_INPUT_LENGTH],
+        )
+
+    reminder_text = tail
+    options = ""
+    if "|" in tail:
+        reminder_text, options = (part.strip() for part in tail.split("|", 1))
+    elif ";" in tail:
+        possible_text, possible_options = (part.strip() for part in tail.split(";", 1))
+        if re.search(
+            r"за\s+недел|за\s+день|за\s+час|утр|срок|дедлайн|просроч|после",
+            possible_options,
+            re.IGNORECASE,
+        ):
+            reminder_text, options = possible_text, possible_options
+    if not reminder_text:
+        return ClarificationRequest(
+            kind="deadline_text",
+            prompt="Добавь текст задачи после даты дедлайна. Например: «оплатить VPS». ",
+            raw_text=raw_text[:MAX_INPUT_LENGTH],
+        )
+
+    policy = _deadline_policy_request(options, raw_text=raw_text)
+    if isinstance(policy, ClarificationRequest):
+        return policy
+    point_codes, overdue_after_minutes = policy
+    return DeadlineRequest(
+        local_dt=local_dt,
+        text=reminder_text,
+        point_codes=point_codes,
+        overdue_after_minutes=overdue_after_minutes,
+    )
+
+
 def _parse_reminder_input(
     raw_text: str,
     now_local: datetime,
-) -> ParsedReminder | ClarificationRequest | None:
+) -> ParsedReminder | DeadlineRequest | ClarificationRequest | None:
     text = raw_text.strip()
     if not text or len(text) > MAX_INPUT_LENGTH:
         return None
+
+    advanced = _parse_advanced_recurrence(text, now_local)
+    if advanced is not _NO_MATCH:
+        return advanced if isinstance(advanced, (ParsedReminder, ClarificationRequest)) else None
+
+    deadline = _parse_deadline_input(text, now_local)
+    if deadline is not _NO_MATCH:
+        return (
+            deadline
+            if isinstance(deadline, (ParsedReminder, DeadlineRequest, ClarificationRequest))
+            else None
+        )
 
     completion = _parse_completion_relative(text, now_local)
     if completion is not _NO_MATCH:
@@ -624,10 +913,6 @@ def _parse_reminder_input(
             text=reminder_text.strip(),
             datetime_semantics="instant",
         )
-
-    advanced = _parse_advanced_recurrence(text, now_local)
-    if advanced is not _NO_MATCH:
-        return advanced if isinstance(advanced, (ParsedReminder, ClarificationRequest)) else None
 
     m = EVERY_DAY_RE.match(text)
     if m:
@@ -705,16 +990,31 @@ def _parse_reminder_input(
 def parse_reminder_input(
     raw_text: str,
     now_local: datetime,
-) -> ParsedReminder | ClarificationRequest | None:
+) -> ParsedReminder | DeadlineRequest | ClarificationRequest | None:
     """Parse a reminder and preserve an explicit normal/persistent mode marker."""
 
     mode, normalized_text = _extract_mode_marker(raw_text)
     parsed = _parse_reminder_input(normalized_text, now_local)
     if isinstance(parsed, ParsedReminder):
         parsed.mode = mode
-    elif isinstance(parsed, ClarificationRequest):
+    elif isinstance(parsed, (ClarificationRequest, DeadlineRequest)):
         parsed = replace(parsed, mode=mode)
     return parsed
+
+
+def parse_deadline_input(
+    raw_text: str,
+    now_local: datetime,
+) -> DeadlineRequest | ClarificationRequest | None:
+    """Parse only the explicit deadline syntax used by the confirmation flow."""
+
+    mode, normalized_text = _extract_mode_marker(raw_text)
+    parsed = _parse_deadline_input(normalized_text, now_local)
+    if parsed is _NO_MATCH:
+        return None
+    if isinstance(parsed, (DeadlineRequest, ClarificationRequest)):
+        return replace(parsed, mode=mode)
+    return None
 
 
 def _explicit_answer_datetime(value: str) -> datetime | None:

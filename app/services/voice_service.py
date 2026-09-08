@@ -31,6 +31,7 @@ from app.services.clarification_service import (
 from app.services.recurrence import decode_rule, encode_rule, legacy_rule
 from app.services.reminder_parser import (
     ClarificationRequest,
+    DeadlineRequest,
     ParsedReminder,
     parse_reminder_input,
 )
@@ -213,7 +214,7 @@ def parse_voice_transcript(
     transcript: str,
     *,
     now_local: datetime,
-) -> tuple[str, ParsedReminder | ClarificationRequest | None]:
+) -> tuple[str, ParsedReminder | DeadlineRequest | ClarificationRequest | None]:
     """Use the deterministic parser; adding the command prefix is explicit and bounded."""
 
     for candidate in _voice_parse_candidates(transcript):
