@@ -44,11 +44,18 @@ def _sqlite_setup(monkeypatch):
     return setup
 
 
-async def _add_user(session_factory, *, suggestions: bool = True, digests: bool = False) -> User:
+async def _add_user(
+    session_factory,
+    *,
+    suggestions: bool = True,
+    digests: bool = False,
+    telegram_user_id: int = 1001,
+    chat_id: int = 2002,
+) -> User:
     async with session_factory() as session:
         user = User(
-            telegram_user_id=1001,
-            chat_id=2002,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
             timezone="Europe/Moscow",
             suggestions_enabled=suggestions,
             digests_enabled=digests,
@@ -470,6 +477,103 @@ def test_digest_is_timezone_aware_bounded_idempotent_and_keeps_important(monkeyp
     asyncio.run(scenario())
 
 
+def test_digest_discovery_pages_past_users_with_existing_slots(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+        monkeypatch.setattr(
+            adaptive_service,
+            "settings",
+            SimpleNamespace(
+                digest_max_delay_minutes=360,
+                digest_morning_time="09:00",
+                digest_evening_time="20:00",
+                digest_quiet_hours_start="22:00",
+                digest_quiet_hours_end="08:00",
+                digest_lease_duration_seconds=60,
+                worker_max_attempts=3,
+                worker_send_timeout_seconds=1,
+                worker_lease_safety_margin_seconds=1,
+            ),
+        )
+        try:
+            users = [
+                await _add_user(
+                    session_factory,
+                    suggestions=False,
+                    digests=True,
+                    telegram_user_id=1100 + index,
+                    chat_id=2100 + index,
+                )
+                for index in range(4)
+            ]
+            async with session_factory() as session:
+                for user in users[:2]:
+                    session.add_all(
+                        [
+                            ReminderDigestDelivery(
+                                user_id=user.id,
+                                chat_id=user.chat_id,
+                                period="morning",
+                                local_date=date(2026, 9, 10),
+                                scheduled_at_utc=now,
+                                state=DigestDeliveryState.SENT.value,
+                            ),
+                            ReminderDigestDelivery(
+                                user_id=user.id,
+                                chat_id=user.chat_id,
+                                period="evening",
+                                local_date=date(2026, 9, 10),
+                                scheduled_at_utc=now,
+                                state=DigestDeliveryState.SENT.value,
+                            ),
+                        ]
+                    )
+                await session.commit()
+
+            claimed = await claim_due_digests(1, now_utc=now)
+            assert len(claimed) == 1
+            assert claimed[0].user_id == users[2].id
+            assert claimed[0].period == "morning"
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_render_digest_prioritizes_persistent_before_ordinary_budget() -> None:
+    scheduled = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+    ordinary = [
+        Reminder(
+            id=index,
+            text=f"обычная {index} " + ("x" * 360),
+            remind_at_utc=scheduled + timedelta(minutes=index),
+            delivery_at_utc=scheduled + timedelta(minutes=index),
+            state=ReminderState.SCHEDULED.value,
+            mode="normal",
+        )
+        for index in range(1, 20)
+    ]
+    important = Reminder(
+        id=100,
+        text="важное напоминание после длинного списка",
+        remind_at_utc=scheduled + timedelta(hours=2),
+        delivery_at_utc=scheduled + timedelta(hours=2),
+        state=ReminderState.SCHEDULED.value,
+        mode="persistent",
+    )
+
+    digest = adaptive_service.render_digest(
+        "morning",
+        [*ordinary, important],
+        timezone_name="Europe/Moscow",
+        local_date=date(2026, 9, 10),
+    )
+
+    assert "важное напоминание после длинного списка" in digest
+
+
 def test_process_due_digest_sends_and_finalizes_with_a_bot(monkeypatch) -> None:
     async def scenario() -> None:
         engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
@@ -539,6 +643,66 @@ def test_process_due_digest_sends_and_finalizes_with_a_bot(monkeypatch) -> None:
                 assert delivery is not None
                 assert delivery.state == DigestDeliveryState.SENT.value
                 assert delivery.message_id == 7002
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_process_due_digest_respects_telegram_retry_after(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
+        now = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+        monkeypatch.setattr(adaptive_service, "utc_now", lambda: now)
+        monkeypatch.setattr(
+            adaptive_service,
+            "settings",
+            SimpleNamespace(
+                digest_max_items=20,
+                digest_max_delay_minutes=360,
+                digest_morning_time="09:00",
+                digest_evening_time="20:00",
+                digest_quiet_hours_start="22:00",
+                digest_quiet_hours_end="08:00",
+                digest_lease_duration_seconds=60,
+                worker_max_attempts=3,
+                worker_send_timeout_seconds=1,
+                worker_retry_base_seconds=1,
+                worker_retry_max_seconds=120,
+            ),
+        )
+
+        retry_after_type = type("TelegramRetryAfter", (Exception,), {})
+        retry_after = retry_after_type()
+        retry_after.retry_after = 42
+
+        class RetryAfterBot:
+            async def send_message(
+                self,
+                *,
+                chat_id: int,
+                text: str,
+                parse_mode: str | None = None,
+            ):
+                raise retry_after
+
+        try:
+            user = await _add_user(session_factory, suggestions=False, digests=True)
+            processed = await adaptive_service.process_due_digests(RetryAfterBot(), limit=1)
+            assert processed == 0
+            async with session_factory() as session:
+                delivery = await session.scalar(select(ReminderDigestDelivery))
+                assert delivery is not None
+                assert delivery.state == DigestDeliveryState.PENDING.value
+                assert delivery.attempt_count == 1
+                assert delivery.retry_count == 1
+                assert delivery.error_text == "TelegramRetryAfter"
+                assert delivery.next_retry_at is not None
+                assert (
+                    adaptive_service._as_utc(delivery.next_retry_at) - now
+                ).total_seconds() == 42
+                assert delivery.chat_id == user.chat_id
         finally:
             await connection.close()
             await engine.dispose()

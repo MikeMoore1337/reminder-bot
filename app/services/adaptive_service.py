@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -10,6 +11,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -903,7 +905,18 @@ def render_digest(
     if not reminders:
         return "".join(result) + "Незавершённых напоминаний нет."
     result.append("Незавершённые напоминания:\n")
-    for index, reminder in enumerate(reminders, start=1):
+    # Persistent reminders must get first claim on the bounded Telegram
+    # message budget. Otherwise a long chronological prefix of ordinary
+    # reminders can hide a later important item entirely.
+    persistent_reminders = sorted(
+        (reminder for reminder in reminders if is_persistent_mode(reminder.mode)),
+        key=_digest_sort_key,
+    )
+    ordinary = sorted(
+        (reminder for reminder in reminders if not is_persistent_mode(reminder.mode)),
+        key=_digest_sort_key,
+    )
+    for index, reminder in enumerate((*persistent_reminders, *ordinary), start=1):
         scheduled = reminder.delivery_at_utc or reminder.remind_at_utc
         local_scheduled = from_utc_to_user(_as_utc(scheduled), timezone_name)
         important = "🔔 ВАЖНОЕ · " if is_persistent_mode(reminder.mode) else ""
@@ -985,57 +998,73 @@ async def claim_due_digests(
         return []
     current_time = _as_utc(now_utc or utc_now())
     async with SessionLocal() as session, session.begin():
-        user_limit = max(limit * 2, limit)
-        users_result = await session.execute(
-            select(User)
-            .where(User.digests_enabled.is_(True))
-            .order_by(User.id.asc())
-            .with_for_update(skip_locked=True)
-            .limit(user_limit)
-        )
-        owners = list(users_result.scalars())
-        for owner in owners:
-            local_now = from_utc_to_user(current_time, owner.timezone)
-            for period in (DigestPeriod.MORNING, DigestPeriod.EVENING):
-                scheduled_local_time = parse_clock(
-                    _digest_time(owner, period), field_name="digest_time"
-                )
-                if local_now.time().replace(tzinfo=None) < scheduled_local_time:
-                    continue
-                scheduled_at = to_utc(
-                    datetime.combine(local_now.date(), scheduled_local_time), owner.timezone
-                )
-                existing = await session.scalar(
-                    select(ReminderDigestDelivery).where(
-                        ReminderDigestDelivery.user_id == owner.id,
-                        ReminderDigestDelivery.period == period.value,
-                        ReminderDigestDelivery.local_date == local_now.date(),
+        # Walk users with a keyset cursor instead of repeatedly selecting the
+        # same lowest IDs. Existing per-user/date slots are skipped, so a
+        # later user becomes eligible on the same pass once the earlier page
+        # contains no new slots. The page keeps memory bounded; the unique
+        # per-user/date constraint makes concurrent slot creation idempotent.
+        user_page_size = max(limit * 2, limit)
+        last_user_id = 0
+        created_slots = 0
+        while True:
+            users_result = await session.execute(
+                select(User)
+                .where(User.digests_enabled.is_(True), User.id > last_user_id)
+                .order_by(User.id.asc())
+                .limit(user_page_size)
+            )
+            owners = list(users_result.scalars())
+            if not owners:
+                break
+            for owner in owners:
+                last_user_id = owner.id
+                local_now = from_utc_to_user(current_time, owner.timezone)
+                for period in (DigestPeriod.MORNING, DigestPeriod.EVENING):
+                    scheduled_local_time = parse_clock(
+                        _digest_time(owner, period), field_name="digest_time"
                     )
-                )
-                if existing is not None:
-                    continue
-                reason = digest_suppression_reason(
-                    owner,
-                    period,
-                    scheduled_at_utc=scheduled_at,
-                    now_utc=current_time,
-                )
-                created = await _create_digest_delivery(
-                    session,
-                    owner=owner,
-                    period=period,
-                    local_date=local_now.date(),
-                    scheduled_at_utc=scheduled_at,
-                    state=(
-                        DigestDeliveryState.SUPPRESSED.value
-                        if reason is not None and reason != "not_due"
-                        else DigestDeliveryState.PENDING.value
-                    ),
-                    now_utc=current_time,
-                    suppression_reason=reason if reason != "not_due" else None,
-                )
-                if created and reason in {"stale", "quiet_hours"}:
-                    adaptive_metrics.digests_suppressed += 1
+                    if local_now.time().replace(tzinfo=None) < scheduled_local_time:
+                        continue
+                    scheduled_at = to_utc(
+                        datetime.combine(local_now.date(), scheduled_local_time), owner.timezone
+                    )
+                    existing = await session.scalar(
+                        select(ReminderDigestDelivery).where(
+                            ReminderDigestDelivery.user_id == owner.id,
+                            ReminderDigestDelivery.period == period.value,
+                            ReminderDigestDelivery.local_date == local_now.date(),
+                        )
+                    )
+                    if existing is not None:
+                        continue
+                    reason = digest_suppression_reason(
+                        owner,
+                        period,
+                        scheduled_at_utc=scheduled_at,
+                        now_utc=current_time,
+                    )
+                    created = await _create_digest_delivery(
+                        session,
+                        owner=owner,
+                        period=period,
+                        local_date=local_now.date(),
+                        scheduled_at_utc=scheduled_at,
+                        state=(
+                            DigestDeliveryState.SUPPRESSED.value
+                            if reason is not None and reason != "not_due"
+                            else DigestDeliveryState.PENDING.value
+                        ),
+                        now_utc=current_time,
+                        suppression_reason=reason if reason != "not_due" else None,
+                    )
+                    if created:
+                        created_slots += 1
+                    if created and reason in {"stale", "quiet_hours"}:
+                        adaptive_metrics.digests_suppressed += 1
+                if created_slots >= limit:
+                    break
+            if created_slots >= limit:
+                break
 
         due_filter = and_(
             ReminderDigestDelivery.state == DigestDeliveryState.PENDING.value,
@@ -1164,6 +1193,7 @@ async def finalize_digest_failure(
     lease_token: str,
     error_type: str,
     *,
+    retry_after_seconds: int | None = None,
     now_utc: datetime | None = None,
 ) -> bool:
     if not lease_token:
@@ -1194,10 +1224,26 @@ async def finalize_digest_failure(
             return True
         base_seconds = _setting_int("worker_retry_base_seconds", 10, minimum=1)
         max_seconds = _setting_int("worker_retry_max_seconds", 300, minimum=1)
-        delay = min(max_seconds, base_seconds * (2 ** min(delivery.retry_count - 1, 30)))
+        exponential_delay = base_seconds * (2 ** min(delivery.retry_count - 1, 30))
+        delay = min(max_seconds, max(exponential_delay, retry_after_seconds or 0))
         delivery.state = DigestDeliveryState.PENDING.value
         delivery.next_retry_at = current_time + timedelta(seconds=max(1, delay))
         return True
+
+
+def _retry_after_seconds(exc: BaseException) -> int | None:
+    if not isinstance(exc, TelegramRetryAfter) and type(exc).__name__ != "TelegramRetryAfter":
+        return None
+    value = getattr(exc, "retry_after", None)
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value):
+            return None
+        return max(0, math.ceil(numeric_value))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 async def process_due_digests(
@@ -1245,7 +1291,12 @@ async def process_due_digests(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await finalize_digest_failure(delivery.id, lease_token, type(exc).__name__)
+            await finalize_digest_failure(
+                delivery.id,
+                lease_token,
+                type(exc).__name__,
+                retry_after_seconds=_retry_after_seconds(exc),
+            )
             logger.warning(
                 "Digest delivery failed",
                 extra={

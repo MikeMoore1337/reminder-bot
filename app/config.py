@@ -49,7 +49,11 @@ class Settings(BaseSettings):
     digest_quiet_hours_end: str = "08:00"
     digest_max_items: int = Field(default=20, ge=1, le=100)
     digest_max_delay_minutes: int = Field(default=360, ge=0, le=1440)
-    digest_lease_duration_seconds: int = Field(default=60, ge=1, le=86400)
+    # Keep the digest lease aligned with the existing worker lease when no
+    # digest-specific override is configured. This preserves valid pre-digest
+    # deployments whose send timeout and safety margin already require a
+    # worker lease longer than the old fixed 60-second digest default.
+    digest_lease_duration_seconds: int | None = Field(default=None, ge=1, le=86400)
 
     voice_stt_command: str = "whisper-cli"
     voice_stt_model_path: str | None = None
@@ -92,6 +96,8 @@ class Settings(BaseSettings):
                 "worker_retry_max_seconds must be greater than or equal to "
                 "worker_retry_base_seconds"
             )
+        if self.digest_lease_duration_seconds is None:
+            self.digest_lease_duration_seconds = self.worker_lease_duration_seconds
         if self.digest_lease_duration_seconds <= (
             self.worker_send_timeout_seconds + self.worker_lease_safety_margin_seconds
         ):

@@ -34,7 +34,9 @@ worker.
 Обычные reminders ограничены `DIGEST_MAX_ITEMS`, а persistent/важные reminders
 добавляются сверх этого лимита и не скрываются. Просроченный слот старше
 `DIGEST_MAX_DELAY_MINUTES` и слот в тихих часах подавляется, а сбой Telegram
-проходит через bounded retry/lease policy.
+проходит через bounded retry/lease policy. Если `DIGEST_LEASE_DURATION_SECONDS`
+не задан, digest lease наследует `WORKER_LEASE_DURATION_SECONDS`; явный override
+должен учитывать timeout и safety margin worker.
 
 Отключение функции отзывает pending подсказки или queued digest slots; уже
 идущая отправка не прерывается задним числом. Worker периодически удаляет

@@ -23,6 +23,16 @@ def test_worker_timing_defaults_are_valid() -> None:
     assert settings.worker_retry_max_seconds >= settings.worker_retry_base_seconds
 
 
+def test_digest_lease_default_follows_existing_worker_lease() -> None:
+    settings = _settings(
+        worker_lease_duration_seconds=70,
+        worker_send_timeout_seconds=55,
+        worker_lease_safety_margin_seconds=10,
+    )
+
+    assert settings.digest_lease_duration_seconds == 70
+
+
 def test_worker_lease_must_cover_send_timeout_and_safety_margin() -> None:
     with pytest.raises(ValidationError, match="worker_lease_duration_seconds"):
         _settings(
