@@ -306,7 +306,8 @@ script perform this bounded sequence:
     and restart count at the end;
 12. re-fetch `origin/master`, atomically write the full SHA to
     `/opt/reminder-bot/state/deployed-sha`, and emit
-    `Deployment verdict: ACTIVE <FULL_SHA>`.
+    `Deployment verdict: ACTIVE <FULL_SHA>`. GitHub Actions captures the remote
+    output and fails closed unless that exact line matches the requested SHA.
 
 The lock path is Reminder Bot-specific and cannot affect `mtproxy`. A second
 deployment waits at most 30 seconds and then fails without Docker service or

@@ -169,9 +169,9 @@ create_backup() {
   backup_tmp="$(mktemp -- "${backup_dir}/.pre-deploy-${expected_sha}.XXXXXX")" \
     || fail "cannot create private backup temporary file"
 
-  if "${compose[@]}" exec -T db sh -c \
+  if "${compose[@]}" exec --interactive=false -T db sh -c \
     'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump --format=custom --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
-    >"${backup_tmp}"; then
+    >"${backup_tmp}" </dev/null; then
     :
   else
     fail "PostgreSQL backup failed"
@@ -212,13 +212,13 @@ verify_bot() {
   [[ "${bot_image}" == "${expected_image}" ]] || return 1
   bot_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${bot_id}" 2>/dev/null || true)"
   [[ "${bot_health}" == "none" || "${bot_health}" == "healthy" ]] || return 1
-  "${compose[@]}" exec -T bot python -c \
+  "${compose[@]}" exec --interactive=false -T bot python -c \
     'import urllib.request
 for path in ("/healthz", "/readyz"):
     with urllib.request.urlopen("http://127.0.0.1:8080" + path, timeout=2) as response:
         if response.status != 200:
             raise SystemExit(1)' \
-    >/dev/null 2>&1
+    </dev/null >/dev/null 2>&1
 }
 
 assert_current_master
