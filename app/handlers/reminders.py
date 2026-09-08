@@ -754,9 +754,6 @@ async def reminder_callback(callback: CallbackQuery) -> None:
 
 @router.message()
 async def text_reminder_handler(message: Message) -> None:
-    if is_contextual_message(message):
-        await _create_and_answer(message, context=extract_message_context(message))
-        return
     ids = _message_ids(message)
     if ids is not None:
         user = await get_or_create_user(telegram_user_id=ids[0], chat_id=ids[1])
@@ -764,4 +761,7 @@ async def text_reminder_handler(message: Message) -> None:
             return
         if await _handle_clarification(message, user):
             return
+    if is_contextual_message(message):
+        await _create_and_answer(message, context=extract_message_context(message))
+        return
     await _create_and_answer(message)

@@ -25,6 +25,7 @@ from app.services.message_context import (
     parse_context_reminder_input,
     serialize_context_snapshot,
 )
+from app.services.reminder_parser import ClarificationRequest, ParsedReminder
 from app.workers import reminder_worker as worker
 
 
@@ -200,6 +201,14 @@ def test_context_parser_supports_ob_etom_and_short_schedule_answers() -> None:
     assert time_only is not None
     assert time_only.local_dt == datetime(2026, 9, 9, 9, 0, tzinfo=UTC)
 
+    explicit_text = parse_context_reminder_input(
+        "напомни завтра в 9 открыть https://example.com",
+        now_local=datetime(2026, 9, 8, 10, 0, tzinfo=UTC),
+    )
+    assert isinstance(explicit_text, ParsedReminder)
+    assert explicit_text.text == "открыть https://example.com"
+    assert CONTEXT_PLACEHOLDER not in explicit_text.text
+
 
 def test_context_serialization_rejects_malformed_or_unsafe_urls() -> None:
     snapshot = MessageContextSnapshot(
@@ -321,6 +330,115 @@ def test_forward_without_schedule_is_restart_safe_and_then_creates_context_remin
             assert context is not None and context.source_message_id == 44
             assert clarifications == []
             assert answer.answer.await_count == 1
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_reply_to_active_action_draft_is_consumed_before_context_routing(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory, user = await _open_sqlite(monkeypatch)()
+        now = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+        try:
+            monkeypatch.setattr(reminder_service, "utc_now", lambda: now)
+            monkeypatch.setattr(reminders_handler, "utc_now", lambda: now)
+
+            async def get_user(*, telegram_user_id: int, chat_id: int):
+                assert (telegram_user_id, chat_id) == (1001, 2002)
+                return user
+
+            monkeypatch.setattr(reminders_handler, "get_or_create_user", get_user)
+            async with session_factory() as session:
+                reminder = Reminder(
+                    user_id=user.id,
+                    chat_id=user.chat_id,
+                    text="Старый текст",
+                    remind_at_utc=now + timedelta(hours=1),
+                    delivery_at_utc=now + timedelta(hours=1),
+                    schedule_timezone=user.timezone,
+                    status="pending",
+                    state="scheduled",
+                    recurrence_type="none",
+                    recurrence_interval=1,
+                    action_revision=0,
+                )
+                session.add(reminder)
+                await session.commit()
+                await session.refresh(reminder)
+                reminder_id = reminder.id
+
+            draft = await reminder_service.create_action_draft(
+                user,
+                reminder_id,
+                action_type="edit",
+                expected_action_revision=0,
+                current_step="text",
+                now_utc=now,
+            )
+            assert draft is not None
+
+            message = _incoming(
+                text="Новый текст",
+                reply_to_message=_source_message(text="Источник ответа"),
+            )
+            message.answer = AsyncMock()
+            await reminders_handler.text_reminder_handler(message)
+
+            active = await reminder_service.get_active_action_draft(user, now_utc=now)
+            assert active is not None
+            payload = reminder_service._payload_dict(active.payload)
+            assert active.current_step == "schedule"
+            assert payload["text"] == "Новый текст"
+            assert "Текст сохранён" in message.answer.await_args.args[0]
+            async with session_factory() as session:
+                assert await session.scalar(select(ReminderContext)) is None
+                assert await session.scalar(select(ReminderClarification)) is None
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_reply_to_active_clarification_is_consumed_before_context_routing(monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, connection, session_factory, user = await _open_sqlite(monkeypatch)()
+        now = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+        try:
+            monkeypatch.setattr(reminder_service, "utc_now", lambda: now)
+            monkeypatch.setattr(reminders_handler, "utc_now", lambda: now)
+
+            async def get_user(*, telegram_user_id: int, chat_id: int):
+                return user
+
+            monkeypatch.setattr(reminders_handler, "get_or_create_user", get_user)
+            request = ClarificationRequest(
+                kind="ambiguous_clock",
+                prompt="Укажи точное время.",
+                raw_text="напомни после обеда позвонить",
+            )
+            await clarification_service.create_clarification(user, request, now_utc=now)
+
+            message = _incoming(
+                text="14:00",
+                reply_to_message=_source_message(text="Источник ответа"),
+            )
+            message.answer = AsyncMock()
+            await reminders_handler.text_reminder_handler(message)
+
+            async with session_factory() as session:
+                reminders = list(
+                    (
+                        await session.scalars(select(Reminder).where(Reminder.user_id == user.id))
+                    ).all()
+                )
+                assert await session.scalar(select(ReminderClarification)) is None
+                assert await session.scalar(select(ReminderContext)) is None
+            assert len(reminders) == 1
+            assert reminders[0].text == "позвонить"
+            assert message.answer.await_count == 1
         finally:
             await connection.close()
             await engine.dispose()

@@ -871,14 +871,19 @@ async def process_claimed_reminder(
                 now_utc=utc_now(),
             )
         except Exception as exc:
-            logger.warning(
-                "Unable to load reminder context; using text fallback",
-                extra={
-                    "extra_data": (
-                        f"reminder_id={reminder.id} error_type={type(exc).__name__[:80]}"
-                    )
-                },
-            )
+            failure = classify_delivery_error(exc)
+            finalized = await _finalize_send_failure(reminder, failure)
+            if finalized:
+                logger.warning(
+                    "Unable to load reminder context; delivery retry scheduled",
+                    extra={
+                        "extra_data": (
+                            f"reminder_id={reminder.id} error_type={failure.error_type} "
+                            f"error_kind={failure.kind.value}"
+                        )
+                    },
+                )
+            return False
     try:
         sent = await asyncio.wait_for(
             _send_delivery(

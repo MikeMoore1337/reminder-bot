@@ -706,14 +706,13 @@ def build_context_clarification() -> ClarificationRequest:
 
 def _context_candidate(raw_text: str) -> str | None:
     value = raw_text.strip()
-    if not _COMMAND_PREFIX_RE.match(value):
-        return None
     match = _CONTEXT_PREFIX_RE.match(value)
-    if match:
-        tail = (match.group("tail") or "").strip()
-        if not tail:
-            return None
-        value = f"напомни {tail}"
+    if match is None:
+        return None
+    tail = (match.group("tail") or "").strip()
+    if not tail:
+        return None
+    value = f"напомни {tail}"
     value = _CONTEXT_MARKER_RE.sub("", value).strip()
     if not value:
         return None
