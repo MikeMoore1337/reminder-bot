@@ -13,6 +13,7 @@ from app.db.models import (
     ActionDraft,
     DeadlinePlanState,
     DeadlineStepState,
+    DigestDeliveryState,
     OccurrenceState,
     RecurrenceType,
     Reminder,
@@ -20,13 +21,18 @@ from app.db.models import (
     ReminderContext,
     ReminderDeadlinePlan,
     ReminderDeadlineStep,
+    ReminderDigestDelivery,
     ReminderKind,
     ReminderOccurrence,
+    ReminderSnoozeEvent,
     ReminderState,
+    ReminderSuggestion,
+    SuggestionState,
     User,
     VoiceReminderDraft,
 )
 from app.services import (
+    adaptive_service,
     clarification_service,
     deadline_service,
     message_context,
@@ -81,6 +87,7 @@ async def _with_postgres(monkeypatch, scenario) -> None:
 
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         monkeypatch.setattr(worker, "SessionLocal", session_factory)
+        monkeypatch.setattr(adaptive_service, "SessionLocal", session_factory)
         monkeypatch.setattr(deadline_service, "SessionLocal", session_factory)
         monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
         monkeypatch.setattr(clarification_service, "SessionLocal", session_factory)
@@ -173,6 +180,39 @@ async def _insert_batch_reminders(session_factory, now_utc: datetime, count: int
         session.add_all(reminders)
         await session.commit()
         return [reminder.id for reminder in reminders]
+
+
+def test_postgres_digest_claim_is_idempotent_under_concurrency(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+        async with session_factory() as session:
+            session.add(
+                User(
+                    telegram_user_id=9701,
+                    chat_id=9702,
+                    timezone="Europe/Moscow",
+                    digests_enabled=True,
+                )
+            )
+            await session.commit()
+
+        claimed_batches = await asyncio.gather(
+            adaptive_service.claim_due_digests(1, now_utc=now),
+            adaptive_service.claim_due_digests(1, now_utc=now),
+        )
+        assert sorted(len(batch) for batch in claimed_batches) == [0, 1]
+        async with session_factory() as session:
+            deliveries = list((await session.scalars(select(ReminderDigestDelivery))).all())
+            assert len(deliveries) == 2
+            processing = [
+                delivery
+                for delivery in deliveries
+                if delivery.state == DigestDeliveryState.PROCESSING.value
+            ]
+            assert len(processing) == 1
+            assert processing[0].lease_token
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
 
 
 def test_postgres_workers_cannot_claim_one_occurrence_concurrently(monkeypatch) -> None:
@@ -655,6 +695,161 @@ def test_postgres_batch_renewal_skips_reclaimed_item_before_send(monkeypatch) ->
         second_bot = FakeBot()
         assert await worker.process_claimed_reminder(second_bot, second_owner[0])
         assert second_bot.calls == [1]
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
+
+
+def test_postgres_snooze_suggestion_race_is_serialized_with_opt_out(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now = datetime(2026, 9, 10, 6, 0, tzinfo=UTC)
+        target = now + timedelta(hours=1)
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: now)
+        async with session_factory() as session:
+            user = User(
+                telegram_user_id=5101,
+                chat_id=6102,
+                timezone="Europe/Moscow",
+                suggestions_enabled=True,
+            )
+            reminder = Reminder(
+                user=user,
+                chat_id=user.chat_id,
+                text="postgres adaptive race reminder",
+                remind_at_utc=now - timedelta(hours=1),
+                delivery_at_utc=now - timedelta(hours=1),
+                schedule_timezone=user.timezone,
+                status="pending",
+                state=ReminderState.SCHEDULED.value,
+                recurrence_type=RecurrenceType.DAILY.value,
+                recurrence_interval=1,
+            )
+            session.add_all([user, reminder])
+            await session.flush()
+            session.add_all(
+                [
+                    ReminderSnoozeEvent(
+                        user_id=user.id,
+                        chat_id=user.chat_id,
+                        reminder_id=reminder.id,
+                        occurrence_at_utc=reminder.remind_at_utc,
+                        snoozed_at_utc=now - timedelta(days=offset),
+                        target_at_utc=target - timedelta(days=offset),
+                        target_local_minutes=10 * 60,
+                        schedule_timezone=user.timezone,
+                    )
+                    for offset in (2, 1)
+                ]
+            )
+            await session.commit()
+            user_id = user.id
+            chat_id = user.chat_id
+            reminder_id = reminder.id
+
+        entered_trim = asyncio.Event()
+        release_trim = asyncio.Event()
+        original_trim = adaptive_service._trim_snooze_history
+
+        async def blocked_trim(*args, **kwargs):
+            entered_trim.set()
+            await asyncio.wait_for(release_trim.wait(), timeout=5)
+            return await original_trim(*args, **kwargs)
+
+        monkeypatch.setattr(adaptive_service, "_trim_snooze_history", blocked_trim)
+        opt_out_task: asyncio.Task | None = None
+        try:
+            snooze_task = asyncio.create_task(
+                reminder_service.snooze_reminder(
+                    User(id=user_id, chat_id=chat_id),
+                    reminder_id,
+                    target_at_utc=target,
+                )
+            )
+            await asyncio.wait_for(entered_trim.wait(), timeout=5)
+            opt_out_task = asyncio.create_task(
+                adaptive_service.set_adaptive_preferences(
+                    User(id=user_id, chat_id=chat_id),
+                    suggestions_enabled=False,
+                )
+            )
+            await asyncio.sleep(0.1)
+            assert not opt_out_task.done()
+            release_trim.set()
+            snoozed = await asyncio.wait_for(snooze_task, timeout=5)
+            assert snoozed is not None
+
+            preferences = await asyncio.wait_for(opt_out_task, timeout=5)
+            assert preferences is not None
+            assert not preferences.suggestions_enabled
+
+            async with session_factory() as session:
+                saved_suggestion = await session.scalar(
+                    select(ReminderSuggestion)
+                    .where(
+                        ReminderSuggestion.user_id == user_id,
+                        ReminderSuggestion.chat_id == chat_id,
+                    )
+                    .order_by(ReminderSuggestion.id.desc())
+                )
+                pending = list(
+                    (
+                        await session.scalars(
+                            select(ReminderSuggestion).where(
+                                ReminderSuggestion.user_id == user_id,
+                                ReminderSuggestion.chat_id == chat_id,
+                                ReminderSuggestion.status == SuggestionState.PENDING.value,
+                            )
+                        )
+                    ).all()
+                )
+                assert saved_suggestion is not None
+                assert saved_suggestion.status == SuggestionState.DISMISSED.value
+                assert saved_suggestion.resolution == "opt_out"
+                assert pending == []
+                saved_reminder = await session.get(Reminder, reminder_id)
+                assert saved_reminder is not None
+                original_schedule = saved_reminder.remind_at_utc
+
+            callback = await adaptive_service.resolve_suggestion(
+                User(id=user_id, chat_id=chat_id),
+                saved_suggestion.id,
+                expected_revision=1,
+                action="accept",
+                now_utc=now,
+            )
+            assert callback.status == SuggestionState.DISMISSED.value
+            assert callback.already_resolved
+            assert not callback.changed
+            async with session_factory() as session:
+                saved_reminder = await session.get(Reminder, reminder_id)
+                assert saved_reminder is not None
+                assert saved_reminder.remind_at_utc == original_schedule
+        finally:
+            release_trim.set()
+            if opt_out_task is not None and not opt_out_task.done():
+                opt_out_task.cancel()
+                await asyncio.gather(opt_out_task, return_exceptions=True)
+
+    asyncio.run(_with_postgres(monkeypatch, scenario))
+
+
+def test_postgres_active_reminder_order_is_stable_for_equal_delivery_times(monkeypatch) -> None:
+    async def scenario(session_factory) -> None:
+        now = datetime(2026, 9, 10, 6, 0, tzinfo=UTC)
+        reminder_ids = await _insert_batch_reminders(session_factory, now, 45)
+        async with session_factory() as session:
+            first_reminder = await session.get(Reminder, reminder_ids[0])
+            assert first_reminder is not None
+            user = await session.get(User, first_reminder.user_id)
+            assert user is not None
+
+        first = [reminder.id for reminder in await reminder_service.list_active_reminders(user)]
+        second = [reminder.id for reminder in await reminder_service.list_active_reminders(user)]
+        assert first == second == sorted(reminder_ids)
+
+        pages = [first[index : index + 20] for index in range(0, len(first), 20)]
+        flattened = [reminder_id for page in pages for reminder_id in page]
+        assert flattened == sorted(reminder_ids)
+        assert len(flattened) == len(set(flattened)) == len(reminder_ids)
 
     asyncio.run(_with_postgres(monkeypatch, scenario))
 

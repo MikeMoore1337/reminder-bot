@@ -38,8 +38,9 @@ The following bounded settings are configurable through environment variables:
 - `WORKER_MAX_ATTEMPTS` (1-20, default 3).
 
 Network errors, timeouts, server errors, `429` responses, and unknown provider
-errors are transient. Retry delay is exponential and capped by
-`WORKER_RETRY_MAX_SECONDS`; Telegram `retry_after` is respected up to that cap.
+errors are transient. Generic exponential retry delay is capped by
+`WORKER_RETRY_MAX_SECONDS`; an explicit Telegram `retry_after` delay is
+honored even when it is longer than that generic cap.
 Bad requests, blocked/deactivated chats, unauthorized/not-found delivery, and
 other explicitly terminal Telegram failures become `failed` without resurrection.
 When the claim count reaches `WORKER_MAX_ATTEMPTS`, the occurrence becomes
@@ -55,9 +56,11 @@ WORKER_SEND_TIMEOUT_SECONDS + WORKER_LEASE_SAFETY_MARGIN_SECONDS`. The
 settings object rejects an invalid combination at startup. A batch claim can
 contain more rows than can be sent inside one original lease, so every row is
 atomically renewed immediately before its Telegram call. The renewal requires
-the exact processing token and a still-live lease, commits before the network
-call, and holds no database lock during the call. A cancelled, reclaimed, or
-expired row is skipped without sending.
+the exact processing token and unchanged `processing` ownership; it may renew
+the timestamp even if that same owner's original lease has just expired. The
+renewal commits before the network call and holds no database lock during the
+call. If another worker has reclaimed the row, its token no longer matches and
+the stale worker is skipped without sending.
 
 ## External-send idempotency boundary
 

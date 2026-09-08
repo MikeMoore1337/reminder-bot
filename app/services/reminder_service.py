@@ -29,6 +29,7 @@ from app.db.models import (
     VoiceReminderDraft,
 )
 from app.db.session import SessionLocal
+from app.services.adaptive_service import record_snooze_event_in_session
 from app.services.message_context import (
     MessageContextSnapshot,
     context_kind_label,
@@ -733,7 +734,10 @@ async def list_active_reminders(user: User) -> list[Reminder]:
                 Reminder.state.in_(ACTIVE_STATES),
                 Reminder.status != "processing",
             )
-            .order_by(func.coalesce(Reminder.delivery_at_utc, Reminder.remind_at_utc).asc())
+            .order_by(
+                func.coalesce(Reminder.delivery_at_utc, Reminder.remind_at_utc).asc(),
+                Reminder.id.asc(),
+            )
         )
         return list(result.scalars().all())
 
@@ -1452,6 +1456,12 @@ async def snooze_reminder(
         raise ValueError("Время откладывания должно быть в будущем")
 
     async with SessionLocal() as session, session.begin():
+        owner = await session.scalar(
+            select(User).where(User.id == user.id, User.chat_id == user.chat_id).with_for_update()
+        )
+        if owner is None:
+            _invalid_action("snooze", reminder_id=reminder_id, reason="owner")
+            return None
         reminder = await _load_owned_reminder(session, user, reminder_id)
         if reminder is None:
             _invalid_action("snooze", reminder_id=reminder_id, reason="owner")
@@ -1602,6 +1612,20 @@ async def snooze_reminder(
             await session.flush()
             await _copy_reminder_context(session, reminder, existing)
             await session.flush()
+            await record_snooze_event_in_session(
+                session,
+                user_id=user.id,
+                chat_id=user.chat_id,
+                reminder=reminder,
+                occurrence_id=occurrence.id if occurrence is not None else None,
+                occurrence_at_utc=(
+                    occurrence.occurrence_at_utc
+                    if occurrence is not None
+                    else reminder.remind_at_utc
+                ),
+                snoozed_at_utc=now_utc,
+                target_at_utc=snoozed_until_utc,
+            )
             _record_action("snoozed", action="snooze", reminder_id=reminder.id)
             _record_action("action_success", action="snooze", reminder_id=reminder.id)
             return existing
@@ -1617,6 +1641,16 @@ async def snooze_reminder(
             _reset_persistent_cycle(reminder)
         _reset_delivery_retry(reminder)
         _clear_delivery_identity(reminder)
+        await record_snooze_event_in_session(
+            session,
+            user_id=user.id,
+            chat_id=user.chat_id,
+            reminder=reminder,
+            occurrence_id=None,
+            occurrence_at_utc=reminder.remind_at_utc,
+            snoozed_at_utc=now_utc,
+            target_at_utc=snoozed_until_utc,
+        )
         _record_action("snoozed", action="snooze", reminder_id=reminder.id)
         _record_action("action_success", action="snooze", reminder_id=reminder.id)
         return reminder

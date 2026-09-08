@@ -17,9 +17,15 @@ from app.callbacks import (
     parse_callback,
 )
 from app.db.models import Reminder, ReminderKind, User, VoiceReminderDraft
+from app.keyboards.adaptive import suggestion_kb
 from app.keyboards.deadline import deadline_draft_kb
 from app.keyboards.voice import voice_draft_kb
 from app.services import reminder_service
+from app.services.adaptive_service import (
+    format_suggestion,
+    get_pending_suggestion,
+    resolve_suggestion,
+)
 from app.services.clarification_service import (
     CLARIFICATION_ORIGIN_VOICE,
     cancel_clarification,
@@ -121,6 +127,77 @@ async def _safe_remove_keyboard(message: Message) -> None:
             "Unable to invalidate Telegram action keyboard",
             extra={"extra_data": f"error_type={type(exc).__name__[:80]}"},
         )
+
+
+async def _send_pending_suggestion(message: Message, user: User, reminder_id: int) -> None:
+    suggestion = await get_pending_suggestion(user, reminder_id=reminder_id)
+    if suggestion is None:
+        return
+    reminder = await get_owned_reminder(user, suggestion.reminder_id)
+    await message.answer(
+        format_suggestion(suggestion, reminder=reminder),
+        reply_markup=suggestion_kb(suggestion.id, suggestion.revision),
+        parse_mode="HTML",
+    )
+
+
+async def _handle_suggestion_callback(
+    callback: CallbackQuery,
+    parsed: ReminderCallback,
+) -> None:
+    if parsed.origin != CallbackOrigin.SUGGESTION or parsed.action not in {
+        CallbackAction.SUGGESTION_ACCEPT,
+        CallbackAction.SUGGESTION_REJECT,
+        CallbackAction.SUGGESTION_DISMISS,
+    }:
+        await callback.answer(STALE_FEEDBACK, show_alert=False)
+        return
+    if not isinstance(callback.message, Message) or callback.from_user is None:
+        await callback.answer(STALE_FEEDBACK, show_alert=False)
+        return
+
+    callback_message = callback.message
+    user = await get_or_create_user(
+        telegram_user_id=callback.from_user.id,
+        chat_id=callback_message.chat.id,
+    )
+    action = {
+        CallbackAction.SUGGESTION_ACCEPT: "accept",
+        CallbackAction.SUGGESTION_REJECT: "reject",
+        CallbackAction.SUGGESTION_DISMISS: "dismiss",
+    }[parsed.action]
+    resolution = await resolve_suggestion(
+        user,
+        parsed.target_id,
+        expected_revision=parsed.revision,
+        action=action,
+    )
+    if resolution.already_resolved:
+        await callback.answer("Уже обработано", show_alert=False)
+        await _safe_remove_keyboard(callback_message)
+        return
+    if resolution.status == "accepted":
+        response = (
+            "✅ Расписание обновлено. Следующее повторение будет примерно в "
+            f"{resolution.proposed_local_time}."
+        )
+        await callback.answer("Готово")
+        await _safe_remove_keyboard(callback_message)
+        await callback_message.answer(response)
+        return
+    if resolution.status == "rejected":
+        response = "Оставляем исходное расписание. Новых изменений без подтверждения не будет."
+        await callback.answer("Оставляем", show_alert=False)
+        await _safe_remove_keyboard(callback_message)
+        await callback_message.answer(response)
+        return
+    if resolution.status == "dismissed":
+        response = "Подсказка скрыта. Расписание не изменено."
+        await callback.answer("Скрыто", show_alert=False)
+        await _safe_remove_keyboard(callback_message)
+        await callback_message.answer(response)
+        return
+    await callback.answer(STALE_FEEDBACK, show_alert=False)
 
 
 def _message_input_text(message: Message) -> str:
@@ -376,6 +453,11 @@ async def _handle_action_draft(message: Message, user: User) -> bool:
         else:
             local_dt = from_utc_to_user(delivery_at_utc(reminder), user.timezone)
             await message.answer(f"Отложено до {local_dt.strftime('%d.%m.%Y %H:%M')}")
+            await _send_pending_suggestion(
+                message,
+                user,
+                reminder.parent_reminder_id or reminder.id,
+            )
         return True
 
     if draft.action_type == "deadline_edit":
@@ -735,6 +817,9 @@ async def reminder_callback(callback: CallbackQuery) -> None:
     if parsed.target == CallbackTarget.DEADLINE_DRAFT:
         await _handle_deadline_callback(callback, parsed)
         return
+    if parsed.target == CallbackTarget.SUGGESTION:
+        await _handle_suggestion_callback(callback, parsed)
+        return
 
     if not isinstance(callback.message, Message):
         await callback.answer(STALE_FEEDBACK, show_alert=False)
@@ -813,6 +898,11 @@ async def reminder_callback(callback: CallbackQuery) -> None:
         await callback.answer("Отложено", show_alert=False)
         await _safe_remove_keyboard(callback_message)
         await callback_message.answer(f"Отложено до {local_dt.strftime('%d.%m.%Y %H:%M')}")
+        await _send_pending_suggestion(
+            callback_message,
+            user,
+            reminder.parent_reminder_id or reminder.id,
+        )
         return
 
     if parsed.action == CallbackAction.SNOOZE_CUSTOM:

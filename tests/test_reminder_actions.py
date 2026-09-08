@@ -1066,6 +1066,7 @@ def test_action_draft_replaces_other_flow_for_same_user_chat(monkeypatch) -> Non
     async def scenario() -> None:
         engine, connection, session_factory = await _open_sqlite(monkeypatch)
         now = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: now)
         try:
             user = await _add_user(session_factory)
             other_user = await _add_user(

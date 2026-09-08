@@ -3,7 +3,7 @@ from functools import lru_cache
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.services.persistent_policy import PersistentPolicy
+from app.services.persistent_policy import PersistentPolicy, parse_clock
 
 
 class Settings(BaseSettings):
@@ -37,6 +37,23 @@ class Settings(BaseSettings):
     persistent_quiet_hours_start: str = "22:00"
     persistent_quiet_hours_end: str = "08:00"
     persistent_user_cooldown_minutes: int = Field(default=1, ge=0, le=60)
+
+    suggestion_snooze_threshold: int = Field(default=3, ge=2, le=10)
+    suggestion_window_days: int = Field(default=30, ge=7, le=90)
+    suggestion_target_tolerance_minutes: int = Field(default=20, ge=1, le=120)
+    suggestion_min_schedule_shift_minutes: int = Field(default=30, ge=1, le=720)
+    digest_worker_enabled: bool = True
+    digest_morning_time: str = "09:00"
+    digest_evening_time: str = "20:00"
+    digest_quiet_hours_start: str = "22:00"
+    digest_quiet_hours_end: str = "08:00"
+    digest_max_items: int = Field(default=20, ge=1, le=100)
+    digest_max_delay_minutes: int = Field(default=360, ge=0, le=1440)
+    # Keep the digest lease aligned with the existing worker lease when no
+    # digest-specific override is configured. This preserves valid pre-digest
+    # deployments whose send timeout and safety margin already require a
+    # worker lease longer than the old fixed 60-second digest default.
+    digest_lease_duration_seconds: int | None = Field(default=None, ge=1, le=86400)
 
     voice_stt_command: str = "whisper-cli"
     voice_stt_model_path: str | None = None
@@ -79,6 +96,15 @@ class Settings(BaseSettings):
                 "worker_retry_max_seconds must be greater than or equal to "
                 "worker_retry_base_seconds"
             )
+        if self.digest_lease_duration_seconds is None:
+            self.digest_lease_duration_seconds = self.worker_lease_duration_seconds
+        if self.digest_lease_duration_seconds <= (
+            self.worker_send_timeout_seconds + self.worker_lease_safety_margin_seconds
+        ):
+            raise ValueError(
+                "digest_lease_duration_seconds must be greater than "
+                "worker_send_timeout_seconds plus worker_lease_safety_margin_seconds"
+            )
         PersistentPolicy(
             interval_minutes=self.persistent_repeat_interval_minutes,
             max_deliveries=self.persistent_max_deliveries,
@@ -86,6 +112,10 @@ class Settings(BaseSettings):
             quiet_hours_start=self.persistent_quiet_hours_start,
             quiet_hours_end=self.persistent_quiet_hours_end,
         )
+        parse_clock(self.digest_morning_time, field_name="digest_morning_time")
+        parse_clock(self.digest_evening_time, field_name="digest_evening_time")
+        parse_clock(self.digest_quiet_hours_start, field_name="digest_quiet_hours_start")
+        parse_clock(self.digest_quiet_hours_end, field_name="digest_quiet_hours_end")
         return self
 
     @property

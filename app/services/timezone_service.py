@@ -2,15 +2,42 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db.models import User
+from app.db.models import DigestDeliveryState, ReminderDigestDelivery, User
 from app.db.session import SessionLocal
 from app.utils.datetime_utils import validate_timezone
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+async def _invalidate_digest_schedule(
+    session: AsyncSession,
+    user: User,
+    *,
+    reason: str,
+) -> None:
+    if not user.digests_enabled:
+        user.digest_schedule_seeded = False
+        return
+    user.digest_schedule_seeded = False
+    await session.execute(
+        update(ReminderDigestDelivery)
+        .where(
+            ReminderDigestDelivery.user_id == user.id,
+            ReminderDigestDelivery.state == DigestDeliveryState.PENDING.value,
+        )
+        .values(
+            state=DigestDeliveryState.SUPPRESSED.value,
+            suppressed_at=func.now(),
+            suppression_reason=reason,
+            next_retry_at=None,
+            error_text=None,
+        )
+    )
 
 
 async def get_or_create_user(telegram_user_id: int, chat_id: int) -> User:
@@ -39,6 +66,7 @@ async def get_or_create_user(telegram_user_id: int, chat_id: int) -> User:
 
         if user.chat_id != chat_id:
             user.chat_id = chat_id
+            await _invalidate_digest_schedule(session, user, reason="chat_changed")
             await session.commit()
 
         return user
@@ -61,8 +89,11 @@ async def set_user_timezone(telegram_user_id: int, chat_id: int, timezone_name: 
             )
             session.add(user)
         else:
+            profile_changed = user.timezone != timezone_name or user.chat_id != chat_id
             user.timezone = timezone_name
             user.chat_id = chat_id
+            if profile_changed:
+                await _invalidate_digest_schedule(session, user, reason="profile_changed")
 
         await session.commit()
         await session.refresh(user)
