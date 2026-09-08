@@ -1042,14 +1042,28 @@ def render_digest(
         render_line(index, reminder, compact=True)
         for index, reminder in enumerate(persistent_reminders, start=1)
     ]
-    persistent_lines = list(persistent_compact_lines)
-    current_length = len("".join(result)) + sum(map(len, persistent_lines))
+    persistent_aggregate_line = (
+        f"🔔 ВАЖНЫЕ НАПОМИНАНИЯ: {len(persistent_reminders)} шт. · "
+        "все учтены; полный список: /list\n"
+    )
+    current_length = len("".join(result))
     marker_reservation = len(DIGEST_TRUNCATION_MARKER) if ordinary else 0
-    for index, full_line in enumerate(persistent_full_lines):
-        extra = len(full_line) - len(persistent_lines[index])
-        if current_length + extra + marker_reservation <= DIGEST_MESSAGE_LIMIT:
-            persistent_lines[index] = full_line
-            current_length += extra
+    compact_length = current_length + sum(map(len, persistent_compact_lines))
+    if compact_length + marker_reservation > DIGEST_MESSAGE_LIMIT:
+        # Individual identifiers are still bounded per item, but the set of
+        # persistent reminders is not. Keep one deterministic, actionable
+        # aggregate instead of emitting an invalid payload or silently
+        # dropping the tail. `/list` is the continuation surface for details.
+        persistent_lines = [persistent_aggregate_line]
+        current_length += len(persistent_aggregate_line)
+    else:
+        persistent_lines = list(persistent_compact_lines)
+        current_length = compact_length
+        for index, full_line in enumerate(persistent_full_lines):
+            extra = len(full_line) - len(persistent_lines[index])
+            if current_length + extra + marker_reservation <= DIGEST_MESSAGE_LIMIT:
+                persistent_lines[index] = full_line
+                current_length += extra
     result.append("".join(persistent_lines))
 
     for index, reminder in enumerate(ordinary, start=len(persistent_reminders) + 1):
@@ -1384,7 +1398,6 @@ async def renew_digest_delivery_lease(
                     ReminderDigestDelivery.id == delivery_id,
                     ReminderDigestDelivery.state == DigestDeliveryState.PROCESSING.value,
                     ReminderDigestDelivery.lease_token == lease_token,
-                    ReminderDigestDelivery.lease_until > current_time,
                 )
                 .values(lease_until=renewed_until)
             ),

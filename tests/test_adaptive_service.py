@@ -664,6 +664,40 @@ def test_render_digest_keeps_every_long_persistent_reminder_represented() -> Non
     assert all(f"#{reminder.id}" in digest for reminder in persistent)
 
 
+def test_render_digest_aggregates_hundreds_of_persistent_reminders_within_limit() -> None:
+    scheduled = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
+    persistent = [
+        Reminder(
+            id=10_000 + index,
+            text=("длинное важное напоминание " + ("x" * 360))
+            if index % 2
+            else "короткое важное напоминание",
+            remind_at_utc=scheduled + timedelta(minutes=index),
+            delivery_at_utc=scheduled + timedelta(minutes=index),
+            state=ReminderState.SCHEDULED.value,
+            mode="persistent",
+        )
+        for index in range(700)
+    ]
+
+    digest = adaptive_service.render_digest(
+        "morning",
+        persistent,
+        timezone_name="Europe/Moscow",
+        local_date=date(2026, 9, 10),
+    )
+
+    assert digest == adaptive_service.render_digest(
+        "morning",
+        persistent,
+        timezone_name="Europe/Moscow",
+        local_date=date(2026, 9, 10),
+    )
+    assert len(digest) <= adaptive_service.DIGEST_MESSAGE_LIMIT
+    assert f"ВАЖНЫЕ НАПОМИНАНИЯ: {len(persistent)} шт." in digest
+    assert "/list" in digest
+
+
 def test_process_due_digest_sends_and_finalizes_with_a_bot(monkeypatch) -> None:
     async def scenario() -> None:
         engine, connection, session_factory = await _sqlite_setup(monkeypatch)()
@@ -799,9 +833,9 @@ def test_process_due_digests_renews_each_item_before_batch_send(monkeypatch) -> 
                 nonlocal load_count
                 load_count += 1
                 if load_count == 3:
-                    # The second claimed row is close to lease expiry by the
-                    # time the first row has completed.
-                    clock[0] = base + timedelta(seconds=4)
+                    # The second claimed row is already past its original
+                    # lease by the time the first row has completed.
+                    clock[0] = base + timedelta(seconds=6)
                 return await original_load(delivery)
 
             monkeypatch.setattr(adaptive_service, "_load_digest_owner", load_owner)
@@ -819,9 +853,9 @@ def test_process_due_digests_renews_each_item_before_batch_send(monkeypatch) -> 
                     now_utc=clock[0],
                 )
                 if renew_count == 2:
-                    # Simulate the provider call consuming the remaining
-                    # original lease before finalization.
-                    clock[0] = base + timedelta(seconds=6)
+                    # Simulate the provider call consuming part of the new
+                    # lease before finalization.
+                    clock[0] = base + timedelta(seconds=8)
                 return result
 
             monkeypatch.setattr(adaptive_service, "renew_digest_delivery_lease", renew)
@@ -839,7 +873,7 @@ def test_process_due_digests_renews_each_item_before_batch_send(monkeypatch) -> 
             assert await adaptive_service.process_due_digests(bot, limit=2) == 2
             assert len(bot.messages) == 2
             assert renew_count == 2
-            assert renew_times[1] == base + timedelta(seconds=4)
+            assert renew_times[1] == base + timedelta(seconds=6)
 
             async with session_factory() as session:
                 deliveries = list(
@@ -852,12 +886,16 @@ def test_process_due_digests_renews_each_item_before_batch_send(monkeypatch) -> 
                 sent_deliveries = [
                     delivery for delivery in deliveries if delivery.local_date == date(2026, 9, 10)
                 ]
+                sent_delivery_ids = {delivery.id for delivery in sent_deliveries}
                 assert len(sent_deliveries) == 2
                 assert all(
                     delivery.state == DigestDeliveryState.SENT.value for delivery in sent_deliveries
                 )
                 assert all(delivery.attempt_count == 1 for delivery in sent_deliveries)
                 assert all(delivery.lease_token is None for delivery in sent_deliveries)
+
+            recovered = await adaptive_service.claim_due_digests(10, now_utc=clock[0])
+            assert not any(delivery.id in sent_delivery_ids for delivery in recovered)
         finally:
             await connection.close()
             await engine.dispose()

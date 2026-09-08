@@ -56,9 +56,11 @@ WORKER_SEND_TIMEOUT_SECONDS + WORKER_LEASE_SAFETY_MARGIN_SECONDS`. The
 settings object rejects an invalid combination at startup. A batch claim can
 contain more rows than can be sent inside one original lease, so every row is
 atomically renewed immediately before its Telegram call. The renewal requires
-the exact processing token and a still-live lease, commits before the network
-call, and holds no database lock during the call. A cancelled, reclaimed, or
-expired row is skipped without sending.
+the exact processing token and unchanged `processing` ownership; it may renew
+the timestamp even if that same owner's original lease has just expired. The
+renewal commits before the network call and holds no database lock during the
+call. If another worker has reclaimed the row, its token no longer matches and
+the stale worker is skipped without sending.
 
 ## External-send idempotency boundary
 
