@@ -461,6 +461,7 @@ async def revoke_invite(
 
 async def list_shared_reminders(user: User) -> list[SharedReminderView]:
     async with SessionLocal() as session:
+        current_time = _as_utc(utc_now())
         participant_exists = exists(
             select(SharedReminderMembership.id).where(
                 SharedReminderMembership.reminder_id == Reminder.id,
@@ -474,17 +475,22 @@ async def list_shared_reminders(user: User) -> list[SharedReminderView]:
                 SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
             )
         )
+        owner_invite_exists = exists(
+            select(SharedReminderInvite.id).where(
+                SharedReminderInvite.reminder_id == Reminder.id,
+                SharedReminderInvite.state == SharedInviteState.PENDING.value,
+                SharedReminderInvite.expires_at > current_time,
+            )
+        )
         result = await session.execute(
             select(Reminder)
             .where(
                 Reminder.state.in_(_ACTIVE_REMINDER_STATES),
                 or_(
-                    (Reminder.user_id == user.id) & (Reminder.chat_id == user.chat_id),
                     participant_exists,
-                ),
-                or_(
-                    (Reminder.user_id == user.id) & (Reminder.chat_id == user.chat_id),
-                    owner_shared_exists,
+                    (Reminder.user_id == user.id)
+                    & (Reminder.chat_id == user.chat_id)
+                    & (owner_shared_exists | owner_invite_exists),
                 ),
             )
             .order_by(
@@ -518,7 +524,7 @@ async def list_shared_reminders(user: User) -> list[SharedReminderView]:
                     .where(
                         SharedReminderInvite.reminder_id == reminder.id,
                         SharedReminderInvite.state == SharedInviteState.PENDING.value,
-                        SharedReminderInvite.expires_at > utc_now(),
+                        SharedReminderInvite.expires_at > current_time,
                     )
                     .order_by(SharedReminderInvite.id.asc())
                 )

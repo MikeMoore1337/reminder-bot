@@ -251,6 +251,16 @@ async def test_shared_invites_are_scoped_hashed_expiring_and_revocable(monkeypat
             )
             assert pending is not None
             pending_id = pending.id
+
+        private_reminder_id = await _add_reminder(
+            session_factory, owner, now=NOW + timedelta(hours=2)
+        )
+        owner_reminder_ids = {
+            view.reminder.id for view in await shared_reminder_service.list_shared_reminders(owner)
+        }
+        assert reminder_id in owner_reminder_ids
+        assert private_reminder_id not in owner_reminder_ids
+
         assert await shared_reminder_service.revoke_invite(
             owner,
             pending_id,
