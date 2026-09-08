@@ -8,6 +8,7 @@ from aiogram.types import Message
 
 from app.config import get_settings
 from app.services.reminder_service import get_failed_reminders, get_stats
+from app.services.voice_service import get_voice_metrics
 
 router = Router()
 settings = get_settings()
@@ -24,6 +25,10 @@ async def cmd_stats(message: Message) -> None:
         return
 
     stats = await get_stats()
+    voice = get_voice_metrics()
+    voice_stt_failures = sum(
+        count for key, count in voice.items() if key.startswith("failure_stt_")
+    )
 
     text = (
         "📊 <b>Статистика бота</b>\n\n"
@@ -32,7 +37,11 @@ async def cmd_stats(message: Message) -> None:
         f"⏳ Ожидают: <b>{stats['pending_reminders']}</b>\n"
         f"❌ Ошибок: <b>{stats['failed_reminders']}</b>\n"
         f"🔁 Повторяющихся: <b>{stats['recurring_reminders']}</b>\n"
-        f"✅ Отправлено за 24 часа: <b>{stats['sent_last_24h']}</b>"
+        f"✅ Отправлено за 24 часа: <b>{stats['sent_last_24h']}</b>\n"
+        f"🎙 Голосовой STT: <b>{voice['stt_success']}</b> успешно / "
+        f"<b>{voice_stt_failures}</b> ошибок\n"
+        f"🛠 Исправлено голосом: <b>{voice['parse_correction']}</b>\n"
+        f"✅ Подтверждено голосом: <b>{voice['confirmation_success']}</b>"
     )
 
     await message.answer(text, parse_mode="HTML")

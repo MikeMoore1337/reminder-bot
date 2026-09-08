@@ -17,9 +17,11 @@ from app.db.models import (
     OccurrenceState,
     RecurrenceType,
     Reminder,
+    ReminderClarification,
     ReminderOccurrence,
     ReminderState,
     User,
+    VoiceReminderDraft,
 )
 from app.db.session import SessionLocal
 from app.services.recurrence import (
@@ -360,7 +362,9 @@ async def create_reminder_in_session(
     recurrence_day_of_month: int | None = None,
     *,
     now_utc: datetime | None = None,
+    schedule_timezone: str | None = None,
 ) -> Reminder:
+    timezone_name = schedule_timezone or user.timezone
     canonical_rule: dict[str, Any] | None = None
     if recurrence_rule is not None:
         canonical_rule = decode_rule(recurrence_rule)
@@ -384,10 +388,10 @@ async def create_reminder_in_session(
 
     remind_at_utc = resolve_schedule_datetime(
         local_dt,
-        user.timezone,
+        timezone_name,
         semantics=datetime_semantics,
     )
-    _validate_initial_rule_date(remind_at_utc, canonical_rule, user.timezone)
+    _validate_initial_rule_date(remind_at_utc, canonical_rule, timezone_name)
     current_time = _as_utc(now_utc or utc_now())
     if recurrence_day_of_month is None and recurrence_type == RecurrenceType.MONTHLY.value:
         recurrence_day_of_month = local_dt.day
@@ -407,7 +411,7 @@ async def create_reminder_in_session(
                 remind_at_utc,
                 recurrence_type,
                 recurrence_interval,
-                timezone_name=user.timezone,
+                timezone_name=timezone_name,
                 recurrence_day_of_month=recurrence_day_of_month,
                 recurrence_rule=canonical_rule,
             )
@@ -425,7 +429,7 @@ async def create_reminder_in_session(
         status="pending",
         state=ReminderState.SCHEDULED.value,
         action_revision=0,
-        schedule_timezone=user.timezone,
+        schedule_timezone=timezone_name,
         delivery_at_utc=remind_at_utc,
         recurrence_type=recurrence_type,
         recurrence_interval=recurrence_interval,
@@ -1708,6 +1712,18 @@ async def create_action_draft(
                     reason="stale",
                 )
                 return None
+        await session.execute(
+            delete(VoiceReminderDraft).where(
+                VoiceReminderDraft.user_id == owner.id,
+                VoiceReminderDraft.chat_id == owner.chat_id,
+            )
+        )
+        await session.execute(
+            delete(ReminderClarification).where(
+                ReminderClarification.user_id == owner.id,
+                ReminderClarification.chat_id == owner.chat_id,
+            )
+        )
         draft_payload = dict(payload or {})
         if expected_occurrence_id is not None:
             draft_payload.setdefault("occurrence_id", expected_occurrence_id)

@@ -11,6 +11,7 @@ CALLBACK_MAX_BYTES = 64
 class CallbackTarget(StrEnum):
     REMINDER = "r"
     OCCURRENCE = "o"
+    VOICE_DRAFT = "v"
 
 
 class CallbackOrigin(StrEnum):
@@ -18,6 +19,7 @@ class CallbackOrigin(StrEnum):
 
     DELIVERY = "d"
     LIST = "l"
+    VOICE = "v"
 
 
 class CallbackAction(StrEnum):
@@ -32,6 +34,8 @@ class CallbackAction(StrEnum):
     PAUSE = "pause"
     RESUME = "resume"
     DELETE = "delete"
+    CREATE = "create"
+    CANCEL = "cancel"
 
 
 @dataclass(frozen=True, slots=True)

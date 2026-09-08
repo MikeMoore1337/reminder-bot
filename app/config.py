@@ -28,6 +28,22 @@ class Settings(BaseSettings):
     worker_retry_base_seconds: int = Field(default=10, ge=1, le=3600)
     worker_retry_max_seconds: int = Field(default=300, ge=1, le=86400)
     worker_max_attempts: int = Field(default=3, ge=1, le=20)
+
+    voice_stt_command: str = "whisper-cli"
+    voice_stt_model_path: str | None = None
+    voice_stt_language: str = "ru"
+    voice_stt_threads: int = Field(default=2, ge=1, le=8)
+    voice_stt_timeout_seconds: int = Field(default=90, ge=1, le=600)
+    voice_stt_max_concurrent_jobs: int = Field(default=1, ge=1, le=2)
+    voice_stt_queue_timeout_seconds: int = Field(default=5, ge=1, le=60)
+    voice_conversion_command: str = "ffmpeg"
+    voice_conversion_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    voice_download_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    voice_temp_dir: str | None = None
+    voice_max_file_size_bytes: int = Field(default=10_000_000, ge=1, le=20_000_000)
+    voice_max_duration_seconds: int = Field(default=120, ge=1, le=120)
+    voice_draft_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
+    voice_draft_cleanup_interval_seconds: int = Field(default=60, ge=10, le=86_400)
     admin_ids_raw: str = Field(
         default="",
         validation_alias=AliasChoices("ADMIN_IDS", "ADMIN_IDS_RAW"),

@@ -78,6 +78,9 @@ class User(Base):
     reminder_clarifications: Mapped[list[ReminderClarification]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    voice_reminder_drafts: Mapped[list[VoiceReminderDraft]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Reminder(Base):
@@ -251,6 +254,42 @@ class ActionDraft(Base):
     reminder: Mapped[Reminder] = relationship()
 
 
+class VoiceReminderDraft(Base):
+    """Restart-safe, confirmation-gated draft created from a voice message."""
+
+    __tablename__ = "voice_reminder_drafts"
+    __table_args__ = (
+        Index("uq_voice_reminder_drafts_user_chat", "user_id", "chat_id", unique=True),
+        Index("ix_voice_reminder_drafts_user_id", "user_id"),
+        Index("ix_voice_reminder_drafts_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    transcript: Mapped[str] = mapped_column(Text, nullable=False)
+    reminder_text: Mapped[str] = mapped_column(Text, nullable=False)
+    remind_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schedule_timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    datetime_semantics: Mapped[str] = mapped_column(String(16), nullable=False)
+    recurrence_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    recurrence_interval: Mapped[int] = mapped_column(Integer, nullable=False)
+    recurrence_day_of_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recurrence_rule: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    preview_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    user: Mapped[User] = relationship(back_populates="voice_reminder_drafts")
+
+
 class ReminderClarification(Base):
     """Bounded, restart-safe state for an ambiguous reminder input."""
 
@@ -265,6 +304,9 @@ class ReminderClarification(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="text")
+    voice_transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     clarification_type: Mapped[str] = mapped_column(String(32), nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
