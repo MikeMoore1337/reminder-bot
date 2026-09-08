@@ -29,6 +29,7 @@ from app.services.timezone_service import (
 from app.workers.reminder_worker import reminder_actions_kb
 
 router = Router()
+LIST_PAGE_SIZE = 20
 
 START_TEXT = (
     "👋 <b>Привет! Я бот-напоминалка.</b>\n\n"
@@ -84,7 +85,7 @@ HELP_TEXT = (
     "- /digest on|off — утренний и вечерний список незавершённых дел\n"
     "- обе функции выключены по умолчанию и включаются только явно\n\n"
     "📋 <b>Команды</b>\n"
-    "/list - список активных напоминаний\n"
+    "/list [страница] - список активных напоминаний\n"
     "/cancel ID - удалить напоминание; /cancel - отменить действие\n"
     "/timezone Europe/Moscow - установить часовой пояс\n"
     "/mytimezone - показать текущий часовой пояс\n\n"
@@ -119,13 +120,41 @@ def _get_ids(message: Message) -> tuple[int, int]:
     return message.from_user.id, message.chat.id
 
 
-def _render_reminders(reminders: list[Reminder], timezone_name: str) -> str:
+def _list_page_bounds(total: int, requested_page: int) -> tuple[int, int, int, int]:
+    total_pages = max(1, (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    page = min(max(1, requested_page), total_pages)
+    start = (page - 1) * LIST_PAGE_SIZE
+    return page, total_pages, start, min(start + LIST_PAGE_SIZE, total)
+
+
+def _parse_list_page(command: CommandObject) -> int:
+    value = (command.args or "").strip().split(maxsplit=1)
+    if not value:
+        return 1
+    try:
+        return max(1, int(value[0]))
+    except ValueError:
+        return 1
+
+
+def _render_reminders(
+    reminders: list[Reminder],
+    timezone_name: str,
+    *,
+    page: int = 1,
+) -> str:
+    current_page, total_pages, start, end = _list_page_bounds(len(reminders), page)
     rendered = "\n\n".join(
         f"{index}. {format_reminder_for_user(reminder, timezone_name)}"
-        for index, reminder in enumerate(reminders[:20], start=1)
+        for index, reminder in enumerate(reminders[start:end], start=start + 1)
     )
-    if len(reminders) > 20:
-        rendered += f"\n\nПоказаны первые 20 из {len(reminders)}"
+    if len(reminders) > LIST_PAGE_SIZE:
+        navigation: list[str] = []
+        if current_page > 1:
+            navigation.append(f"предыдущая: /list {current_page - 1}")
+        if current_page < total_pages:
+            navigation.append(f"следующая: /list {current_page + 1}")
+        rendered += f"\n\nПоказаны {start + 1}–{end} из {len(reminders)} · {'; '.join(navigation)}"
     return rendered
 
 
@@ -185,8 +214,11 @@ async def _send_actionable_reminders(
     user: User,
     reminders: list[Reminder],
     timezone_name: str,
+    *,
+    page: int = 1,
 ) -> None:
-    for reminder in reminders[:20]:
+    current_page, total_pages, start, end = _list_page_bounds(len(reminders), page)
+    for reminder in reminders[start:end]:
         occurrence = None
         latest_occurrence = await get_latest_occurrence(user, reminder.id)
         if (
@@ -238,8 +270,15 @@ async def _send_actionable_reminders(
             ),
             parse_mode="HTML",
         )
-    if len(reminders) > 20:
-        await message.answer(f"Показаны первые 20 из {len(reminders)}")
+    if len(reminders) > LIST_PAGE_SIZE:
+        navigation: list[str] = []
+        if current_page > 1:
+            navigation.append(f"предыдущая: /list {current_page - 1}")
+        if current_page < total_pages:
+            navigation.append(f"следующая: /list {current_page + 1}")
+        await message.answer(
+            f"Показаны {start + 1}–{end} из {len(reminders)} · {'; '.join(navigation)}"
+        )
 
 
 @router.message(Command("start"))
@@ -320,10 +359,12 @@ async def cmd_digest(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("list"))
-async def cmd_list(message: Message) -> None:
+async def cmd_list(message: Message, command: CommandObject) -> None:
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
     reminders = await list_active_reminders(user)
+    page = _parse_list_page(command)
+    current_page, _, _, _ = _list_page_bounds(len(reminders), page)
 
     if not reminders:
         await message.answer(
@@ -335,14 +376,15 @@ async def cmd_list(message: Message) -> None:
 
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
     await message.answer("📋 <b>Твои активные напоминания:</b>", parse_mode="HTML")
-    await _send_actionable_reminders(message, user, reminders, timezone_name)
-    for suggestion in await get_pending_suggestions(user, limit=5):
-        reminder = next((item for item in reminders if item.id == suggestion.reminder_id), None)
-        await message.answer(
-            format_suggestion(suggestion, reminder=reminder),
-            reply_markup=suggestion_kb(suggestion.id, suggestion.revision),
-            parse_mode="HTML",
-        )
+    await _send_actionable_reminders(message, user, reminders, timezone_name, page=page)
+    if current_page == 1:
+        for suggestion in await get_pending_suggestions(user, limit=5):
+            reminder = next((item for item in reminders if item.id == suggestion.reminder_id), None)
+            await message.answer(
+                format_suggestion(suggestion, reminder=reminder),
+                reply_markup=suggestion_kb(suggestion.id, suggestion.revision),
+                parse_mode="HTML",
+            )
     await message.answer(
         "Выбери действие кнопкой выше или обнови список командой /list.",
         reply_markup=get_main_keyboard(),

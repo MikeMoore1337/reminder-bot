@@ -1044,7 +1044,7 @@ def render_digest(
     ]
     persistent_aggregate_line = (
         f"🔔 ВАЖНЫЕ НАПОМИНАНИЯ: {len(persistent_reminders)} шт. · "
-        "все учтены; полный список: /list\n"
+        "все учтены; полный список: /list, затем /list 2, /list 3…\n"
     )
     current_length = len("".join(result))
     marker_reservation = len(DIGEST_TRUNCATION_MARKER) if ordinary else 0
