@@ -56,7 +56,7 @@ def test_worker_retry_max_cannot_be_below_retry_base() -> None:
         _settings(worker_retry_base_seconds=60, worker_retry_max_seconds=30)
 
 
-def test_condition_bounds_are_opt_in_and_lease_covers_request_timeout() -> None:
+def test_condition_bounds_are_opt_in_and_lease_covers_request_with_margin() -> None:
     settings = _settings()
 
     assert settings.condition_worker_enabled is False
@@ -65,11 +65,13 @@ def test_condition_bounds_are_opt_in_and_lease_covers_request_timeout() -> None:
     assert settings.condition_drain_interval_seconds == 1
     assert settings.condition_authorization_env_allowlist == frozenset()
     assert settings.condition_authorization_env_bindings == {}
-    assert settings.condition_lease_duration_seconds > settings.condition_request_timeout_seconds
+    assert settings.condition_lease_duration_seconds > (
+        settings.condition_request_timeout_seconds + settings.worker_lease_safety_margin_seconds
+    )
     assert settings.condition_retry_max_seconds >= settings.condition_retry_base_seconds
 
     with pytest.raises(ValidationError, match="condition_lease_duration_seconds"):
-        _settings(condition_request_timeout_seconds=30, condition_lease_duration_seconds=30)
+        _settings(condition_request_timeout_seconds=60, condition_lease_duration_seconds=61)
     with pytest.raises(ValidationError, match="condition_retry_max_seconds"):
         _settings(condition_retry_base_seconds=60, condition_retry_max_seconds=30)
 

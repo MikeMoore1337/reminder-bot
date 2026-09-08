@@ -143,10 +143,13 @@ class Settings(BaseSettings):
                 "condition_retry_max_seconds must be greater than or equal to "
                 "condition_retry_base_seconds"
             )
-        if self.condition_lease_duration_seconds <= self.condition_request_timeout_seconds:
+        if self.condition_lease_duration_seconds <= (
+            self.condition_request_timeout_seconds + self.worker_lease_safety_margin_seconds
+        ):
             raise ValueError(
                 "condition_lease_duration_seconds must be greater than "
-                "condition_request_timeout_seconds"
+                "condition_request_timeout_seconds plus "
+                "worker_lease_safety_margin_seconds"
             )
         for raw_name in self.condition_authorization_env_allowlist_raw.split(","):
             name = raw_name.strip().upper()

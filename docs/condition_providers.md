@@ -88,10 +88,12 @@ The optional `condition_worker` loop is separate and is not wired into the
 existing time worker. Defaults are conservative: batch size 10, five-minute
 poll interval, ten bounded drain batches per pass with a one-second drain
 cadence when more due work remains, ten-second request timeout, 64 KiB response
-limit, 60-second retry base, one-hour retry cap, and a 90-second lease. Observation cleanup runs
-at most once per hour by default and retains the last 90 days. Settings
-validation requires the lease to exceed the request timeout and the retry cap
-to cover the retry base. Cleanup runs in the supervised condition worker on
+limit, 60-second retry base, one-hour retry cap, and a 90-second lease. The
+condition lease must exceed the request timeout by the bounded
+`WORKER_LEASE_SAFETY_MARGIN_SECONDS` so the result transaction cannot race the
+lease expiry. Observation cleanup runs at most once per hour by default and
+retains the last 90 days. Settings validation also requires the retry cap to
+cover the retry base. Cleanup runs in the supervised condition worker on
 its own bounded cadence; a cleanup failure is logged as a safe error and does
 not stop condition polling or the time worker, with a later cadence retry.
 

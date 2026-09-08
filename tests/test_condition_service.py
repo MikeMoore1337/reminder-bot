@@ -81,6 +81,7 @@ def _settings(**overrides: object) -> Settings:
         "condition_poll_interval_seconds": 30,
         "condition_request_timeout_seconds": 1,
         "condition_lease_duration_seconds": 5,
+        "worker_lease_safety_margin_seconds": 1,
         "condition_retry_base_seconds": 10,
         "condition_retry_max_seconds": 60,
     }
