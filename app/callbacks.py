@@ -14,6 +14,8 @@ class CallbackTarget(StrEnum):
     VOICE_DRAFT = "v"
     DEADLINE_DRAFT = "d"
     SUGGESTION = "s"
+    MEMBERSHIP = "m"
+    INVITE = "i"
 
 
 class CallbackOrigin(StrEnum):
@@ -24,6 +26,7 @@ class CallbackOrigin(StrEnum):
     VOICE = "v"
     DEADLINE = "e"
     SUGGESTION = "s"
+    SHARED = "h"
 
 
 class CallbackAction(StrEnum):
@@ -46,6 +49,7 @@ class CallbackAction(StrEnum):
     SUGGESTION_ACCEPT = "sok"
     SUGGESTION_REJECT = "sno"
     SUGGESTION_DISMISS = "sdismiss"
+    REVOKE = "revoke"
 
 
 @dataclass(frozen=True, slots=True)

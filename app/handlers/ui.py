@@ -8,6 +8,7 @@ from app.callbacks import CallbackOrigin
 from app.db.models import OccurrenceState, Reminder, User
 from app.keyboards.adaptive import suggestion_kb
 from app.keyboards.reply import get_main_keyboard, get_timezone_keyboard
+from app.services import shared_reminder_service
 from app.services.adaptive_service import (
     AdaptivePreferences,
     format_suggestion,
@@ -86,6 +87,8 @@ HELP_TEXT = (
     "- обе функции выключены по умолчанию и включаются только явно\n\n"
     "📋 <b>Команды</b>\n"
     "/list [страница] - список активных напоминаний\n"
+    "/share ID - создать одноразовую ссылку-приглашение\n"
+    "/shared - общие напоминания и отзыв доступа\n"
     "/cancel ID - удалить напоминание; /cancel - отменить действие\n"
     "/timezone Europe/Moscow - установить часовой пояс\n"
     "/mytimezone - показать текущий часовой пояс\n\n"
@@ -282,12 +285,25 @@ async def _send_actionable_reminders(
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, command: CommandObject) -> None:
     telegram_user_id, chat_id = _get_ids(message)
-    await get_or_create_user(telegram_user_id, chat_id)
+    user = await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
 
     text = f"{START_TEXT}\n\n🕒 <b>Твой часовой пояс:</b> <code>{timezone_name}</code>"
+
+    payload = (command.args or "").strip()
+    if payload.startswith(shared_reminder_service.SHARED_INVITE_PREFIX):
+        if getattr(message.chat, "type", None) != "private":
+            text = "❌ Приглашение можно принять только в личном чате с ботом.\n\n" + text
+        else:
+            acceptance = await shared_reminder_service.accept_invite(user, payload)
+            if acceptance.accepted:
+                text = "✅ Доступ к общему напоминанию предоставлен. Открой /shared.\n\n" + text
+            elif acceptance.already_member:
+                text = "ℹ️ Ты уже участник этого общего напоминания. Открой /shared.\n\n" + text
+            else:
+                text = "❌ Приглашение недействительно, отозвано или истекло.\n\n" + text
 
     await message.answer(
         text,

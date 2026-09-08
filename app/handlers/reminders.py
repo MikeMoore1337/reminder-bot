@@ -20,7 +20,7 @@ from app.db.models import Reminder, ReminderKind, User, VoiceReminderDraft
 from app.keyboards.adaptive import suggestion_kb
 from app.keyboards.deadline import deadline_draft_kb
 from app.keyboards.voice import voice_draft_kb
-from app.services import reminder_service
+from app.services import reminder_service, shared_reminder_service
 from app.services.adaptive_service import (
     format_suggestion,
     get_pending_suggestion,
@@ -831,6 +831,20 @@ async def reminder_callback(callback: CallbackQuery) -> None:
         chat_id=callback_message.chat.id,
     )
     target = await _resolve_callback_target(parsed, user)
+    shared_target = None
+    if target is None and parsed.target == CallbackTarget.OCCURRENCE:
+        candidate = await shared_reminder_service.resolve_shared_occurrence_target(
+            user,
+            parsed.target_id,
+        )
+        if candidate is not None and not candidate.is_owner:
+            shared_target = candidate
+            target = (
+                candidate.reminder_id,
+                candidate.occurrence_id,
+                candidate.occurrence_at_utc,
+                None,
+            )
     if target is None:
         reminder_service.record_unauthorized_callback()
         await callback.answer(STALE_FEEDBACK, show_alert=False)
@@ -841,6 +855,85 @@ async def reminder_callback(callback: CallbackQuery) -> None:
         occurrence_id,
         callback_message.message_id,
     )
+
+    if shared_target is not None:
+        if parsed.action == CallbackAction.SNOOZE:
+            valid = await shared_reminder_service.validate_shared_action_target(
+                user,
+                reminder_id,
+                occurrence_id or 0,
+                expected_revision=parsed.revision,
+                expected_occurrence_at_utc=occurrence_at_utc,
+                expected_message_id=expected_message_id,
+            )
+            if not valid:
+                await callback.answer(STALE_FEEDBACK, show_alert=False)
+                return
+            await callback.answer("Выбери время", show_alert=False)
+            await callback_message.edit_reply_markup(
+                reply_markup=snooze_presets_kb(
+                    reminder_id,
+                    occurrence_id=occurrence_id,
+                    revision=parsed.revision,
+                    origin=parsed.origin,
+                    include_custom=False,
+                )
+            )
+            return
+
+        if parsed.action in {
+            CallbackAction.SNOOZE_10,
+            CallbackAction.SNOOZE_1H,
+            CallbackAction.SNOOZE_EVENING,
+            CallbackAction.SNOOZE_TOMORROW,
+        }:
+            preset = {
+                CallbackAction.SNOOZE_10: "10m",
+                CallbackAction.SNOOZE_1H: "1h",
+                CallbackAction.SNOOZE_EVENING: "evening",
+                CallbackAction.SNOOZE_TOMORROW: "tomorrow",
+            }[parsed.action]
+            target_at_utc = calculate_snooze_target(
+                preset,
+                now_utc=reminder_service.utc_now(),
+                timezone_name=user.timezone,
+            )
+            snoozed = await shared_reminder_service.snooze_shared_reminder(
+                user,
+                reminder_id,
+                occurrence_id or 0,
+                target_at_utc,
+                expected_revision=parsed.revision,
+                expected_occurrence_at_utc=occurrence_at_utc,
+                expected_message_id=expected_message_id,
+                now_utc=reminder_service.utc_now(),
+            )
+            if not snoozed:
+                await callback.answer(STALE_FEEDBACK, show_alert=False)
+                return
+            local_dt = from_utc_to_user(target_at_utc, user.timezone)
+            await callback.answer("Отложено", show_alert=False)
+            await _safe_remove_keyboard(callback_message)
+            await callback_message.answer(f"Отложено до {local_dt.strftime('%d.%m.%Y %H:%M')}")
+            return
+
+        if parsed.action == CallbackAction.DONE:
+            completed = await shared_reminder_service.complete_shared_reminder(
+                user,
+                reminder_id,
+                occurrence_id or 0,
+                expected_revision=parsed.revision,
+                expected_occurrence_at_utc=occurrence_at_utc,
+                expected_message_id=expected_message_id,
+                now_utc=reminder_service.utc_now(),
+            )
+            await callback.answer("Готово" if completed else STALE_FEEDBACK, show_alert=False)
+            if completed:
+                await _safe_remove_keyboard(callback_message)
+            return
+
+        await callback.answer(STALE_FEEDBACK, show_alert=False)
+        return
 
     if parsed.action == CallbackAction.SNOOZE:
         if not await reminder_service.validate_action_target(

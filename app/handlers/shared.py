@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+from datetime import datetime
+from html import escape
+
+from aiogram import Bot, F, Router
+from aiogram.filters import Command, CommandObject
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+
+from app.callbacks import CallbackAction, CallbackOrigin, CallbackTarget, parse_callback
+from app.db.models import OccurrenceState, Reminder, ReminderOccurrence
+from app.keyboards.shared import revoke_invite_kb, revoke_membership_kb
+from app.services import shared_reminder_service
+from app.services.reminder_service import delivery_at_utc, format_state
+from app.services.timezone_service import get_or_create_user
+from app.utils.datetime_utils import from_utc_to_user
+from app.workers.reminder_worker import reminder_actions_kb
+
+router = Router()
+
+
+def _private_chat(message: Message) -> bool:
+    return getattr(message.chat, "type", None) == "private"
+
+
+def _ids(message: Message) -> tuple[int, int]:
+    if message.from_user is None:
+        raise ValueError("Не удалось определить пользователя")
+    return message.from_user.id, message.chat.id
+
+
+def _shared_reminder_text(
+    reminder: Reminder,
+    timezone_name: str,
+    *,
+    display_state: str | None = None,
+    display_at_utc: datetime | None = None,
+) -> str:
+    local_dt = from_utc_to_user(display_at_utc or delivery_at_utc(reminder), timezone_name)
+    return (
+        f"ID: {reminder.id}\n"
+        f"Состояние: {format_state(display_state or reminder.state)}\n"
+        f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        f"Текст: {escape(reminder.text)}"
+    )
+
+
+def _entry_markup(
+    entry: shared_reminder_service.SharedReminderView,
+    occurrence: ReminderOccurrence | None,
+) -> InlineKeyboardMarkup | None:
+    reminder = entry.reminder
+    if occurrence is not None:
+        state = OccurrenceState.DELIVERED.value
+        occurrence_id = occurrence.id
+        revision = occurrence.action_revision
+    elif entry.is_owner:
+        state = reminder.state
+        occurrence_id = None
+        revision = reminder.action_revision
+    else:
+        return None
+    return reminder_actions_kb(
+        reminder.id,
+        occurrence_id=occurrence_id,
+        revision=revision,
+        state=state,
+        recurrence_type=reminder.recurrence_type,
+        include_snooze=entry.is_owner or occurrence is not None,
+        origin=CallbackOrigin.SHARED,
+        mode=reminder.mode,
+        reminder_kind=reminder.kind,
+        deadline_plan_state=reminder.deadline_plan_state,
+        shared_participant=not entry.is_owner,
+    )
+
+
+async def _require_private(message: Message) -> bool:
+    if _private_chat(message):
+        return True
+    await message.answer("Общие напоминания доступны только в личном чате с ботом.")
+    return False
+
+
+@router.message(Command("share"))
+async def cmd_share(message: Message, command: CommandObject, bot: Bot) -> None:
+    if not await _require_private(message):
+        return
+    telegram_user_id, chat_id = _ids(message)
+    owner = await get_or_create_user(telegram_user_id, chat_id)
+    raw_id = (command.args or "").strip()
+    try:
+        reminder_id = int(raw_id)
+    except ValueError:
+        reminder_id = 0
+    if reminder_id < 1 or raw_id != str(reminder_id):
+        await message.answer("Используй: <code>/share ID</code>")
+        return
+    try:
+        identity = await bot.get_me()
+        username = getattr(identity, "username", None)
+        if not isinstance(username, str) or not username:
+            await message.answer("❌ У бота не настроено имя для ссылок-приглашений.")
+            return
+        invite = await shared_reminder_service.create_invite(owner, reminder_id)
+    except shared_reminder_service.SharedReminderError as exc:
+        await message.answer(f"❌ {exc}")
+        return
+    except Exception:
+        await message.answer("❌ Не удалось подготовить приглашение. Попробуй позже.")
+        return
+    link = f"https://t.me/{username}?start={shared_reminder_service.invite_start_payload(invite.token)}"
+    await message.answer(
+        "🔗 <b>Приглашение создано</b>\n\n"
+        "Передай эту ссылку одному человеку. Она одноразовая и действует 24 часа:\n"
+        f"<code>{escape(link)}</code>\n\n"
+        "Отозвать ссылку или доступ можно командой /shared.",
+        parse_mode="HTML",
+    )
+
+
+def _render_shared_header(entry: shared_reminder_service.SharedReminderView) -> str:
+    role = "владелец" if entry.is_owner else "участник"
+    return (
+        f"🤝 <b>Общее напоминание · {role}</b>\n"
+        f"Участников: <code>{entry.participant_count + 1}</code>"
+    )
+
+
+@router.message(Command("shared"))
+async def cmd_shared(message: Message) -> None:
+    if not await _require_private(message):
+        return
+    telegram_user_id, chat_id = _ids(message)
+    user = await get_or_create_user(telegram_user_id, chat_id)
+    entries = await shared_reminder_service.list_shared_reminders(user)
+    if not entries:
+        await message.answer(
+            "🤝 Общих напоминаний пока нет.\n\n"
+            "Владелец может создать ссылку командой <code>/share ID</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    timezone_name = user.timezone
+    for entry in entries:
+        occurrence = await shared_reminder_service.get_shared_occurrence(
+            user,
+            entry.reminder.id,
+        )
+        display_state = OccurrenceState.DELIVERED.value if occurrence is not None else None
+        await message.answer(
+            f"{_render_shared_header(entry)}\n\n"
+            + _shared_reminder_text(
+                entry.reminder,
+                timezone_name,
+                display_state=display_state,
+                display_at_utc=occurrence.delivery_at_utc if occurrence is not None else None,
+            ),
+            reply_markup=_entry_markup(entry, occurrence),
+            parse_mode="HTML",
+        )
+        if entry.is_owner:
+            for member in entry.members:
+                await message.answer(
+                    f"Участник <code>#{member.membership_id}</code>",
+                    reply_markup=revoke_membership_kb(
+                        member.membership_id,
+                        member.revision,
+                    ),
+                    parse_mode="HTML",
+                )
+            for invite in entry.pending_invites:
+                expires_local = from_utc_to_user(invite.expires_at, timezone_name)
+                await message.answer(
+                    f"Активная ссылка <code>#{invite.invite_id}</code> до "
+                    f"<code>{expires_local.strftime('%d.%m.%Y %H:%M')}</code>",
+                    reply_markup=revoke_invite_kb(invite.invite_id, invite.revision),
+                    parse_mode="HTML",
+                )
+
+
+async def _remove_keyboard(callback: CallbackQuery) -> None:
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            return
+
+
+async def _revoke_callback(callback: CallbackQuery) -> None:
+    parsed = parse_callback(callback.data)
+    if (
+        parsed is None
+        or parsed.action != CallbackAction.REVOKE
+        or parsed.origin != CallbackOrigin.SHARED
+        or not isinstance(callback.message, Message)
+        or callback.from_user is None
+        or getattr(callback.message.chat, "type", None) != "private"
+    ):
+        await callback.answer("Устарело", show_alert=False)
+        return
+    owner = await get_or_create_user(
+        telegram_user_id=callback.from_user.id,
+        chat_id=callback.message.chat.id,
+    )
+    if parsed.target == CallbackTarget.MEMBERSHIP:
+        revoked = await shared_reminder_service.revoke_membership(
+            owner,
+            parsed.target_id,
+            expected_revision=parsed.revision,
+        )
+        text = "Доступ отозван" if revoked else "Ссылка или доступ уже недействительны"
+    elif parsed.target == CallbackTarget.INVITE:
+        revoked = await shared_reminder_service.revoke_invite(
+            owner,
+            parsed.target_id,
+            expected_revision=parsed.revision,
+        )
+        text = "Ссылка отозвана" if revoked else "Ссылка уже недействительна"
+    else:
+        await callback.answer("Устарело", show_alert=False)
+        return
+    await callback.answer(text, show_alert=False)
+    if revoked:
+        await _remove_keyboard(callback)
+
+
+@router.callback_query(F.data.startswith("r1:revoke:m:"))
+async def revoke_membership_callback(callback: CallbackQuery) -> None:
+    await _revoke_callback(callback)
+
+
+@router.callback_query(F.data.startswith("r1:revoke:i:"))
+async def revoke_invite_callback(callback: CallbackQuery) -> None:
+    await _revoke_callback(callback)

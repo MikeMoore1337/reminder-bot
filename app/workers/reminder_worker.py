@@ -35,6 +35,7 @@ from app.db.models import (
     User,
 )
 from app.db.session import SessionLocal
+from app.services import shared_reminder_service
 from app.services.adaptive_service import cleanup_adaptive_data, process_due_digests
 from app.services.deadline_service import (
     cleanup_expired_deadline_drafts,
@@ -125,6 +126,7 @@ def reminder_actions_kb(
     mode: str = "normal",
     reminder_kind: str = ReminderKind.ORDINARY.value,
     deadline_plan_state: str | None = None,
+    shared_participant: bool = False,
 ) -> InlineKeyboardMarkup:
     # Keep the old helper call useful for callers that only want a compact
     # cancellation button. Real delivery cards always pass an occurrence id.
@@ -167,6 +169,8 @@ def reminder_actions_kb(
         rows.append([button("✅ Готово", CallbackAction.DONE)])
         if include_snooze and not is_deadline:
             rows.append([button("⏰ Отложить", CallbackAction.SNOOZE)])
+        if shared_participant:
+            return InlineKeyboardMarkup(inline_keyboard=rows)
         rows.append([button("✏️ Изменить", CallbackAction.EDIT)])
         if recurrence_type != RecurrenceType.NONE.value and not is_deadline:
             rows.append([button("⏸ Пауза", CallbackAction.PAUSE)])
@@ -208,10 +212,11 @@ def snooze_presets_kb(
     occurrence_id: int | None,
     revision: int,
     origin: CallbackOrigin | str = CallbackOrigin.DELIVERY,
+    include_custom: bool = True,
 ) -> InlineKeyboardMarkup:
     target = CallbackTarget.OCCURRENCE if occurrence_id is not None else CallbackTarget.REMINDER
     target_id = occurrence_id or reminder_id
-    return InlineKeyboardMarkup(
+    markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
@@ -271,6 +276,9 @@ def snooze_presets_kb(
             ],
         ]
     )
+    if not include_custom:
+        markup.inline_keyboard.pop()
+    return markup
 
 
 def classify_delivery_error(exc: BaseException) -> DeliveryFailure:
@@ -1049,7 +1057,9 @@ async def _send_delivery(
     context: MessageContextSnapshot | None,
     *,
     reply_markup: InlineKeyboardMarkup,
+    chat_id: int | None = None,
 ) -> Any:
+    destination_chat_id = reminder.chat_id if chat_id is None else chat_id
     delivery_text = _delivery_text(reminder, context)
     if (
         context is not None
@@ -1064,7 +1074,7 @@ async def _send_delivery(
             media_argument = "photo" if media_kind == "photo" else "document"
             try:
                 return await media_method(
-                    chat_id=reminder.chat_id,
+                    chat_id=destination_chat_id,
                     **{media_argument: context.media_file_id},
                     caption=delivery_text,
                     reply_markup=reply_markup,
@@ -1085,10 +1095,163 @@ async def _send_delivery(
                     media_unavailable=True,
                 )
     return await bot.send_message(
-        chat_id=reminder.chat_id,
+        chat_id=destination_chat_id,
         text=delivery_text,
         reply_markup=reply_markup,
     )
+
+
+async def _process_shared_delivery(
+    bot: Bot,
+    reminder: Reminder,
+    occurrence_id: int,
+    *,
+    stop_event: asyncio.Event | None = None,
+) -> bool:
+    """Fan out one occurrence through durable per-recipient rows.
+
+    The parent reminder lease still serializes the occurrence. Each recipient
+    row makes a restart after a completed send idempotent and binds callbacks
+    to the participant membership generation that received the message.
+    """
+
+    lease_token = reminder.lease_token
+    if lease_token is None:
+        return False
+    try:
+        delivery_ids = await shared_reminder_service.prepare_shared_delivery_recipients(
+            reminder.id,
+            occurrence_id,
+            lease_token,
+            now_utc=utc_now(),
+        )
+    except shared_reminder_service.SharedReminderError:
+        await _finalize_send_failure(
+            reminder,
+            DeliveryFailure(
+                kind=DeliveryErrorKind.TERMINAL,
+                error_type="SharedDeliveryLimit",
+            ),
+        )
+        return False
+
+    had_transient_failure = False
+    for delivery_id in delivery_ids:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        if not await renew_claim_before_send(reminder.id, lease_token):
+            return False
+        target = await shared_reminder_service.claim_shared_delivery(
+            delivery_id,
+            reminder.id,
+            occurrence_id,
+            lease_token,
+            now_utc=utc_now(),
+            lease_seconds=settings.worker_lease_duration_seconds,
+        )
+        if target is None:
+            continue
+
+        context: MessageContextSnapshot | None = None
+        if target.is_owner and reminder.context_kind is not None:
+            try:
+                context = await get_context_for_delivery(
+                    reminder.id,
+                    reminder.user_id,
+                    reminder.chat_id,
+                    now_utc=utc_now(),
+                )
+            except Exception as exc:
+                failure = classify_delivery_error(exc)
+                recorded = await shared_reminder_service.record_shared_delivery_failure(
+                    target,
+                    error_kind=failure.kind.value,
+                    error_type=failure.error_type,
+                    reminder_lease_token=lease_token,
+                    now_utc=utc_now(),
+                )
+                had_transient_failure |= recorded and failure.kind == DeliveryErrorKind.TRANSIENT
+                continue
+
+        try:
+            sent = await asyncio.wait_for(
+                _send_delivery(
+                    bot,
+                    reminder,
+                    context,
+                    chat_id=target.chat_id,
+                    reply_markup=reminder_actions_kb(
+                        reminder.id,
+                        occurrence_id=occurrence_id,
+                        revision=target.action_revision,
+                        state=ReminderState.DELIVERED.value,
+                        recurrence_type=reminder.recurrence_type,
+                        include_snooze=True,
+                        mode=reminder.mode,
+                        reminder_kind=reminder.kind,
+                        deadline_plan_state=reminder.deadline_plan_state,
+                        shared_participant=not target.is_owner,
+                    ),
+                ),
+                timeout=settings.worker_send_timeout_seconds,
+            )
+            message_id = getattr(sent, "message_id", None)
+            if not isinstance(message_id, int) or message_id < 1:
+                raise ValueError("Telegram delivery did not return a message id")
+        except Exception as exc:
+            failure = classify_delivery_error(exc)
+            recorded = await shared_reminder_service.record_shared_delivery_failure(
+                target,
+                error_kind=failure.kind.value,
+                error_type=failure.error_type,
+                reminder_lease_token=lease_token,
+                now_utc=utc_now(),
+            )
+            had_transient_failure |= recorded and failure.kind == DeliveryErrorKind.TRANSIENT
+            continue
+
+        await shared_reminder_service.record_shared_delivery_success(
+            target,
+            message_id,
+            reminder_lease_token=lease_token,
+            now_utc=utc_now(),
+        )
+
+    if stop_event is not None and stop_event.is_set():
+        return False
+    if had_transient_failure:
+        await _finalize_send_failure(
+            reminder,
+            DeliveryFailure(
+                kind=DeliveryErrorKind.TRANSIENT,
+                error_type="SharedRecipientDelivery",
+            ),
+        )
+        return False
+
+    delivery_status = await shared_reminder_service.get_shared_delivery_status(
+        reminder.id,
+        occurrence_id,
+        action_revision=reminder.action_revision,
+    )
+    if not delivery_status.complete:
+        return False
+    if delivery_status.owner_message_id is not None and not await set_last_message_id(
+        reminder.id,
+        delivery_status.owner_message_id,
+        lease_token=lease_token,
+        occurrence_at_utc=reminder.remind_at_utc,
+        now_utc=utc_now(),
+    ):
+        return False
+    if not await finalize_delivery_success(reminder.id, lease_token):
+        return False
+    worker_metrics.delivered += 1
+    logger.info(
+        "Shared reminder delivered",
+        extra={"extra_data": f"reminder_id={reminder.id} recipient_rows={len(delivery_ids)}"},
+    )
+    return True
 
 
 async def process_claimed_reminder(
@@ -1123,6 +1286,17 @@ async def process_claimed_reminder(
         return False
     if stop_event is not None and stop_event.is_set():
         return False
+
+    if await shared_reminder_service.is_shared_reminder(
+        reminder.id,
+        session_factory=SessionLocal,
+    ):
+        return await _process_shared_delivery(
+            bot,
+            reminder,
+            occurrence_id,
+            stop_event=stop_event,
+        )
 
     attempt_number = reminder.attempt_count
     context: MessageContextSnapshot | None = None
@@ -1307,6 +1481,7 @@ async def reminder_loop(bot: Bot, stop_event: asyncio.Event | None = None) -> No
             await cleanup_expired_reminder_contexts(now_utc=current_time)
             if hasattr(settings, "digest_worker_enabled"):
                 await cleanup_adaptive_data(now_utc=current_time)
+            await shared_reminder_service.cleanup_expired_shared_data(now_utc=current_time)
             last_voice_cleanup_at = current_time
         if await _wait_for_stop(stop_event, settings.worker_poll_interval_seconds):
             break

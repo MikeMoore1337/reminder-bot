@@ -8,7 +8,7 @@ from datetime import UTC, datetime, time, timedelta
 from html import escape
 from typing import Any, cast
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,10 +21,14 @@ from app.db.models import (
     Reminder,
     ReminderClarification,
     ReminderContext,
+    ReminderDelivery,
+    ReminderDeliveryState,
     ReminderKind,
     ReminderMode,
     ReminderOccurrence,
     ReminderState,
+    SharedMembershipState,
+    SharedReminderMembership,
     User,
     VoiceReminderDraft,
 )
@@ -1147,6 +1151,48 @@ def _reset_delivery_retry(reminder: Reminder) -> None:
     reminder.error_text = None
 
 
+async def _reset_shared_delivery_rows(session: Any, occurrence_id: int) -> None:
+    """Start a fresh fan-out generation after an owner snooze."""
+
+    await session.execute(
+        update(ReminderDelivery)
+        .where(ReminderDelivery.occurrence_id == occurrence_id)
+        .values(
+            state=ReminderDeliveryState.PENDING.value,
+            action_revision=0,
+            attempt_count=0,
+            lease_until=None,
+            lease_token=None,
+            message_id=None,
+            sent_at=None,
+            last_error=None,
+            error_kind=None,
+        )
+    )
+
+
+async def _cancel_shared_delivery_rows(session: Any, occurrence_id: int) -> None:
+    """Fence pending shared recipients when an owner completes an occurrence."""
+
+    await session.execute(
+        update(ReminderDelivery)
+        .where(
+            ReminderDelivery.occurrence_id == occurrence_id,
+            ReminderDelivery.state.in_(
+                (
+                    ReminderDeliveryState.PENDING.value,
+                    ReminderDeliveryState.PROCESSING.value,
+                )
+            ),
+        )
+        .values(
+            state=ReminderDeliveryState.CANCELLED.value,
+            lease_until=None,
+            lease_token=None,
+        )
+    )
+
+
 async def _cancel_children(session: Any, parent_id: int, now_utc: datetime) -> None:
     result = await session.execute(
         select(Reminder)
@@ -1641,6 +1687,8 @@ async def snooze_reminder(
             _reset_persistent_cycle(reminder)
         _reset_delivery_retry(reminder)
         _clear_delivery_identity(reminder)
+        if occurrence is not None:
+            await _reset_shared_delivery_rows(session, occurrence.id)
         await record_snooze_event_in_session(
             session,
             user_id=user.id,
@@ -1821,6 +1869,7 @@ async def complete_reminder(
                         _reset_delivery_retry(parent)
                         _clear_delivery_identity(parent)
 
+        await _cancel_shared_delivery_rows(session, occurrence.id)
         _record_action("completed", action="done", reminder_id=reminder.id)
         _record_action("action_success", action="done", reminder_id=reminder.id)
         return True
@@ -2048,6 +2097,19 @@ async def edit_reminder(
                 if new_recurrence == RecurrenceType.ADVANCED.value:
                     raise ValueError("Для advanced recurrence требуется каноническое правило")
                 new_interval = recurrence_interval or 1
+            if new_recurrence != RecurrenceType.NONE.value:
+                shared_membership = await session.scalar(
+                    select(SharedReminderMembership.id)
+                    .where(
+                        SharedReminderMembership.reminder_id == reminder.id,
+                        SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
+                    )
+                    .limit(1)
+                )
+                if shared_membership is not None:
+                    raise ValueError(
+                        "Для общего напоминания сначала отзови участников перед включением повторов"
+                    )
             validate_recurrence(new_recurrence, new_interval)
             if local_dt is None:
                 raise ValueError("Для изменения расписания укажи дату и время")

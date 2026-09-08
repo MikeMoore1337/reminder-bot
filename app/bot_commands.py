@@ -17,6 +17,8 @@ PUBLIC_COMMANDS = [
     BotCommand(command="remind", description="Создать напоминание"),
     BotCommand(command="deadline", description="Создать напоминание с защитой дедлайна"),
     BotCommand(command="list", description="Мои активные напоминания"),
+    BotCommand(command="share", description="Пригласить участника"),
+    BotCommand(command="shared", description="Общие напоминания"),
     BotCommand(command="cancel", description="Удалить напоминание или отменить действие"),
 ]
 
@@ -30,6 +32,8 @@ ADMIN_COMMANDS = [
     BotCommand(command="remind", description="Создать напоминание"),
     BotCommand(command="deadline", description="Создать напоминание с защитой дедлайна"),
     BotCommand(command="list", description="Мои активные напоминания"),
+    BotCommand(command="share", description="Пригласить участника"),
+    BotCommand(command="shared", description="Общие напоминания"),
     BotCommand(command="cancel", description="Удалить напоминание или отменить действие"),
     BotCommand(command="stats", description="Статистика бота"),
     BotCommand(command="failed", description="Ошибки отправки"),
