@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Reminder Bot — Текст, голос, повторы</title>
+  <desc id="desc">Clean productivity visual with a clock, a completed check mark and three reminder capabilities.</desc>
+  <rect width="1600" height="900" fill="#0f161e"/>
+  <circle cx="1510" cy="15" r="325" fill="#151e28"/>
+  <path d="M720 250V660M70 660H1490" stroke="#24333f" stroke-width="2"/>
+  <circle cx="135" cy="145" r="74" fill="#1b2631"/>
+  <circle cx="135" cy="145" r="65" fill="#bef449"/>
+  <circle cx="135" cy="143" r="55" fill="#151e28"/>
+  <circle cx="135" cy="143" r="42" fill="#bef449"/>
+  <circle cx="135" cy="143" r="32" fill="#151e28"/>
+  <path d="M135 143V120M135 143L150 146" stroke="#f2f7f4" stroke-width="8" stroke-linecap="round"/>
+  <path d="M149 162l13 12 27-35" fill="none" stroke="#f2f7f4" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="275" y="160" fill="#f2f7f4" font-family="Arial, sans-serif" font-size="56" font-weight="700" letter-spacing="5">REMINDER BOT</text>
+  <rect x="278" y="202" width="257" height="9" rx="4" fill="#bef449"/>
+  <rect x="840" y="70" width="640" height="570" rx="38" fill="#1b2631"/>
+  <rect x="895" y="125" width="530" height="460" rx="28" fill="#151e28"/>
+  <circle cx="1155" cy="295" r="128" fill="#bef449"/>
+  <circle cx="1155" cy="295" r="118" fill="#151e28"/>
+  <path d="M1155 295V233M1155 295l46 10" stroke="#f2f7f4" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="1155" cy="295" r="9" fill="#bef449"/>
+  <path d="M1289 260l17 16 36-45" fill="none" stroke="#5bdab8" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="1005" y="480" width="295" height="20" rx="10" fill="#24333f"/>
+  <rect x="1005" y="525" width="375" height="20" rx="10" fill="#24333f"/>
+  <rect x="1005" y="570" width="200" height="20" rx="10" fill="#ffc25b"/>
+  <circle cx="1340" cy="490" r="14" fill="#5bdab8"/>
+  <circle cx="1370" cy="535" r="14" fill="#bef449"/>
+  <circle cx="1225" cy="580" r="14" fill="#ffc25b"/>
+  <g font-family="Arial, sans-serif" font-size="48" font-weight="700" fill="#f2f7f4">
+    <rect x="70" y="710" width="450" height="132" rx="28" fill="#1b2631"/>
+    <circle cx="125" cy="776" r="29" fill="#bef449"/>
+    <text x="175" y="793">ТЕКСТ</text>
+    <rect x="570" y="710" width="450" height="132" rx="28" fill="#1b2631"/>
+    <circle cx="625" cy="776" r="29" fill="#5bdab8"/>
+    <text x="675" y="793">ГОЛОС</text>
+    <rect x="1070" y="710" width="450" height="132" rx="28" fill="#1b2631"/>
+    <circle cx="1125" cy="776" r="29" fill="#ffc25b"/>
+    <text x="1175" y="793">ПОВТОРЫ</text>
+  </g>
+</svg>

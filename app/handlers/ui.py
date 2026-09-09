@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from app.callbacks import CallbackOrigin
 from app.db.models import OccurrenceState, Reminder, User
@@ -28,74 +30,16 @@ from app.services.timezone_service import (
     get_user_timezone,
     set_user_timezone,
 )
+from app.telegram_metadata import (
+    HELP_TEXT,
+    START_TEXT,
+    WELCOME_IMAGE_PATH,
+)
 from app.workers.reminder_worker import reminder_actions_kb
 
 router = Router()
 LIST_PAGE_SIZE = 20
-
-START_TEXT = (
-    "👋 <b>Привет! Я бот-напоминалка.</b>\n\n"
-    "Помогаю не забывать важное:\n"
-    "- напоминания на дату и время\n"
-    "- напоминания через время\n"
-    "- повторяющиеся напоминания по календарным правилам\n\n"
-    "📌 <b>Примеры:</b>\n"
-    "- напомни через 30 минут проверить духовку\n"
-    "- напомни завтра в 9 созвон\n"
-    "- напомни каждый день в 10 выпить витамины\n\n"
-    "⏳ <b>Дедлайн с планом защиты</b>\n"
-    "- /deadline 2026-09-10 18:00 оплатить счёт\n"
-    "- /deadline 2026-09-10 18:00 оплатить счёт | за день, за час, в срок\n"
-    "- после создания бот покажет план и попросит подтверждение\n\n"
-    "🔔 Важное напоминание: «напомни важное завтра в 9 позвонить».\n\n"
-    "Выбери действие кнопкой ниже или просто напиши напоминание текстом."
-)
-
-HELP_TEXT = (
-    "❓ <b>Как пользоваться ботом</b>\n\n"
-    "🕒 <b>Разовые напоминания</b>\n"
-    "- напомни 31.03.2026 18:30 купить молоко\n"
-    "- напомни завтра в 9 созвон\n"
-    "- напомни сегодня в 20 вынести мусор\n\n"
-    "⏱ <b>Через время</b>\n"
-    "- напомни через 15 минут выключить духовку\n"
-    "- напомни через 2 часа выйти на созвон\n\n"
-    "🔁 <b>Повторяющиеся</b>\n"
-    "- напомни каждый день в 10 выпить витамины\n"
-    "- напомни каждый понедельник и четверг в 9 отправить отчёт\n"
-    "- напомни по будням в 18 проверить задачи\n"
-    "- напомни каждый второй вторник месяца в 10 оплатить счёт\n"
-    "- напомни в последнюю пятницу месяца в 18 получить зарплату\n"
-    "- напомни каждый год 15 марта в 9 годовщина\n"
-    "- напомни завтра в 9 отчёт, через 3 дня после выполнения\n"
-    "- повторяющиеся правила могут иметь границу «до 2026-12-31»\n\n"
-    "⏳ <b>Дедлайны</b>\n"
-    "- /deadline 2026-09-10 18:00 оплатить счёт\n"
-    "- точки: «за неделю», «за день», «утром», «за час», «в срок», «просрочено через час»\n"
-    "- план всегда показывает предварительный просмотр и требует подтверждения\n\n"
-    "🔔 <b>Важный режим</b>\n"
-    "- добавь «важное» после «напомни» или [важное] в конце строки\n"
-    "- бот повторяет доставку с ограничением и учитывает тихие часы\n"
-    "- остановить повторы можно кнопкой «Выключить повторы», «Готово», «Отложить» или «Удалить»\n\n"
-    "📎 <b>Контекст Telegram</b>\n"
-    "Ответь на сообщение: «напомни об этом завтра в 9».\n"
-    "Можно также переслать ссылку, фото, документ или сообщение без времени — бот сохранит\n"
-    "короткий контекст и спросит, когда напомнить.\n\n"
-    "⚠️ Если время неоднозначно, бот сначала попросит уточнение.\n\n"
-    "💡 <b>Подсказки и дайджесты</b>\n"
-    "- /suggestions on|off — подсказки по повторным переносам\n"
-    "- /digest on|off — утренний и вечерний список незавершённых дел\n"
-    "- обе функции выключены по умолчанию и включаются только явно\n\n"
-    "📋 <b>Команды</b>\n"
-    "/list [страница] - список активных напоминаний\n"
-    "/share ID - создать одноразовую ссылку-приглашение\n"
-    "/shared - общие напоминания и отзыв доступа\n"
-    "/cancel ID - удалить напоминание; /cancel - отменить действие\n"
-    "/timezone Europe/Moscow - установить часовой пояс\n"
-    "/mytimezone - показать текущий часовой пояс\n\n"
-    "💡 <b>Подсказка</b>\n"
-    "Чем естественнее формулировка - тем удобнее пользоваться ботом."
-)
+logger = logging.getLogger(__name__)
 
 CREATE_REMINDER_HINT = (
     "➕ <b>Создание напоминания</b>\n\n"
@@ -122,6 +66,29 @@ def _get_ids(message: Message) -> tuple[int, int]:
     if message.from_user is None:
         raise ValueError("Не удалось определить пользователя")
     return message.from_user.id, message.chat.id
+
+
+async def _send_start_screen(message: Message, text: str) -> None:
+    try:
+        await message.answer_photo(
+            photo=FSInputFile(WELCOME_IMAGE_PATH),
+            caption=text,
+            reply_markup=get_main_keyboard(),
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        # The welcome image is enhancement-only.  Keep the first interaction
+        # usable when the file or Telegram media request is unavailable, and
+        # never expose the provider error or its payload to the user/logs.
+        logger.warning(
+            "Welcome image delivery failed; using text fallback",
+            extra={"extra_data": f"error={type(exc).__name__}"},
+        )
+        await message.answer(
+            text,
+            reply_markup=get_main_keyboard(),
+            parse_mode="HTML",
+        )
 
 
 def _list_page_bounds(total: int, requested_page: int) -> tuple[int, int, int, int]:
@@ -314,11 +281,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         else:
             text = "❌ Приглашение недействительно, отозвано или истекло.\n\n" + text
 
-    await message.answer(
-        text,
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML",
-    )
+    await _send_start_screen(message, text)
 
 
 @router.message(Command("help"))
@@ -518,8 +481,4 @@ async def btn_back(message: Message) -> None:
 
     text = f"{START_TEXT}\n\n🕒 <b>Твой часовой пояс:</b> <code>{timezone_name}</code>"
 
-    await message.answer(
-        text,
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML",
-    )
+    await _send_start_screen(message, text)

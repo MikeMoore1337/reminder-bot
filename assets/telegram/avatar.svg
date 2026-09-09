@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Reminder Bot icon</title>
+  <desc id="desc">A clock with a completed check mark, centered for a circular Telegram avatar crop.</desc>
+  <rect width="1024" height="1024" fill="#0f161e"/>
+  <circle cx="512" cy="512" r="470" fill="#151e28"/>
+  <circle cx="512" cy="512" r="350" fill="#bef449"/>
+  <circle cx="512" cy="512" r="326" fill="#0f161e"/>
+  <circle cx="512" cy="490" r="205" fill="#bef449"/>
+  <circle cx="512" cy="490" r="195" fill="#151e28"/>
+  <path d="M512 490V391M512 490l70 15" stroke="#f2f7f4" stroke-width="16" stroke-linecap="round"/>
+  <path d="M422 585l35 34 145-174" fill="none" stroke="#f2f7f4" stroke-width="23" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="512" cy="490" r="13" fill="#bef449"/>
+</svg>
