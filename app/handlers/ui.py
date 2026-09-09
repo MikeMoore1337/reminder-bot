@@ -6,8 +6,10 @@ from aiogram.types import Message
 
 from app.callbacks import CallbackOrigin
 from app.db.models import OccurrenceState, Reminder, User
+from app.handlers.guards import require_private_chat
 from app.keyboards.adaptive import suggestion_kb
 from app.keyboards.reply import get_main_keyboard, get_timezone_keyboard
+from app.services import shared_reminder_service
 from app.services.adaptive_service import (
     AdaptivePreferences,
     format_suggestion,
@@ -86,6 +88,8 @@ HELP_TEXT = (
     "- обе функции выключены по умолчанию и включаются только явно\n\n"
     "📋 <b>Команды</b>\n"
     "/list [страница] - список активных напоминаний\n"
+    "/share ID - создать одноразовую ссылку-приглашение\n"
+    "/shared - общие напоминания и отзыв доступа\n"
     "/cancel ID - удалить напоминание; /cancel - отменить действие\n"
     "/timezone Europe/Moscow - установить часовой пояс\n"
     "/mytimezone - показать текущий часовой пояс\n\n"
@@ -180,6 +184,8 @@ async def _handle_adaptive_toggle(
     *,
     feature: str,
 ) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
     value = (command.args or "").strip().lower()
@@ -282,12 +288,31 @@ async def _send_actionable_reminders(
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, command: CommandObject) -> None:
+    payload = (command.args or "").strip()
+    if (
+        payload.startswith(shared_reminder_service.SHARED_INVITE_PREFIX)
+        and getattr(message.chat, "type", None) != "private"
+    ):
+        await message.answer("❌ Приглашение можно принять только в личном чате с ботом.")
+        return
+    if not await require_private_chat(message):
+        return
+
     telegram_user_id, chat_id = _get_ids(message)
-    await get_or_create_user(telegram_user_id, chat_id)
+    user = await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
 
     text = f"{START_TEXT}\n\n🕒 <b>Твой часовой пояс:</b> <code>{timezone_name}</code>"
+
+    if payload.startswith(shared_reminder_service.SHARED_INVITE_PREFIX):
+        acceptance = await shared_reminder_service.accept_invite(user, payload)
+        if acceptance.accepted:
+            text = "✅ Доступ к общему напоминанию предоставлен. Открой /shared.\n\n" + text
+        elif acceptance.already_member:
+            text = "ℹ️ Ты уже участник этого общего напоминания. Открой /shared.\n\n" + text
+        else:
+            text = "❌ Приглашение недействительно, отозвано или истекло.\n\n" + text
 
     await message.answer(
         text,
@@ -307,6 +332,8 @@ async def cmd_help(message: Message) -> None:
 
 @router.message(Command("mytimezone"))
 async def cmd_mytimezone(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
@@ -320,6 +347,8 @@ async def cmd_mytimezone(message: Message) -> None:
 
 @router.message(Command("timezone"))
 async def cmd_timezone(message: Message, command: CommandObject) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
 
@@ -360,6 +389,8 @@ async def cmd_digest(message: Message, command: CommandObject) -> None:
 
 @router.message(Command("list"))
 async def cmd_list(message: Message, command: CommandObject) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
     reminders = await list_active_reminders(user)
@@ -402,6 +433,8 @@ async def btn_create_reminder(message: Message) -> None:
 
 @router.message(F.text == "📋 Мои напоминания")
 async def btn_list(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
     reminders = await list_active_reminders(user)
@@ -431,6 +464,8 @@ async def btn_list(message: Message) -> None:
 
 @router.message(F.text == "🌍 Часовой пояс")
 async def btn_timezone(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
@@ -453,6 +488,8 @@ async def btn_help(message: Message) -> None:
 
 @router.message(F.text.in_({"Europe/Moscow", "Europe/Helsinki", "Europe/Berlin", "UTC"}))
 async def btn_set_popular_timezone(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = (message.text or "").strip()
@@ -473,6 +510,8 @@ async def btn_set_popular_timezone(message: Message) -> None:
 
 @router.message(F.text == "⬅️ Назад")
 async def btn_back(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)

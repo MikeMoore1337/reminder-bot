@@ -14,6 +14,18 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+def is_private_chat_id(chat_id: int) -> bool:
+    """Telegram private-chat IDs are positive; group and channel IDs are negative."""
+
+    return chat_id > 0
+
+
+def _can_replace_chat_id(current_chat_id: int, requested_chat_id: int) -> bool:
+    """Keep a verified private destination from being replaced by group input."""
+
+    return is_private_chat_id(requested_chat_id) or not is_private_chat_id(current_chat_id)
+
+
 async def _invalidate_digest_schedule(
     session: AsyncSession,
     user: User,
@@ -43,7 +55,7 @@ async def _invalidate_digest_schedule(
 async def get_or_create_user(telegram_user_id: int, chat_id: int) -> User:
     async with SessionLocal() as session:
         result = await session.execute(
-            select(User).where(User.telegram_user_id == telegram_user_id)
+            select(User).where(User.telegram_user_id == telegram_user_id).with_for_update()
         )
         user = result.scalar_one_or_none()
 
@@ -64,7 +76,7 @@ async def get_or_create_user(telegram_user_id: int, chat_id: int) -> User:
             )
             return user
 
-        if user.chat_id != chat_id:
+        if user.chat_id != chat_id and _can_replace_chat_id(user.chat_id, chat_id):
             user.chat_id = chat_id
             await _invalidate_digest_schedule(session, user, reason="chat_changed")
             await session.commit()
@@ -77,7 +89,7 @@ async def set_user_timezone(telegram_user_id: int, chat_id: int, timezone_name: 
 
     async with SessionLocal() as session:
         result = await session.execute(
-            select(User).where(User.telegram_user_id == telegram_user_id)
+            select(User).where(User.telegram_user_id == telegram_user_id).with_for_update()
         )
         user = result.scalar_one_or_none()
 
@@ -89,9 +101,11 @@ async def set_user_timezone(telegram_user_id: int, chat_id: int, timezone_name: 
             )
             session.add(user)
         else:
-            profile_changed = user.timezone != timezone_name or user.chat_id != chat_id
+            chat_changed = user.chat_id != chat_id and _can_replace_chat_id(user.chat_id, chat_id)
+            profile_changed = user.timezone != timezone_name or chat_changed
             user.timezone = timezone_name
-            user.chat_id = chat_id
+            if chat_changed:
+                user.chat_id = chat_id
             if profile_changed:
                 await _invalidate_digest_schedule(session, user, reason="profile_changed")
 

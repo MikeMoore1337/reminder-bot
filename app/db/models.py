@@ -112,6 +112,26 @@ class ConditionDeliveryState(StrEnum):
     FAILED = "failed"
 
 
+class SharedMembershipState(StrEnum):
+    ACTIVE = "active"
+    REVOKED = "revoked"
+
+
+class SharedInviteState(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+class ReminderDeliveryState(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SENT = "sent"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (
@@ -174,6 +194,21 @@ class User(Base):
     )
     condition_subscriptions: Mapped[list[ConditionSubscription]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
+    )
+    shared_memberships: Mapped[list[SharedReminderMembership]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    shared_invites_created: Mapped[list[SharedReminderInvite]] = relationship(
+        foreign_keys="SharedReminderInvite.owner_user_id",
+        back_populates="owner",
+        cascade="all, delete-orphan",
+    )
+    shared_invites_accepted: Mapped[list[SharedReminderInvite]] = relationship(
+        foreign_keys="SharedReminderInvite.accepted_by_user_id",
+        back_populates="accepted_by",
+    )
+    reminder_deliveries: Mapped[list[ReminderDelivery]] = relationship(
+        back_populates="recipient", cascade="all, delete-orphan"
     )
 
 
@@ -315,6 +350,15 @@ class Reminder(Base):
     suggestions: Mapped[list[ReminderSuggestion]] = relationship(
         back_populates="reminder", cascade="all, delete-orphan"
     )
+    shared_memberships: Mapped[list[SharedReminderMembership]] = relationship(
+        back_populates="reminder", cascade="all, delete-orphan"
+    )
+    shared_invites: Mapped[list[SharedReminderInvite]] = relationship(
+        back_populates="reminder", cascade="all, delete-orphan"
+    )
+    delivery_records: Mapped[list[ReminderDelivery]] = relationship(
+        back_populates="reminder", cascade="all, delete-orphan"
+    )
 
 
 class ReminderOccurrence(Base):
@@ -358,6 +402,137 @@ class ReminderOccurrence(Base):
     )
 
     reminder: Mapped[Reminder] = relationship(back_populates="occurrences")
+    delivery_records: Mapped[list[ReminderDelivery]] = relationship(
+        back_populates="occurrence", cascade="all, delete-orphan"
+    )
+
+
+class SharedReminderMembership(Base):
+    """Explicit participant membership for an owner-shared reminder."""
+
+    __tablename__ = "shared_reminder_memberships"
+    __table_args__ = (
+        UniqueConstraint(
+            "reminder_id",
+            "user_id",
+            name="uq_shared_reminder_memberships_reminder_user",
+        ),
+        Index("ix_shared_reminder_memberships_reminder_state", "reminder_id", "state"),
+        Index("ix_shared_reminder_memberships_user_state", "user_id", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="participant")
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=SharedMembershipState.ACTIVE.value
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    joined_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    reminder: Mapped[Reminder] = relationship(back_populates="shared_memberships")
+    user: Mapped[User] = relationship(back_populates="shared_memberships")
+
+
+class SharedReminderInvite(Base):
+    """Hashed, single-use capability used by the Telegram deep-link flow."""
+
+    __tablename__ = "shared_reminder_invites"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_shared_reminder_invites_token_hash"),
+        Index("ix_shared_reminder_invites_reminder_state", "reminder_id", "state"),
+        Index("ix_shared_reminder_invites_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    owner_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=SharedInviteState.PENDING.value
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    reminder: Mapped[Reminder] = relationship(back_populates="shared_invites")
+    owner: Mapped[User] = relationship(
+        foreign_keys=[owner_user_id], back_populates="shared_invites_created"
+    )
+    accepted_by: Mapped[User | None] = relationship(
+        foreign_keys=[accepted_by_user_id], back_populates="shared_invites_accepted"
+    )
+
+
+class ReminderDelivery(Base):
+    """Per-recipient durable fan-out state for a shared reminder occurrence."""
+
+    __tablename__ = "reminder_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "occurrence_id",
+            "recipient_user_id",
+            "membership_revision",
+            name="uq_reminder_deliveries_occurrence_recipient_generation",
+        ),
+        Index("ix_reminder_deliveries_reminder_occurrence", "reminder_id", "occurrence_id"),
+        Index("ix_reminder_deliveries_state_lease", "state", "lease_until"),
+        Index("ix_reminder_deliveries_recipient_state", "recipient_user_id", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey("reminders.id", ondelete="CASCADE"), nullable=False
+    )
+    occurrence_id: Mapped[int] = mapped_column(
+        ForeignKey("reminder_occurrences.id", ondelete="CASCADE"), nullable=False
+    )
+    recipient_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    membership_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    action_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ReminderDeliveryState.PENDING.value
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    reminder: Mapped[Reminder] = relationship(back_populates="delivery_records")
+    occurrence: Mapped[ReminderOccurrence] = relationship(back_populates="delivery_records")
+    recipient: Mapped[User] = relationship(back_populates="reminder_deliveries")
 
 
 class ReminderDeadlinePlan(Base):
