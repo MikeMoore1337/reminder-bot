@@ -68,6 +68,9 @@ async def _open_sqlite(monkeypatch):
     monkeypatch.setattr(shared_reminder_service, "SessionLocal", session_factory)
     monkeypatch.setattr(reminder_service, "SessionLocal", session_factory)
     monkeypatch.setattr(worker, "SessionLocal", session_factory)
+    monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: NOW)
+    monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+    monkeypatch.setattr(worker, "utc_now", lambda: NOW)
     return engine, connection, session_factory
 
 
@@ -178,6 +181,7 @@ async def _add_delivered_shared(
             state=ReminderDeliveryState.SENT.value,
             message_id=777,
             sent_at=now,
+            created_at=now,
         )
         session.add(delivery)
         await session.commit()
