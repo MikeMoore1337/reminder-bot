@@ -60,10 +60,13 @@ class ReminderCallback:
     target_id: int
     revision: int
     origin: CallbackOrigin
+    membership_id: int | None = None
+    membership_revision: int | None = None
 
 
 _ID_RE = re.compile(r"[1-9][0-9]*\Z")
 _REVISION_RE = re.compile(r"[0-9]+\Z")
+_MEMBERSHIP_RE = re.compile(r"([1-9][0-9]*)\.([1-9][0-9]*)\Z")
 
 
 def encode_callback(
@@ -73,6 +76,8 @@ def encode_callback(
     revision: int,
     *,
     origin: CallbackOrigin | str = CallbackOrigin.DELIVERY,
+    membership_id: int | None = None,
+    membership_revision: int | None = None,
 ) -> str:
     try:
         action_value = CallbackAction(action)
@@ -83,11 +88,19 @@ def encode_callback(
 
     if target_id < 1 or revision < 0:
         raise ValueError("Callback identifiers must be positive and revision non-negative")
+    if (membership_id is None) != (membership_revision is None):
+        raise ValueError("Membership id and revision must be provided together")
+    if membership_id is not None and (
+        membership_id < 1 or membership_revision is None or membership_revision < 1
+    ):
+        raise ValueError("Membership id and revision must be positive")
 
     payload = (
         f"{CALLBACK_VERSION}:{action_value.value}:{target_value.value}:"
         f"{target_id}:{revision}:{origin_value.value}"
     )
+    if membership_id is not None and membership_revision is not None:
+        payload += f":{membership_id}.{membership_revision}"
     if len(payload.encode("utf-8")) > CALLBACK_MAX_BYTES:
         raise ValueError("Callback data exceeds Telegram's callback_data limit")
     return payload
@@ -98,11 +111,19 @@ def parse_callback(data: str | None) -> ReminderCallback | None:
         return None
 
     parts = data.split(":")
-    if len(parts) not in {5, 6} or parts[0] != CALLBACK_VERSION:
+    if len(parts) not in {5, 6, 7} or parts[0] != CALLBACK_VERSION:
         return None
 
     _, action_raw, target_raw, target_id_raw, revision_raw = parts[:5]
-    origin_raw = parts[5] if len(parts) == 6 else CallbackOrigin.DELIVERY.value
+    origin_raw = parts[5] if len(parts) >= 6 else CallbackOrigin.DELIVERY.value
+    membership_id: int | None = None
+    membership_revision: int | None = None
+    if len(parts) == 7:
+        membership_match = _MEMBERSHIP_RE.fullmatch(parts[6])
+        if membership_match is None:
+            return None
+        membership_id = int(membership_match.group(1))
+        membership_revision = int(membership_match.group(2))
     if not _ID_RE.fullmatch(target_id_raw) or not _REVISION_RE.fullmatch(revision_raw):
         return None
 
@@ -128,4 +149,6 @@ def parse_callback(data: str | None) -> ReminderCallback | None:
         target_id=target_id,
         revision=revision,
         origin=origin,
+        membership_id=membership_id,
+        membership_revision=membership_revision,
     )

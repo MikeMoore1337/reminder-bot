@@ -29,6 +29,8 @@ from app.db.models import (
     OccurrenceState,
     RecurrenceType,
     Reminder,
+    ReminderDelivery,
+    ReminderDeliveryState,
     ReminderKind,
     ReminderOccurrence,
     ReminderState,
@@ -127,6 +129,8 @@ def reminder_actions_kb(
     reminder_kind: str = ReminderKind.ORDINARY.value,
     deadline_plan_state: str | None = None,
     shared_participant: bool = False,
+    membership_id: int | None = None,
+    membership_revision: int | None = None,
 ) -> InlineKeyboardMarkup:
     # Keep the old helper call useful for callers that only want a compact
     # cancellation button. Real delivery cards always pass an occurrence id.
@@ -160,6 +164,8 @@ def reminder_actions_kb(
                 target_id,
                 revision,
                 origin=origin,
+                membership_id=membership_id if shared_participant else None,
+                membership_revision=membership_revision if shared_participant else None,
             ),
         )
 
@@ -213,6 +219,8 @@ def snooze_presets_kb(
     revision: int,
     origin: CallbackOrigin | str = CallbackOrigin.DELIVERY,
     include_custom: bool = True,
+    membership_id: int | None = None,
+    membership_revision: int | None = None,
 ) -> InlineKeyboardMarkup:
     target = CallbackTarget.OCCURRENCE if occurrence_id is not None else CallbackTarget.REMINDER
     target_id = occurrence_id or reminder_id
@@ -227,6 +235,8 @@ def snooze_presets_kb(
                         target_id,
                         revision,
                         origin=origin,
+                        membership_id=membership_id,
+                        membership_revision=membership_revision,
                     ),
                 ),
                 InlineKeyboardButton(
@@ -237,6 +247,8 @@ def snooze_presets_kb(
                         target_id,
                         revision,
                         origin=origin,
+                        membership_id=membership_id,
+                        membership_revision=membership_revision,
                     ),
                 ),
             ],
@@ -249,6 +261,8 @@ def snooze_presets_kb(
                         target_id,
                         revision,
                         origin=origin,
+                        membership_id=membership_id,
+                        membership_revision=membership_revision,
                     ),
                 ),
                 InlineKeyboardButton(
@@ -259,6 +273,8 @@ def snooze_presets_kb(
                         target_id,
                         revision,
                         origin=origin,
+                        membership_id=membership_id,
+                        membership_revision=membership_revision,
                     ),
                 ),
             ],
@@ -271,6 +287,8 @@ def snooze_presets_kb(
                         target_id,
                         revision,
                         origin=origin,
+                        membership_id=membership_id,
+                        membership_revision=membership_revision,
                     ),
                 )
             ],
@@ -842,6 +860,7 @@ async def finalize_delivery_failure(
     current_time = now_utc or utc_now()
     terminal = False
     retried = False
+    partial_success = False
     async with SessionLocal() as session, session.begin():
         result = await session.execute(
             select(Reminder)
@@ -885,9 +904,53 @@ async def finalize_delivery_failure(
             )
             session.add(occurrence)
         else:
-            occurrence.status = OccurrenceState.FAILED.value
-            occurrence.message_id = None
-        if reminder.kind == ReminderKind.DEADLINE.value:
+            sent_deliveries = list(
+                (
+                    await session.scalars(
+                        select(ReminderDelivery).where(
+                            ReminderDelivery.occurrence_id == occurrence.id,
+                            ReminderDelivery.state == ReminderDeliveryState.SENT.value,
+                        )
+                    )
+                ).all()
+            )
+            partial_success = bool(sent_deliveries)
+
+            if partial_success:
+                owner_delivery = next(
+                    (
+                        row
+                        for row in sent_deliveries
+                        if row.recipient_user_id == reminder.user_id
+                        and row.membership_revision == 0
+                    ),
+                    None,
+                )
+                sent_times = [
+                    _as_utc(row.sent_at) for row in sent_deliveries if row.sent_at is not None
+                ]
+                delivered_at = min(sent_times, default=current_time)
+                occurrence.status = OccurrenceState.DELIVERED.value
+                occurrence.message_id = owner_delivery.message_id if owner_delivery else None
+                occurrence.delivered_at = delivered_at
+                occurrence.snoozed_until_utc = None
+                reminder.sent_at = delivered_at
+                reminder.last_message_id = occurrence.message_id
+                reminder.last_delivery_occurrence_utc = occurrence.occurrence_at_utc
+            else:
+                occurrence.status = OccurrenceState.FAILED.value
+                occurrence.message_id = None
+        if terminal:
+            await session.execute(
+                update(ReminderDelivery)
+                .where(
+                    ReminderDelivery.occurrence_id == occurrence.id,
+                    ReminderDelivery.state == ReminderDeliveryState.FAILED.value,
+                    ReminderDelivery.error_kind == DeliveryErrorKind.TRANSIENT.value,
+                )
+                .values(error_kind=DeliveryErrorKind.TERMINAL.value)
+            )
+        if reminder.kind == ReminderKind.DEADLINE.value and not partial_success:
             await finalize_deadline_delivery_failure(
                 session,
                 reminder,
@@ -895,7 +958,25 @@ async def finalize_delivery_failure(
                 now_utc=current_time,
                 terminal=terminal,
             )
-        if terminal:
+        if partial_success:
+            if terminal:
+                reminder.status = "sent"
+                reminder.state = ReminderState.DELIVERED.value
+                reminder.delivery_at_utc = None
+                reminder.snoozed_until_utc = None
+                reminder.next_retry_at = None
+            else:
+                delay = retry_delay_seconds(
+                    reminder.retry_count,
+                    base_seconds=settings.worker_retry_base_seconds,
+                    max_seconds=settings.worker_retry_max_seconds,
+                    retry_after_seconds=failure.retry_after_seconds,
+                )
+                reminder.status = "pending"
+                reminder.state = ReminderState.SCHEDULED.value
+                reminder.next_retry_at = current_time + timedelta(seconds=delay)
+                retried = True
+        elif terminal:
             reminder.status = "failed"
             reminder.state = ReminderState.FAILED.value
             await shared_reminder_service.expire_terminal_memberships_in_session(
@@ -915,7 +996,7 @@ async def finalize_delivery_failure(
             reminder.next_retry_at = current_time + timedelta(seconds=delay)
             retried = True
 
-    if terminal:
+    if terminal and not partial_success:
         worker_metrics.failed += 1
     if retried:
         worker_metrics.retried += 1
@@ -1227,6 +1308,10 @@ async def _process_shared_delivery(
                         reminder_kind=reminder.kind,
                         deadline_plan_state=reminder.deadline_plan_state,
                         shared_participant=not target.is_owner,
+                        membership_id=target.membership_id if not target.is_owner else None,
+                        membership_revision=(
+                            target.membership_revision if not target.is_owner else None
+                        ),
                     ),
                 ),
                 timeout=settings.worker_send_timeout_seconds,
@@ -1262,7 +1347,12 @@ async def _process_shared_delivery(
     if stop_event is not None and stop_event.is_set():
         return False
     if had_transient_failure:
-        await _finalize_send_failure(
+        delivery_status = await shared_reminder_service.get_shared_delivery_status(
+            reminder.id,
+            occurrence_id,
+            action_revision=reminder.action_revision,
+        )
+        finalized = await _finalize_send_failure(
             reminder,
             DeliveryFailure(
                 kind=DeliveryErrorKind.TRANSIENT,
@@ -1270,6 +1360,22 @@ async def _process_shared_delivery(
                 retry_after_seconds=max_retry_after_seconds,
             ),
         )
+        if (
+            finalized
+            and reminder.attempt_count >= settings.worker_max_attempts
+            and delivery_status.successful_delivery_count > 0
+        ):
+            worker_metrics.delivered += 1
+            logger.info(
+                "Shared reminder partially delivered",
+                extra={
+                    "extra_data": (
+                        f"reminder_id={reminder.id} recipient_rows={len(delivery_ids)} "
+                        f"successful_recipient_rows={delivery_status.successful_delivery_count}"
+                    )
+                },
+            )
+            return True
         return False
 
     delivery_status = await shared_reminder_service.get_shared_delivery_status(

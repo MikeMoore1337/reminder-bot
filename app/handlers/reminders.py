@@ -857,6 +857,11 @@ async def reminder_callback(callback: CallbackQuery) -> None:
     )
 
     if shared_target is not None:
+        if parsed.origin == CallbackOrigin.SHARED and (
+            parsed.membership_id is None or parsed.membership_revision is None
+        ):
+            await callback.answer(STALE_FEEDBACK, show_alert=False)
+            return
         if parsed.action == CallbackAction.SNOOZE:
             valid = await shared_reminder_service.validate_shared_action_target(
                 user,
@@ -865,6 +870,8 @@ async def reminder_callback(callback: CallbackQuery) -> None:
                 expected_revision=parsed.revision,
                 expected_occurrence_at_utc=occurrence_at_utc,
                 expected_message_id=expected_message_id,
+                expected_membership_id=parsed.membership_id,
+                expected_membership_revision=parsed.membership_revision,
             )
             if not valid:
                 await callback.answer(STALE_FEEDBACK, show_alert=False)
@@ -877,6 +884,8 @@ async def reminder_callback(callback: CallbackQuery) -> None:
                     revision=parsed.revision,
                     origin=parsed.origin,
                     include_custom=False,
+                    membership_id=parsed.membership_id,
+                    membership_revision=parsed.membership_revision,
                 )
             )
             return
@@ -906,6 +915,8 @@ async def reminder_callback(callback: CallbackQuery) -> None:
                 expected_revision=parsed.revision,
                 expected_occurrence_at_utc=occurrence_at_utc,
                 expected_message_id=expected_message_id,
+                expected_membership_id=parsed.membership_id,
+                expected_membership_revision=parsed.membership_revision,
                 now_utc=reminder_service.utc_now(),
             )
             if not snoozed:
@@ -925,6 +936,8 @@ async def reminder_callback(callback: CallbackQuery) -> None:
                 expected_revision=parsed.revision,
                 expected_occurrence_at_utc=occurrence_at_utc,
                 expected_message_id=expected_message_id,
+                expected_membership_id=parsed.membership_id,
+                expected_membership_revision=parsed.membership_revision,
                 now_utc=reminder_service.utc_now(),
             )
             await callback.answer("Готово" if completed else STALE_FEEDBACK, show_alert=False)

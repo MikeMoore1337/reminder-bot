@@ -90,6 +90,8 @@ class SharedReminderView:
     participant_count: int
     members: tuple[SharedMemberView, ...] = ()
     pending_invites: tuple[SharedInviteView, ...] = ()
+    membership_id: int | None = None
+    membership_revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +124,7 @@ class SharedDeliveryTarget:
     occurrence_id: int
     recipient_user_id: int
     chat_id: int
+    membership_id: int | None
     membership_revision: int
     action_revision: int
     is_owner: bool
@@ -260,6 +263,8 @@ async def _build_shared_reminder_view(
     reminder: Reminder,
     *,
     current_time: datetime,
+    membership_id: int | None = None,
+    membership_revision: int | None = None,
 ) -> SharedReminderView:
     is_owner = _owner_matches(reminder, user)
     member_count = await _active_participant_count(session, reminder.id)
@@ -299,6 +304,8 @@ async def _build_shared_reminder_view(
         participant_count=member_count,
         members=members,
         pending_invites=pending_invites,
+        membership_id=None if is_owner else membership_id,
+        membership_revision=None if is_owner else membership_revision,
     )
 
 
@@ -619,12 +626,32 @@ async def _list_shared_reminders(
             .offset(offset)
         )
         reminders = list(result.scalars().all())
+        membership_by_reminder: dict[int, tuple[int, int]] = {}
+        if reminders:
+            membership_result = await session.execute(
+                select(
+                    SharedReminderMembership.reminder_id,
+                    SharedReminderMembership.id,
+                    SharedReminderMembership.revision,
+                ).where(
+                    SharedReminderMembership.reminder_id.in_(
+                        [reminder.id for reminder in reminders]
+                    ),
+                    SharedReminderMembership.user_id == user.id,
+                    SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
+                )
+            )
+            membership_by_reminder = {
+                int(row[0]): (int(row[1]), int(row[2])) for row in membership_result
+            }
         views = [
             await _build_shared_reminder_view(
                 session,
                 user,
                 reminder,
                 current_time=current_time,
+                membership_id=membership_by_reminder.get(reminder.id, (None, None))[0],
+                membership_revision=membership_by_reminder.get(reminder.id, (None, None))[1],
             )
             for reminder in reminders
         ]
@@ -693,6 +720,8 @@ async def get_shared_reminder_card(
             user,
             reminder,
             current_time=current_time,
+            membership_id=_membership.id if _membership is not None else None,
+            membership_revision=_membership.revision if _membership is not None else None,
         )
         occurrence = await session.scalar(
             select(ReminderOccurrence)
@@ -766,6 +795,8 @@ async def _load_shared_action_target(
     expected_revision: int,
     expected_occurrence_at_utc: datetime | None,
     expected_message_id: int | None,
+    expected_membership_id: int | None,
+    expected_membership_revision: int | None,
 ) -> tuple[Reminder, ReminderOccurrence, SharedReminderMembership] | None:
     reminder, membership, is_owner = await _load_shared_reminder(
         session,
@@ -774,6 +805,15 @@ async def _load_shared_action_target(
         for_update=True,
     )
     if reminder is None or membership is None or is_owner:
+        return None
+    if (expected_membership_id is None) != (expected_membership_revision is None):
+        return None
+    if expected_membership_id is not None and (
+        membership.id != expected_membership_id
+        or membership.revision != expected_membership_revision
+    ):
+        return None
+    if expected_message_id is None and expected_membership_id is None:
         return None
     occurrence = await session.scalar(
         select(ReminderOccurrence)
@@ -828,6 +868,8 @@ async def validate_shared_action_target(
     expected_revision: int,
     expected_occurrence_at_utc: datetime | None = None,
     expected_message_id: int | None = None,
+    expected_membership_id: int | None = None,
+    expected_membership_revision: int | None = None,
 ) -> bool:
     async with SessionLocal() as session, session.begin():
         return (
@@ -839,6 +881,8 @@ async def validate_shared_action_target(
                 expected_revision=expected_revision,
                 expected_occurrence_at_utc=expected_occurrence_at_utc,
                 expected_message_id=expected_message_id,
+                expected_membership_id=expected_membership_id,
+                expected_membership_revision=expected_membership_revision,
             )
             is not None
         )
@@ -852,6 +896,8 @@ async def complete_shared_reminder(
     expected_revision: int,
     expected_occurrence_at_utc: datetime | None = None,
     expected_message_id: int | None = None,
+    expected_membership_id: int | None = None,
+    expected_membership_revision: int | None = None,
     now_utc: datetime | None = None,
 ) -> bool:
     current_time = _as_utc(now_utc or utc_now())
@@ -864,6 +910,8 @@ async def complete_shared_reminder(
             expected_revision=expected_revision,
             expected_occurrence_at_utc=expected_occurrence_at_utc,
             expected_message_id=expected_message_id,
+            expected_membership_id=expected_membership_id,
+            expected_membership_revision=expected_membership_revision,
         )
         if target is None:
             return False
@@ -917,6 +965,8 @@ async def snooze_shared_reminder(
     expected_revision: int,
     expected_occurrence_at_utc: datetime | None = None,
     expected_message_id: int | None = None,
+    expected_membership_id: int | None = None,
+    expected_membership_revision: int | None = None,
     now_utc: datetime | None = None,
 ) -> bool:
     current_time = _as_utc(now_utc or utc_now())
@@ -932,6 +982,8 @@ async def snooze_shared_reminder(
             expected_revision=expected_revision,
             expected_occurrence_at_utc=expected_occurrence_at_utc,
             expected_message_id=expected_message_id,
+            expected_membership_id=expected_membership_id,
+            expected_membership_revision=expected_membership_revision,
         )
         if target is None:
             return False
@@ -990,14 +1042,17 @@ async def is_shared_reminder(
 async def _delivery_specs(
     session: AsyncSession,
     reminder: Reminder,
-) -> list[tuple[int, int, int, bool]]:
+) -> list[tuple[int, int, int | None, int, bool]]:
     if not is_private_chat_id(reminder.chat_id):
         raise SharedReminderError("Общая доставка требует подтверждённого личного чата владельца")
-    specs: list[tuple[int, int, int, bool]] = [(reminder.user_id, reminder.chat_id, 0, True)]
+    specs: list[tuple[int, int, int | None, int, bool]] = [
+        (reminder.user_id, reminder.chat_id, None, 0, True)
+    ]
     result = await session.execute(
         select(
             SharedReminderMembership.user_id,
             User.chat_id,
+            SharedReminderMembership.id,
             SharedReminderMembership.revision,
         )
         .join(User, User.id == SharedReminderMembership.user_id)
@@ -1015,7 +1070,7 @@ async def _delivery_specs(
         participant_chat_id = int(row[1])
         if not is_private_chat_id(participant_chat_id):
             raise SharedReminderError("Общая доставка требует подтверждённых личных чатов")
-        specs.append((int(row[0]), participant_chat_id, int(row[2]), False))
+        specs.append((int(row[0]), participant_chat_id, int(row[2]), int(row[3]), False))
     return specs
 
 
@@ -1099,7 +1154,7 @@ async def prepare_shared_delivery_recipients(
         # sent message.
         occurrence.action_revision = shared_action_revision
         delivery_ids: list[int] = []
-        for recipient_user_id, chat_id, membership_revision, _is_owner in specs:
+        for recipient_user_id, chat_id, _membership_id, membership_revision, _is_owner in specs:
             row = existing.get((recipient_user_id, membership_revision))
             if row is None:
                 row = ReminderDelivery(
@@ -1213,6 +1268,8 @@ async def claim_shared_delivery(
                 delivery.state = ReminderDeliveryState.CANCELLED.value
                 _clear_delivery_claim(delivery)
                 return None
+        else:
+            membership = None
 
         row_token = secrets.token_hex(32)
         delivery.state = ReminderDeliveryState.PROCESSING.value
@@ -1225,6 +1282,7 @@ async def claim_shared_delivery(
             occurrence_id=occurrence.id,
             recipient_user_id=delivery.recipient_user_id,
             chat_id=delivery.chat_id,
+            membership_id=membership.id if membership is not None else None,
             membership_revision=delivery.membership_revision,
             action_revision=delivery.action_revision,
             is_owner=delivery.recipient_user_id == reminder.user_id
@@ -1327,6 +1385,9 @@ async def validate_shared_delivery_before_send(
             )
         )
         if membership is None:
+            await fence_target()
+            return False
+        if target.membership_id is None or membership.id != target.membership_id:
             await fence_target()
             return False
         return True
@@ -1446,7 +1507,7 @@ async def get_shared_delivery_status(
         owner_message_id: int | None = None
         successful_delivery_count = 0
         complete = True
-        for recipient_user_id, _chat_id, membership_revision, is_owner in specs:
+        for recipient_user_id, _chat_id, _membership_id, membership_revision, is_owner in specs:
             row = rows.get((recipient_user_id, membership_revision))
             if row is None:
                 complete = False

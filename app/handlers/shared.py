@@ -72,6 +72,8 @@ def _entry_markup(
         reminder_kind=reminder.kind,
         deadline_plan_state=reminder.deadline_plan_state,
         shared_participant=not entry.is_owner,
+        membership_id=entry.membership_id if not entry.is_owner else None,
+        membership_revision=entry.membership_revision if not entry.is_owner else None,
     )
 
 

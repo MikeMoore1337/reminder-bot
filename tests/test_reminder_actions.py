@@ -148,7 +148,26 @@ def test_callback_protocol_is_compact_and_fail_closed() -> None:
     assert parsed.target_id == 42
     assert parsed.revision == 7
     assert parsed.origin == CallbackOrigin.DELIVERY
+    assert parsed.membership_id is None
+    assert parsed.membership_revision is None
     assert len(payload.encode()) <= 64
+
+    shared_payload = encode_callback(
+        CallbackAction.DONE,
+        CallbackTarget.OCCURRENCE,
+        42,
+        7,
+        origin=CallbackOrigin.SHARED,
+        membership_id=123,
+        membership_revision=4,
+    )
+    parsed_shared = parse_callback(shared_payload)
+    assert shared_payload == "r1:done:o:42:7:h:123.4"
+    assert parsed_shared is not None
+    assert parsed_shared.origin == CallbackOrigin.SHARED
+    assert parsed_shared.membership_id == 123
+    assert parsed_shared.membership_revision == 4
+    assert len(shared_payload.encode()) <= 64
 
     list_payload = encode_callback(
         CallbackAction.DONE,
@@ -173,12 +192,32 @@ def test_callback_protocol_is_compact_and_fail_closed() -> None:
         "r1:done:o:42:-1",
         "r1:done:o:42:7:extra",
         "r1:done:o:42:7:x",
+        "r1:done:o:42:7:h:1",
+        "r1:done:o:42:7:h:1.0",
+        "r1:done:o:42:7:h:0.1",
+        "r1:done:o:42:7:h:1.1.extra",
     )
     assert all(parse_callback(value) is None for value in invalid_payloads)
     with pytest.raises(ValueError):
         encode_callback(CallbackAction.DONE, CallbackTarget.OCCURRENCE, 0, 0)
     with pytest.raises(ValueError):
         encode_callback(CallbackAction.DONE, CallbackTarget.OCCURRENCE, 1, -1)
+    with pytest.raises(ValueError):
+        encode_callback(
+            CallbackAction.DONE,
+            CallbackTarget.OCCURRENCE,
+            1,
+            0,
+            membership_id=1,
+        )
+    with pytest.raises(ValueError):
+        encode_callback(
+            CallbackAction.DONE,
+            CallbackTarget.OCCURRENCE,
+            1,
+            0,
+            membership_revision=1,
+        )
 
 
 def test_action_keyboard_exposes_only_state_valid_actions() -> None:
@@ -261,6 +300,26 @@ def test_action_keyboard_exposes_only_state_valid_actions() -> None:
         for button in row
     }
     assert list_snooze_origins == {CallbackOrigin.LIST}
+
+    shared_card = worker.reminder_actions_kb(
+        42,
+        occurrence_id=9,
+        revision=3,
+        state=ReminderState.DELIVERED.value,
+        origin=CallbackOrigin.SHARED,
+        shared_participant=True,
+        membership_id=12,
+        membership_revision=2,
+    )
+    shared_callbacks = [
+        parse_callback(button.callback_data)
+        for row in shared_card.inline_keyboard
+        for button in row
+    ]
+    assert all(parsed is not None for parsed in shared_callbacks)
+    assert {(parsed.membership_id, parsed.membership_revision) for parsed in shared_callbacks} == {
+        (12, 2)
+    }
 
 
 def test_list_occurrence_callbacks_do_not_bind_to_new_control_message() -> None:
