@@ -111,6 +111,7 @@ class SharedDeliveryStatus:
     complete: bool
     owner_message_id: int | None
     action_revision: int | None = None
+    successful_delivery_count: int = 0
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -1073,17 +1074,37 @@ async def validate_shared_delivery_before_send(
         return False
     current_time = _as_utc(now_utc or utc_now())
     async with SessionLocal() as session, session.begin():
-        reminder = await session.scalar(
-            select(Reminder)
-            .where(
-                Reminder.id == target.reminder_id,
-                Reminder.status == "processing",
-                Reminder.lease_token == reminder_lease_token,
-                Reminder.lease_until > current_time,
+
+        async def fence_target() -> None:
+            await session.execute(
+                update(ReminderDelivery)
+                .where(
+                    ReminderDelivery.id == target.delivery_id,
+                    ReminderDelivery.reminder_id == target.reminder_id,
+                    ReminderDelivery.occurrence_id == target.occurrence_id,
+                    ReminderDelivery.state == ReminderDeliveryState.PROCESSING.value,
+                    ReminderDelivery.lease_token == target.lease_token,
+                )
+                .values(
+                    state=ReminderDeliveryState.CANCELLED.value,
+                    lease_until=None,
+                    lease_token=None,
+                )
             )
-            .with_for_update()
+
+        reminder = await session.scalar(
+            select(Reminder).where(Reminder.id == target.reminder_id).with_for_update()
         )
         if reminder is None:
+            return False
+        if (
+            reminder.status != "processing"
+            or reminder.state not in (ReminderState.SCHEDULED.value, ReminderState.SNOOZED.value)
+            or reminder.lease_token != reminder_lease_token
+            or reminder.lease_until is None
+            or _as_utc(reminder.lease_until) <= current_time
+        ):
+            await fence_target()
             return False
         occurrence = await session.scalar(
             select(ReminderOccurrence).where(
@@ -1094,6 +1115,7 @@ async def validate_shared_delivery_before_send(
             )
         )
         if occurrence is None:
+            await fence_target()
             return False
         delivery = await session.scalar(
             select(ReminderDelivery)
@@ -1112,12 +1134,14 @@ async def validate_shared_delivery_before_send(
             .with_for_update()
         )
         if delivery is None:
+            await fence_target()
             return False
 
         is_owner = (
             delivery.recipient_user_id == reminder.user_id and delivery.membership_revision == 0
         )
         if is_owner != target.is_owner:
+            await fence_target()
             return False
         if is_owner:
             return True
@@ -1130,7 +1154,10 @@ async def validate_shared_delivery_before_send(
                 SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
             )
         )
-        return membership is not None
+        if membership is None:
+            await fence_target()
+            return False
+        return True
 
 
 async def record_shared_delivery_success(
@@ -1245,6 +1272,7 @@ async def get_shared_delivery_status(
         )
         rows = {(row.recipient_user_id, row.membership_revision): row for row in result.scalars()}
         owner_message_id: int | None = None
+        successful_delivery_count = 0
         complete = True
         for recipient_user_id, _chat_id, membership_revision, is_owner in specs:
             row = rows.get((recipient_user_id, membership_revision))
@@ -1259,9 +1287,15 @@ async def get_shared_delivery_status(
             if row.state == ReminderDeliveryState.SENT.value and is_owner:
                 owner_message_id = row.message_id
             if row.state == ReminderDeliveryState.SENT.value:
+                successful_delivery_count += 1
                 continue
             complete = False
-        return SharedDeliveryStatus(complete, owner_message_id, effective_action_revision)
+        return SharedDeliveryStatus(
+            complete,
+            owner_message_id,
+            effective_action_revision,
+            successful_delivery_count,
+        )
 
 
 async def cleanup_expired_shared_data(
@@ -1322,6 +1356,7 @@ async def cleanup_expired_shared_data(
                                 (
                                     OccurrenceState.COMPLETED.value,
                                     OccurrenceState.CANCELLED.value,
+                                    OccurrenceState.FAILED.value,
                                 )
                             )
                         )

@@ -335,8 +335,10 @@ def retry_delay_seconds(
 ) -> int:
     exponent = min(max(failed_attempt - 1, 0), 30)
     exponential_delay = base_seconds * (2**exponent)
-    requested_delay: int = max(exponential_delay, retry_after_seconds or 0)
-    bounded_delay: int = min(max_seconds, requested_delay)
+    bounded_exponential_delay = min(max_seconds, exponential_delay)
+    # Telegram's provider-directed delay is authoritative even when it is
+    # longer than the generic exponential cap.
+    bounded_delay: int = max(bounded_exponential_delay, retry_after_seconds or 0)
     return max(1, bounded_delay)
 
 
@@ -1146,6 +1148,7 @@ async def _process_shared_delivery(
         return False
 
     had_transient_failure = False
+    max_retry_after_seconds: int | None = None
     for delivery_id in delivery_ids:
         if stop_event is not None and stop_event.is_set():
             return False
@@ -1180,7 +1183,13 @@ async def _process_shared_delivery(
                     reminder_lease_token=lease_token,
                     now_utc=utc_now(),
                 )
-                had_transient_failure |= recorded and failure.kind == DeliveryErrorKind.TRANSIENT
+                if recorded and failure.kind == DeliveryErrorKind.TRANSIENT:
+                    had_transient_failure = True
+                    if failure.retry_after_seconds is not None:
+                        max_retry_after_seconds = max(
+                            max_retry_after_seconds or 0,
+                            failure.retry_after_seconds,
+                        )
                 continue
 
         if not await shared_reminder_service.validate_shared_delivery_before_send(
@@ -1224,7 +1233,13 @@ async def _process_shared_delivery(
                 reminder_lease_token=lease_token,
                 now_utc=utc_now(),
             )
-            had_transient_failure |= recorded and failure.kind == DeliveryErrorKind.TRANSIENT
+            if recorded and failure.kind == DeliveryErrorKind.TRANSIENT:
+                had_transient_failure = True
+                if failure.retry_after_seconds is not None:
+                    max_retry_after_seconds = max(
+                        max_retry_after_seconds or 0,
+                        failure.retry_after_seconds,
+                    )
             continue
 
         await shared_reminder_service.record_shared_delivery_success(
@@ -1242,6 +1257,7 @@ async def _process_shared_delivery(
             DeliveryFailure(
                 kind=DeliveryErrorKind.TRANSIENT,
                 error_type="SharedRecipientDelivery",
+                retry_after_seconds=max_retry_after_seconds,
             ),
         )
         return False
@@ -1252,6 +1268,15 @@ async def _process_shared_delivery(
         action_revision=reminder.action_revision,
     )
     if not delivery_status.complete:
+        return False
+    if delivery_status.successful_delivery_count == 0:
+        await _finalize_send_failure(
+            reminder,
+            DeliveryFailure(
+                kind=DeliveryErrorKind.TERMINAL,
+                error_type="SharedRecipientDelivery",
+            ),
+        )
         return False
     if delivery_status.action_revision is None:
         return False

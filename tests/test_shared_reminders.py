@@ -633,6 +633,106 @@ async def test_shared_worker_fanout_is_bounded_private_and_idempotent(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_shared_worker_all_terminal_failures_finalize_as_failed(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1421, chat_id=2421)
+        participant = await _add_user(session_factory, telegram_user_id=1422, chat_id=2422)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(participant, invite.token, now_utc=NOW)
+        ).accepted
+
+        monkeypatch.setattr(worker, "worker_metrics", worker.WorkerMetrics())
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: NOW)
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: NOW)
+        forbidden_type = type("TelegramForbiddenError", (Exception,), {})
+        bot = _FakeBot(
+            failures={
+                owner.chat_id: [forbidden_type("owner blocked the bot")],
+                participant.chat_id: [forbidden_type("participant blocked the bot")],
+            }
+        )
+
+        assert await worker.process_due_reminders(bot) == 0
+        assert [call["chat_id"] for call in bot.calls] == [owner.chat_id, participant.chat_id]
+        assert worker.worker_metrics.delivered == 0
+        assert worker.worker_metrics.failed == 1
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            occurrence = await session.scalar(
+                select(ReminderOccurrence).where(ReminderOccurrence.reminder_id == reminder_id)
+            )
+            rows = list((await session.scalars(select(ReminderDelivery))).all())
+            assert reminder is not None
+            assert reminder.status == "failed"
+            assert reminder.state == ReminderState.FAILED.value
+            assert reminder.next_retry_at is None
+            assert occurrence is not None and occurrence.status == OccurrenceState.FAILED.value
+            assert len(rows) == 2
+            assert all(row.state == ReminderDeliveryState.FAILED.value for row in rows)
+            assert all(row.error_kind == "terminal" for row in rows)
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_fences_cancelled_reminder_after_claim_before_send(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1431, chat_id=2431)
+        participant = await _add_user(session_factory, telegram_user_id=1432, chat_id=2432)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(participant, invite.token, now_utc=NOW)
+        ).accepted
+
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: NOW)
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: NOW)
+        original_claim = shared_reminder_service.claim_shared_delivery
+        cancelled = False
+
+        async def claim_then_cancel(*args, **kwargs):
+            nonlocal cancelled
+            target = await original_claim(*args, **kwargs)
+            if target is not None and not cancelled:
+                cancelled = True
+                assert await reminder_service.cancel_reminder(owner, reminder_id)
+            return target
+
+        monkeypatch.setattr(shared_reminder_service, "claim_shared_delivery", claim_then_cancel)
+        bot = _FakeBot()
+
+        assert await worker.process_due_reminders(bot) == 0
+        assert bot.calls == []
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            owner_row = await session.scalar(
+                select(ReminderDelivery).where(
+                    ReminderDelivery.reminder_id == reminder_id,
+                    ReminderDelivery.recipient_user_id == owner.id,
+                )
+            )
+            assert reminder is not None and reminder.state == ReminderState.CANCELLED.value
+            assert owner_row is not None
+            assert owner_row.state == ReminderDeliveryState.CANCELLED.value
+            assert owner_row.lease_token is None
+            assert owner_row.lease_until is None
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_shared_worker_fences_revoked_claim_before_send(monkeypatch) -> None:
     engine, connection, session_factory = await _open_sqlite(monkeypatch)
     try:
@@ -773,6 +873,52 @@ async def test_shared_worker_retry_preserves_successful_recipient(monkeypatch) -
             expected_revision=first_owner_done.revision,
             expected_message_id=guest_message_id,
         )
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_retry_after_uses_max_shared_recipient_delay(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1541, chat_id=2541)
+        guest_a = await _add_user(session_factory, telegram_user_id=1542, chat_id=2542)
+        guest_b = await _add_user(session_factory, telegram_user_id=1543, chat_id=2543)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        for guest in (guest_a, guest_b):
+            invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+            assert (
+                await shared_reminder_service.accept_invite(guest, invite.token, now_utc=NOW)
+            ).accepted
+
+        retry_after_type = type("TelegramRetryAfter", (Exception,), {})
+        retry_after_short = retry_after_type("retry later")
+        retry_after_short.retry_after = 42
+        retry_after_long = retry_after_type("retry later")
+        retry_after_long.retry_after = 90
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: NOW)
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: NOW)
+        bot = _FakeBot(
+            failures={
+                guest_a.chat_id: [retry_after_short],
+                guest_b.chat_id: [retry_after_long],
+            }
+        )
+
+        assert await worker.process_due_reminders(bot) == 0
+        assert [call["chat_id"] for call in bot.calls] == [
+            owner.chat_id,
+            guest_a.chat_id,
+            guest_b.chat_id,
+        ]
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            assert reminder is not None
+            assert reminder.next_retry_at.replace(tzinfo=UTC) == NOW + timedelta(seconds=90)
+            assert reminder.retry_count == 1
     finally:
         await connection.close()
         await engine.dispose()
@@ -953,6 +1099,66 @@ async def test_shared_cleanup_removes_expired_invites_and_bounded_terminal_data(
             "deleted_memberships": 0,
             "deleted_deliveries": 1,
         }
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_cleanup_removes_failed_occurrence_deliveries_then_tombstone(
+    monkeypatch,
+) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1661, chat_id=2661)
+        participant = await _add_user(session_factory, telegram_user_id=1662, chat_id=2662)
+        _reminder_id, occurrence_id, membership_id, delivery_id = await _add_delivered_shared(
+            session_factory, owner, participant, now=NOW
+        )
+        assert await shared_reminder_service.revoke_membership(
+            owner,
+            membership_id,
+            expected_revision=1,
+            now_utc=NOW,
+        )
+        async with session_factory() as session:
+            await session.execute(
+                update(ReminderOccurrence)
+                .where(ReminderOccurrence.id == occurrence_id)
+                .values(
+                    status=OccurrenceState.FAILED.value,
+                    delivered_at=None,
+                    message_id=None,
+                )
+            )
+            await session.execute(
+                update(ReminderDelivery)
+                .where(ReminderDelivery.id == delivery_id)
+                .values(
+                    state=ReminderDeliveryState.FAILED.value,
+                    error_kind="terminal",
+                    created_at=NOW - timedelta(days=31),
+                )
+            )
+            await session.execute(
+                update(SharedReminderMembership)
+                .where(SharedReminderMembership.id == membership_id)
+                .values(revoked_at=NOW - timedelta(days=31))
+            )
+            await session.commit()
+
+        cleanup_time = NOW + timedelta(days=31)
+        first = await shared_reminder_service.cleanup_expired_shared_data(now_utc=cleanup_time)
+        assert first["deleted_deliveries"] == 1
+        assert first["deleted_memberships"] == 0
+        async with session_factory() as session:
+            assert await session.get(ReminderDelivery, delivery_id) is None
+            assert await session.get(SharedReminderMembership, membership_id) is not None
+
+        second = await shared_reminder_service.cleanup_expired_shared_data(now_utc=cleanup_time)
+        assert second["deleted_memberships"] == 1
+        async with session_factory() as session:
+            assert await session.get(SharedReminderMembership, membership_id) is None
     finally:
         await connection.close()
         await engine.dispose()

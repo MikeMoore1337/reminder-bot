@@ -277,7 +277,7 @@ def test_delivery_error_classification_is_bounded_and_secret_safe() -> None:
     assert timeout.kind == worker.DeliveryErrorKind.TRANSIENT
     assert "secret" not in worker._safe_failure_text(terminal)
     assert (
-        worker.retry_delay_seconds(1, base_seconds=10, max_seconds=30, retry_after_seconds=90) == 30
+        worker.retry_delay_seconds(1, base_seconds=10, max_seconds=30, retry_after_seconds=90) == 90
     )
 
 
