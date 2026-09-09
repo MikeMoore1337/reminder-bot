@@ -213,11 +213,16 @@ async def cmd_shared(message: Message, command: CommandObject | None = None) -> 
     # One card contains all management controls for that reminder. Together
     # with one optional navigation message this bounds the Bot API fan-out to
     # SHARED_PAGE_SIZE + 1 calls per command invocation.
+    displayed_count = 0
     for entry in entries[: shared_reminder_service.SHARED_PAGE_SIZE]:
-        occurrence = await shared_reminder_service.get_shared_occurrence(
+        card = await shared_reminder_service.get_shared_reminder_card(
             user,
             entry.reminder.id,
         )
+        if card is None:
+            continue
+        entry = card.entry
+        occurrence = card.occurrence
         display_state = OccurrenceState.DELIVERED.value if occurrence is not None else None
         card_text = (
             f"{_render_shared_header(entry)}\n\n"
@@ -234,16 +239,21 @@ async def cmd_shared(message: Message, command: CommandObject | None = None) -> 
             reply_markup=_shared_entry_markup(entry, occurrence),
             parse_mode="HTML",
         )
+        displayed_count += 1
     if page.has_previous or page.has_next:
-        start = (page.page - 1) * page.page_size + 1
-        end = start + len(entries) - 1
         navigation: list[str] = []
         if page.has_previous:
             navigation.append(f"предыдущая: /shared {page.page - 1}")
         if page.has_next:
             navigation.append(f"следующая: /shared {page.page + 1}")
+        if displayed_count:
+            start = (page.page - 1) * page.page_size + 1
+            end = start + displayed_count - 1
+            page_summary = f"Показаны {start}–{end}"
+        else:
+            page_summary = "На этой странице нет доступных карточек"
         await message.answer(
-            f"Показаны {start}–{end} · {'; '.join(navigation)}",
+            f"{page_summary} · {'; '.join(navigation)}",
         )
 
 
