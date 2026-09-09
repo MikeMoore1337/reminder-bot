@@ -479,6 +479,7 @@ async def claim_due_reminders(
     recovered_count = 0
     expired_count = 0
     exhausted_count = 0
+    recovered_shared_delivery_count = 0
     persistent_exhausted_count = 0
     quiet_deferred_count = 0
     user_cooldown_deferred_count = 0
@@ -561,6 +562,13 @@ async def claim_due_reminders(
 
             was_recovery = reminder.status == "processing"
             if reminder.attempt_count >= settings.worker_max_attempts:
+                if await shared_reminder_service.reconcile_shared_delivery_after_recovery(
+                    session,
+                    reminder,
+                    now_utc=current_time,
+                ):
+                    recovered_shared_delivery_count += 1
+                    continue
                 if reminder.kind == ReminderKind.DEADLINE.value:
                     await finalize_deadline_delivery_failure(
                         session,
@@ -623,6 +631,7 @@ async def claim_due_reminders(
     worker_metrics.recovered += recovered_count
     worker_metrics.expired_leases += expired_count
     worker_metrics.failed += exhausted_count
+    worker_metrics.delivered += recovered_shared_delivery_count
     worker_metrics.persistent_exhausted += persistent_exhausted_count
     worker_metrics.quiet_hours_deferred += quiet_deferred_count
     worker_metrics.user_cooldown_deferred += user_cooldown_deferred_count
@@ -632,6 +641,7 @@ async def claim_due_reminders(
         claimed
         or recovered_count
         or exhausted_count
+        or recovered_shared_delivery_count
         or persistent_exhausted_count
         or quiet_deferred_count
         or user_cooldown_deferred_count
@@ -644,6 +654,7 @@ async def claim_due_reminders(
                     f"exhausted={exhausted_count} quiet_deferred={quiet_deferred_count} "
                     f"user_cooldown_deferred={user_cooldown_deferred_count} "
                     f"persistent_exhausted={persistent_exhausted_count} "
+                    f"recovered_shared_delivery={recovered_shared_delivery_count} "
                     f"processing_age_seconds={current_processing_age:.3f}"
                 )
             },

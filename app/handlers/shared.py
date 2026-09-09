@@ -11,10 +11,14 @@ from app.callbacks import CallbackAction, CallbackOrigin, CallbackTarget, parse_
 from app.db.models import OccurrenceState, Reminder, ReminderOccurrence
 from app.keyboards.shared import revoke_invite_kb, revoke_membership_kb
 from app.services import shared_reminder_service
-from app.services.reminder_service import delivery_at_utc, format_state
+from app.services.reminder_service import (
+    MAX_REMINDER_TEXT_LENGTH,
+    delivery_at_utc,
+    format_state,
+)
 from app.services.timezone_service import get_or_create_user
 from app.utils.datetime_utils import from_utc_to_user
-from app.workers.reminder_worker import reminder_actions_kb
+from app.workers.reminder_worker import _escape_bounded, reminder_actions_kb
 
 router = Router()
 
@@ -35,14 +39,21 @@ def _shared_reminder_text(
     *,
     display_state: str | None = None,
     display_at_utc: datetime | None = None,
+    text_budget: int | None = None,
 ) -> str:
     local_dt = from_utc_to_user(display_at_utc or delivery_at_utc(reminder), timezone_name)
-    return (
+    prefix = (
         f"ID: {reminder.id}\n"
         f"Состояние: {format_state(display_state or reminder.state)}\n"
         f"Когда: {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
-        f"Текст: {escape(reminder.text)}"
+        "Текст: "
     )
+    rendered_text = (
+        escape(reminder.text)
+        if text_budget is None
+        else _escape_bounded(reminder.text, max(0, text_budget))
+    )
+    return prefix + rendered_text
 
 
 def _entry_markup(
@@ -226,15 +237,30 @@ async def cmd_shared(message: Message, command: CommandObject | None = None) -> 
         entry = card.entry
         occurrence = card.occurrence
         display_state = OccurrenceState.DELIVERED.value if occurrence is not None else None
+        header = _render_shared_header(entry)
+        owner_controls = _render_owner_controls(entry, timezone_name)
+        card_prefix = f"{header}\n\n"
+        body_prefix = _shared_reminder_text(
+            entry.reminder,
+            timezone_name,
+            display_state=display_state,
+            display_at_utc=occurrence.delivery_at_utc if occurrence is not None else None,
+            text_budget=0,
+        )
+        text_budget = max(
+            0,
+            MAX_REMINDER_TEXT_LENGTH - len(card_prefix) - len(body_prefix) - len(owner_controls),
+        )
         card_text = (
-            f"{_render_shared_header(entry)}\n\n"
+            card_prefix
             + _shared_reminder_text(
                 entry.reminder,
                 timezone_name,
                 display_state=display_state,
                 display_at_utc=occurrence.delivery_at_utc if occurrence is not None else None,
+                text_budget=text_budget,
             )
-            + _render_owner_controls(entry, timezone_name)
+            + owner_controls
         )
         await message.answer(
             card_text,

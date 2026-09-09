@@ -1079,6 +1079,103 @@ def _clear_delivery_claim(delivery: ReminderDelivery) -> None:
     delivery.lease_token = None
 
 
+async def reconcile_shared_delivery_after_recovery(
+    session: AsyncSession,
+    reminder: Reminder,
+    *,
+    now_utc: datetime,
+) -> bool:
+    """Finalize a recovered shared occurrence from durable recipient state.
+
+    A worker can stop after Telegram accepted one recipient but before the
+    parent reminder finalization commits.  When that claim is recovered at the
+    attempt limit, SENT rows are authoritative: keep their callbacks and make
+    only the unfinished recipient rows terminal.
+    """
+
+    if (
+        reminder.status != "processing"
+        or reminder.kind != ReminderKind.ORDINARY.value
+        or reminder.mode != "normal"
+        or reminder.recurrence_type != "none"
+        or reminder.parent_reminder_id is not None
+        or not is_private_chat_id(reminder.chat_id)
+    ):
+        return False
+
+    occurrence = await session.scalar(
+        select(ReminderOccurrence)
+        .where(
+            ReminderOccurrence.reminder_id == reminder.id,
+            ReminderOccurrence.occurrence_at_utc == reminder.remind_at_utc,
+        )
+        .with_for_update()
+    )
+    if occurrence is None:
+        return False
+
+    deliveries = list(
+        (
+            await session.scalars(
+                select(ReminderDelivery)
+                .where(ReminderDelivery.occurrence_id == occurrence.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    sent_deliveries = [
+        delivery for delivery in deliveries if delivery.state == ReminderDeliveryState.SENT.value
+    ]
+    if not sent_deliveries:
+        return False
+
+    current_time = _as_utc(now_utc)
+    owner_delivery = next(
+        (
+            delivery
+            for delivery in sent_deliveries
+            if delivery.recipient_user_id == reminder.user_id and delivery.membership_revision == 0
+        ),
+        None,
+    )
+    sent_times = [
+        _as_utc(delivery.sent_at) for delivery in sent_deliveries if delivery.sent_at is not None
+    ]
+    delivered_at = min(sent_times, default=current_time)
+    occurrence.status = OccurrenceState.DELIVERED.value
+    occurrence.message_id = owner_delivery.message_id if owner_delivery else None
+    occurrence.delivered_at = delivered_at
+    occurrence.snoozed_until_utc = None
+
+    reminder.status = "sent"
+    reminder.state = ReminderState.DELIVERED.value
+    reminder.sent_at = delivered_at
+    reminder.error_text = None
+    reminder.last_message_id = occurrence.message_id
+    reminder.last_delivery_occurrence_utc = occurrence.occurrence_at_utc
+    reminder.delivery_at_utc = None
+    reminder.snoozed_until_utc = None
+    reminder.next_retry_at = None
+    reminder.processing_started_at = None
+    reminder.lease_until = None
+    reminder.lease_token = None
+
+    terminal_error = "delivery attempt limit exhausted"
+    for delivery in deliveries:
+        if delivery.state == ReminderDeliveryState.SENT.value:
+            continue
+        if delivery.state in {
+            ReminderDeliveryState.PENDING.value,
+            ReminderDeliveryState.PROCESSING.value,
+            ReminderDeliveryState.FAILED.value,
+        }:
+            delivery.state = ReminderDeliveryState.FAILED.value
+            delivery.last_error = delivery.last_error or terminal_error
+            delivery.error_kind = "terminal"
+            _clear_delivery_claim(delivery)
+    return True
+
+
 def _reset_delivery_row(delivery: ReminderDelivery, action_revision: int) -> None:
     delivery.action_revision = action_revision
     delivery.state = ReminderDeliveryState.PENDING.value

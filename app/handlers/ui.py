@@ -6,6 +6,7 @@ from aiogram.types import Message
 
 from app.callbacks import CallbackOrigin
 from app.db.models import OccurrenceState, Reminder, User
+from app.handlers.guards import require_private_chat
 from app.keyboards.adaptive import suggestion_kb
 from app.keyboards.reply import get_main_keyboard, get_timezone_keyboard
 from app.services import shared_reminder_service
@@ -183,6 +184,8 @@ async def _handle_adaptive_toggle(
     *,
     feature: str,
 ) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
     value = (command.args or "").strip().lower()
@@ -293,6 +296,8 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     ):
         await message.answer("❌ Приглашение можно принять только в личном чате с ботом.")
         return
+    if not await require_private_chat(message):
+        return
 
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
@@ -327,6 +332,8 @@ async def cmd_help(message: Message) -> None:
 
 @router.message(Command("mytimezone"))
 async def cmd_mytimezone(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
@@ -340,6 +347,8 @@ async def cmd_mytimezone(message: Message) -> None:
 
 @router.message(Command("timezone"))
 async def cmd_timezone(message: Message, command: CommandObject) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
 
@@ -380,6 +389,8 @@ async def cmd_digest(message: Message, command: CommandObject) -> None:
 
 @router.message(Command("list"))
 async def cmd_list(message: Message, command: CommandObject) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
     reminders = await list_active_reminders(user)
@@ -422,6 +433,8 @@ async def btn_create_reminder(message: Message) -> None:
 
 @router.message(F.text == "📋 Мои напоминания")
 async def btn_list(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
     reminders = await list_active_reminders(user)
@@ -451,6 +464,8 @@ async def btn_list(message: Message) -> None:
 
 @router.message(F.text == "🌍 Часовой пояс")
 async def btn_timezone(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)
@@ -473,6 +488,8 @@ async def btn_help(message: Message) -> None:
 
 @router.message(F.text.in_({"Europe/Moscow", "Europe/Helsinki", "Europe/Berlin", "UTC"}))
 async def btn_set_popular_timezone(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = (message.text or "").strip()
@@ -493,6 +510,8 @@ async def btn_set_popular_timezone(message: Message) -> None:
 
 @router.message(F.text == "⬅️ Назад")
 async def btn_back(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     telegram_user_id, chat_id = _get_ids(message)
     await get_or_create_user(telegram_user_id, chat_id)
     timezone_name = await get_user_timezone(telegram_user_id, chat_id)

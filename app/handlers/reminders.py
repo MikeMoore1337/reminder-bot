@@ -17,6 +17,7 @@ from app.callbacks import (
     parse_callback,
 )
 from app.db.models import Reminder, ReminderKind, User, VoiceReminderDraft
+from app.handlers.guards import require_private_chat
 from app.keyboards.adaptive import suggestion_kb
 from app.keyboards.deadline import deadline_draft_kb
 from app.keyboards.voice import voice_draft_kb
@@ -251,6 +252,8 @@ async def _create_and_answer(
     show_hint: bool = False,
     context: MessageContextSnapshot | None = None,
 ) -> None:
+    if not await require_private_chat(message):
+        return
     ids = _message_ids(message)
     if ids is None:
         await message.answer("Не удалось определить пользователя")
@@ -565,6 +568,8 @@ async def cmd_remind(message: Message) -> None:
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     parts = (message.text or "").split(maxsplit=1)
     ids = _message_ids(message)
     if ids is None:
@@ -746,6 +751,8 @@ async def _handle_deadline_callback(callback: CallbackQuery, parsed: ReminderCal
 
 @router.message(F.voice)
 async def voice_reminder_handler(message: Message, bot: Bot) -> None:
+    if not await require_private_chat(message):
+        return
     ids = _message_ids(message)
     if ids is None or message.voice is None:
         await message.answer("Не удалось определить голосовое сообщение")
@@ -1200,6 +1207,8 @@ async def reminder_callback(callback: CallbackQuery) -> None:
 
 @router.message()
 async def text_reminder_handler(message: Message) -> None:
+    if not await require_private_chat(message):
+        return
     ids = _message_ids(message)
     if ids is not None:
         user = await get_or_create_user(telegram_user_id=ids[0], chat_id=ids[1])
