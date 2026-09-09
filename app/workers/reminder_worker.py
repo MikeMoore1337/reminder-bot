@@ -1464,8 +1464,9 @@ async def process_claimed_reminder(
     if stop_event is not None and stop_event.is_set():
         return False
 
-    if await shared_reminder_service.is_shared_reminder(
+    if await shared_reminder_service.should_process_as_shared_delivery(
         reminder.id,
+        occurrence_id,
         session_factory=SessionLocal,
     ):
         return await _process_shared_delivery(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -739,24 +741,69 @@ async def get_shared_reminder_card(
 
     current_time = _as_utc(utc_now())
     async with SessionLocal() as session:
-        reminder, _membership, _is_owner = await _load_shared_reminder(
+        return await _load_shared_card_in_session(
             session,
             user,
             reminder_id,
-            for_update=False,
+            current_time=current_time,
+            lock_membership=False,
         )
-        if reminder is None:
+
+
+async def _load_shared_card_in_session(
+    session: AsyncSession,
+    user: User,
+    reminder_id: int,
+    *,
+    current_time: datetime,
+    lock_membership: bool,
+) -> SharedReminderCard | None:
+    reminder = await session.scalar(select(Reminder).where(Reminder.id == reminder_id))
+    if reminder is None or not _shareable(reminder):
+        return None
+
+    membership: SharedReminderMembership | None = None
+    if not _owner_matches(reminder, user):
+        membership_statement = select(SharedReminderMembership).where(
+            SharedReminderMembership.reminder_id == reminder_id,
+            SharedReminderMembership.user_id == user.id,
+            SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
+        )
+        if lock_membership:
+            membership_statement = membership_statement.with_for_update()
+        membership = await session.scalar(membership_statement)
+        if membership is None:
             return None
-        entry = await _build_shared_reminder_view(
+
+    entry = await _build_shared_reminder_view(
+        session,
+        user,
+        reminder,
+        current_time=current_time,
+        membership_id=membership.id if membership is not None else None,
+        membership_revision=membership.revision if membership is not None else None,
+    )
+    occurrence = await _load_current_delivered_occurrence(session, reminder)
+    return SharedReminderCard(entry=entry, occurrence=occurrence)
+
+
+@asynccontextmanager
+async def authorize_shared_card_send(
+    user: User,
+    reminder_id: int,
+) -> AsyncIterator[SharedReminderCard | None]:
+    """Hold participant authorization through the caller's Telegram send."""
+
+    current_time = _as_utc(utc_now())
+    async with SessionLocal() as session, session.begin():
+        card = await _load_shared_card_in_session(
             session,
             user,
-            reminder,
+            reminder_id,
             current_time=current_time,
-            membership_id=_membership.id if _membership is not None else None,
-            membership_revision=_membership.revision if _membership is not None else None,
+            lock_membership=True,
         )
-        occurrence = await _load_current_delivered_occurrence(session, reminder)
-        return SharedReminderCard(entry=entry, occurrence=occurrence)
+        yield card
 
 
 async def get_shared_occurrence(
@@ -1049,6 +1096,36 @@ async def is_shared_reminder(
                     )
                 )
             )
+        )
+
+
+async def should_process_as_shared_delivery(
+    reminder_id: int,
+    occurrence_id: int,
+    *,
+    session_factory: Any | None = None,
+) -> bool:
+    """Keep a fan-out occurrence on the shared path after membership changes."""
+
+    factory = session_factory or SessionLocal
+    async with factory() as session:
+        active_membership = exists().where(
+            SharedReminderMembership.reminder_id == reminder_id,
+            SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
+        )
+        current_occurrence_delivery = exists(
+            select(ReminderDelivery.id)
+            .join(ReminderOccurrence, ReminderOccurrence.id == ReminderDelivery.occurrence_id)
+            .where(
+                ReminderDelivery.reminder_id == reminder_id,
+                ReminderDelivery.occurrence_id == occurrence_id,
+                ReminderOccurrence.id == occurrence_id,
+                ReminderOccurrence.reminder_id == reminder_id,
+                ReminderOccurrence.status == OccurrenceState.PROCESSING.value,
+            )
+        )
+        return bool(
+            await session.scalar(select(or_(active_membership, current_occurrence_delivery)))
         )
 
 

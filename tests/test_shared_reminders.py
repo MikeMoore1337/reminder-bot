@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -574,13 +575,14 @@ async def test_shared_command_keeps_owner_controls_within_bounded_fanout(monkeyp
     async def fake_page(*args, **kwargs):
         return page
 
-    async def fake_card(_user, reminder_id):
+    @asynccontextmanager
+    async def fake_card_send(_user, reminder_id):
         entry = next(item for item in entries if item.reminder.id == reminder_id)
-        return shared_reminder_service.SharedReminderCard(entry=entry, occurrence=None)
+        yield shared_reminder_service.SharedReminderCard(entry=entry, occurrence=None)
 
     monkeypatch.setattr(shared_handler, "get_or_create_user", fake_user)
     monkeypatch.setattr(
-        shared_handler.shared_reminder_service, "get_shared_reminder_card", fake_card
+        shared_handler.shared_reminder_service, "authorize_shared_card_send", fake_card_send
     )
     monkeypatch.setattr(
         shared_handler.shared_reminder_service, "list_shared_reminders_page", fake_page
@@ -700,9 +702,10 @@ async def test_shared_handler_skips_entry_revoked_after_page_load(monkeypatch) -
         async def fake_page(*args, **kwargs):
             return page
 
-        original_card = shared_reminder_service.get_shared_reminder_card
+        original_authorize = shared_reminder_service.authorize_shared_card_send
         revoked = False
 
+        @asynccontextmanager
         async def revoke_before_fresh_validation(user, loaded_reminder_id):
             nonlocal revoked
             if not revoked:
@@ -713,7 +716,8 @@ async def test_shared_handler_skips_entry_revoked_after_page_load(monkeypatch) -
                     expected_revision=1,
                     now_utc=NOW,
                 )
-            return await original_card(user, loaded_reminder_id)
+            async with original_authorize(user, loaded_reminder_id) as card:
+                yield card
 
         answers: list[tuple[str, dict[str, object]]] = []
 
@@ -727,7 +731,7 @@ async def test_shared_handler_skips_entry_revoked_after_page_load(monkeypatch) -
         )
         monkeypatch.setattr(
             shared_handler.shared_reminder_service,
-            "get_shared_reminder_card",
+            "authorize_shared_card_send",
             revoke_before_fresh_validation,
         )
         message = SimpleNamespace(
@@ -1572,6 +1576,185 @@ async def test_shared_worker_retry_preserves_successful_recipient(monkeypatch) -
             expected_revision=first_owner_done.revision,
             expected_message_id=guest_message_id,
         )
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_keeps_current_occurrence_after_final_membership_revoke(
+    monkeypatch,
+) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1681, chat_id=2681)
+        participant = await _add_user(session_factory, telegram_user_id=1682, chat_id=2682)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(participant, invite.token, now_utc=NOW)
+        ).accepted
+
+        clock = [NOW]
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: clock[0])
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: clock[0])
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: clock[0])
+        shared_route_results: list[bool] = []
+        original_shared_route = shared_reminder_service.should_process_as_shared_delivery
+
+        async def record_shared_route(*args, **kwargs) -> bool:
+            result = await original_shared_route(*args, **kwargs)
+            shared_route_results.append(result)
+            return result
+
+        monkeypatch.setattr(
+            shared_reminder_service,
+            "should_process_as_shared_delivery",
+            record_shared_route,
+        )
+        bot = _FakeBot(fail_chat_id=participant.chat_id)
+
+        assert await worker.process_due_reminders(bot) == 0
+        assert [call["chat_id"] for call in bot.calls] == [owner.chat_id, participant.chat_id]
+
+        async with session_factory() as session:
+            occurrence = await session.scalar(
+                select(ReminderOccurrence).where(ReminderOccurrence.reminder_id == reminder_id)
+            )
+            membership = await session.scalar(
+                select(SharedReminderMembership).where(
+                    SharedReminderMembership.reminder_id == reminder_id,
+                    SharedReminderMembership.user_id == participant.id,
+                )
+            )
+            assert occurrence is not None
+            assert occurrence.status == OccurrenceState.DELIVERED.value
+            assert membership is not None
+            membership_id = membership.id
+            membership_revision = membership.revision
+            occurrence_id = occurrence.id
+            rows = list(
+                (
+                    await session.scalars(
+                        select(ReminderDelivery).where(
+                            ReminderDelivery.occurrence_id == occurrence_id
+                        )
+                    )
+                ).all()
+            )
+            assert {row.state for row in rows} == {
+                ReminderDeliveryState.SENT.value,
+                ReminderDeliveryState.FAILED.value,
+            }
+
+        assert await shared_reminder_service.revoke_membership(
+            owner,
+            membership_id,
+            expected_revision=membership_revision,
+            now_utc=NOW,
+        )
+
+        bot.fail_chat_id = None
+        clock[0] = NOW + timedelta(seconds=11)
+        assert await worker.process_due_reminders(bot) == 1
+        assert [call["chat_id"] for call in bot.calls] == [owner.chat_id, participant.chat_id]
+        assert shared_route_results == [True, True]
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            occurrence = await session.get(ReminderOccurrence, occurrence_id)
+            membership = await session.get(SharedReminderMembership, membership_id)
+            rows = {
+                row.recipient_user_id: row
+                for row in (
+                    await session.scalars(
+                        select(ReminderDelivery).where(
+                            ReminderDelivery.occurrence_id == occurrence_id
+                        )
+                    )
+                ).all()
+            }
+            assert reminder is not None and reminder.state == ReminderState.DELIVERED.value
+            assert occurrence is not None and occurrence.status == OccurrenceState.DELIVERED.value
+            assert membership is not None
+            assert membership.state == SharedMembershipState.REVOKED.value
+            assert rows[owner.id].state == ReminderDeliveryState.SENT.value
+            assert rows[participant.id].state == ReminderDeliveryState.FAILED.value
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_worker_ignores_historical_shared_occurrence_rows(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1691, chat_id=2691)
+        participant = await _add_user(session_factory, telegram_user_id=1692, chat_id=2692)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        historical_at = NOW - timedelta(hours=1)
+
+        async with session_factory() as session:
+            historical_occurrence = ReminderOccurrence(
+                reminder_id=reminder_id,
+                occurrence_at_utc=historical_at,
+                delivery_at_utc=historical_at,
+                status=OccurrenceState.DELIVERED.value,
+                action_revision=4,
+                message_id=9901,
+                delivered_at=historical_at,
+            )
+            session.add(historical_occurrence)
+            await session.flush()
+            session.add(
+                ReminderDelivery(
+                    reminder_id=reminder_id,
+                    occurrence_id=historical_occurrence.id,
+                    recipient_user_id=participant.id,
+                    membership_revision=1,
+                    action_revision=4,
+                    chat_id=participant.chat_id,
+                    state=ReminderDeliveryState.SENT.value,
+                    message_id=9902,
+                    sent_at=historical_at,
+                )
+            )
+            await session.commit()
+
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: NOW)
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: NOW)
+        bot = _FakeBot()
+
+        assert await worker.process_due_reminders(bot) == 1
+        assert [call["chat_id"] for call in bot.calls] == [owner.chat_id]
+
+        async with session_factory() as session:
+            current_occurrence = await session.scalar(
+                select(ReminderOccurrence).where(
+                    ReminderOccurrence.reminder_id == reminder_id,
+                    ReminderOccurrence.occurrence_at_utc == NOW,
+                )
+            )
+            historical_delivery = await session.scalar(
+                select(ReminderDelivery).where(
+                    ReminderDelivery.reminder_id == reminder_id,
+                    ReminderDelivery.recipient_user_id == participant.id,
+                )
+            )
+            assert current_occurrence is not None
+            assert historical_delivery is not None
+            assert historical_delivery.occurrence_id != current_occurrence.id
+            assert (
+                await session.scalar(
+                    select(ReminderDelivery.id).where(
+                        ReminderDelivery.occurrence_id == current_occurrence.id
+                    )
+                )
+                is None
+            )
     finally:
         await connection.close()
         await engine.dispose()

@@ -228,46 +228,49 @@ async def cmd_shared(message: Message, command: CommandObject | None = None) -> 
     # SHARED_PAGE_SIZE + 1 calls per command invocation.
     displayed_count = 0
     for entry in entries[: shared_reminder_service.SHARED_PAGE_SIZE]:
-        card = await shared_reminder_service.get_shared_reminder_card(
+        async with shared_reminder_service.authorize_shared_card_send(
             user,
             entry.reminder.id,
-        )
-        if card is None:
-            continue
-        entry = card.entry
-        occurrence = card.occurrence
-        display_state = OccurrenceState.DELIVERED.value if occurrence is not None else None
-        header = _render_shared_header(entry)
-        owner_controls = _render_owner_controls(entry, timezone_name)
-        card_prefix = f"{header}\n\n"
-        body_prefix = _shared_reminder_text(
-            entry.reminder,
-            timezone_name,
-            display_state=display_state,
-            display_at_utc=occurrence.delivery_at_utc if occurrence is not None else None,
-            text_budget=0,
-        )
-        text_budget = max(
-            0,
-            MAX_REMINDER_TEXT_LENGTH - len(card_prefix) - len(body_prefix) - len(owner_controls),
-        )
-        card_text = (
-            card_prefix
-            + _shared_reminder_text(
+        ) as card:
+            if card is None:
+                continue
+            entry = card.entry
+            occurrence = card.occurrence
+            display_state = OccurrenceState.DELIVERED.value if occurrence is not None else None
+            header = _render_shared_header(entry)
+            owner_controls = _render_owner_controls(entry, timezone_name)
+            card_prefix = f"{header}\n\n"
+            body_prefix = _shared_reminder_text(
                 entry.reminder,
                 timezone_name,
                 display_state=display_state,
                 display_at_utc=occurrence.delivery_at_utc if occurrence is not None else None,
-                text_budget=text_budget,
+                text_budget=0,
             )
-            + owner_controls
-        )
-        await message.answer(
-            card_text,
-            reply_markup=_shared_entry_markup(entry, occurrence),
-            parse_mode="HTML",
-        )
-        displayed_count += 1
+            text_budget = max(
+                0,
+                MAX_REMINDER_TEXT_LENGTH
+                - len(card_prefix)
+                - len(body_prefix)
+                - len(owner_controls),
+            )
+            card_text = (
+                card_prefix
+                + _shared_reminder_text(
+                    entry.reminder,
+                    timezone_name,
+                    display_state=display_state,
+                    display_at_utc=occurrence.delivery_at_utc if occurrence is not None else None,
+                    text_budget=text_budget,
+                )
+                + owner_controls
+            )
+            await message.answer(
+                card_text,
+                reply_markup=_shared_entry_markup(entry, occurrence),
+                parse_mode="HTML",
+            )
+            displayed_count += 1
     if page.has_previous or page.has_next:
         navigation: list[str] = []
         if page.has_previous:
