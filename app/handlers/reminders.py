@@ -109,6 +109,11 @@ REMINDER_FORMAT_HINT = (
     "напомни каждый день в 9 выпить витамины\n"
     "напомни важное завтра в 9 позвонить"
 )
+DEADLINE_FORMAT_HINT = (
+    "Создай дедлайн так:\n"
+    "/deadline завтра 18:00 Оплатить счёт | за час, в срок\n\n"
+    "Можно указать точки заранее: за день, за час, в срок."
+)
 
 STALE_FEEDBACK = "Это действие уже неактуально"
 CLARIFICATION_STALE_FEEDBACK = "Это уточнение уже обработано или истекло"
@@ -564,6 +569,15 @@ async def _handle_action_draft(message: Message, user: User) -> bool:
 @router.message(Command("remind"))
 async def cmd_remind(message: Message) -> None:
     await _create_and_answer(message, show_hint=True)
+
+
+@router.message(Command("deadline"))
+async def cmd_deadline(message: Message) -> None:
+    if len((message.text or "").split(maxsplit=1)) == 1:
+        if await require_private_chat(message):
+            await message.answer(DEADLINE_FORMAT_HINT)
+        return
+    await _create_and_answer(message)
 
 
 @router.message(Command("cancel"))
