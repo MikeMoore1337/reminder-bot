@@ -24,6 +24,14 @@ def hex_color(color: Color) -> str:
     return "#" + "".join(f"{channel:02x}" for channel in color)
 
 
+def svg_number(value: float) -> str:
+    """Serialize coordinates without platform-specific float noise."""
+
+    if value == 0:
+        return "0"
+    return format(value, ".6f").rstrip("0").rstrip(".")
+
+
 class Canvas:
     def __init__(self, width: int, height: int, *, scale: int = 2) -> None:
         self.scale = scale
@@ -74,7 +82,9 @@ class Canvas:
         top = self._coordinate(min(y0, y1))
         bottom = self._coordinate(max(y0, y1))
         self.shapes.append(
-            f'<rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" rx="{radius}" fill="{hex_color(color)}"/>'
+            f'<rect x="{svg_number(x0)}" y="{svg_number(y0)}" '
+            f'width="{svg_number(x1 - x0)}" height="{svg_number(y1 - y0)}" '
+            f'rx="{svg_number(radius)}" fill="{hex_color(color)}"/>'
         )
         corner = min(self._coordinate(radius), (right - left) // 2, (bottom - top) // 2)
         for y in range(max(0, top), min(self.height, bottom)):
@@ -93,7 +103,8 @@ class Canvas:
     def circle(self, cx: float, cy: float, radius: float, color: Color) -> None:
         if self._record:
             self.shapes.append(
-                f'<circle cx="{cx}" cy="{cy}" r="{radius}" fill="{hex_color(color)}"/>'
+                f'<circle cx="{svg_number(cx)}" cy="{svg_number(cy)}" '
+                f'r="{svg_number(radius)}" fill="{hex_color(color)}"/>'
             )
         center_x = self._coordinate(cx)
         center_y = self._coordinate(cy)
@@ -109,7 +120,9 @@ class Canvas:
 
     def line(self, x0: float, y0: float, x1: float, y1: float, color: Color, width: float) -> None:
         self.shapes.append(
-            f'<path d="M{x0} {y0}L{x1} {y1}" fill="none" stroke="{hex_color(color)}" stroke-width="{width}" stroke-linecap="round"/>'
+            f'<path d="M{svg_number(x0)} {svg_number(y0)}L{svg_number(x1)} '
+            f'{svg_number(y1)}" fill="none" stroke="{hex_color(color)}" '
+            f'stroke-width="{svg_number(width)}" stroke-linecap="round"/>'
         )
         self._record = False
         start_x, start_y = self._coordinate(x0), self._coordinate(y0)
@@ -171,7 +184,9 @@ class Canvas:
         paths, edges = [], []
         for polygon in outlines[key]:
             points = [(x + p[0], y + p[1]) for p in polygon]
-            paths.append("M" + "L".join(f"{px} {py}" for px, py in points) + "Z")
+            paths.append(
+                "M" + "L".join(f"{svg_number(px)} {svg_number(py)}" for px, py in points) + "Z"
+            )
             scaled = [(self._coordinate(px), self._coordinate(py)) for px, py in points]
             edges.extend(zip(scaled, scaled[1:] + scaled[:1], strict=True))
         self.shapes.append(
