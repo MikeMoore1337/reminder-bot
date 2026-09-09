@@ -890,7 +890,19 @@ async def prepare_delivery_occurrence(
         else:
             occurrence.delivery_at_utc = delivery_at_utc(reminder)
             occurrence.status = OccurrenceState.PROCESSING.value
-            occurrence.action_revision = reminder.action_revision
+            sent_shared_delivery = await session.scalar(
+                select(ReminderDelivery.id)
+                .where(
+                    ReminderDelivery.occurrence_id == occurrence.id,
+                    ReminderDelivery.state == ReminderDeliveryState.SENT.value,
+                )
+                .limit(1)
+            )
+            if sent_shared_delivery is None:
+                occurrence.action_revision = max(
+                    occurrence.action_revision,
+                    reminder.action_revision,
+                )
             occurrence.message_id = None
             occurrence.delivered_at = None
             occurrence.snoozed_until_utc = reminder.snoozed_until_utc
@@ -955,10 +967,11 @@ async def set_last_message_id(
             )
             session.add(occurrence)
         occurrence.status = OccurrenceState.DELIVERED.value
-        occurrence.action_revision = (
+        occurrence.action_revision = max(
+            occurrence.action_revision,
             effective_occurrence_revision
             if effective_occurrence_revision is not None
-            else reminder.action_revision
+            else reminder.action_revision,
         )
         occurrence.message_id = message_id
         occurrence.delivered_at = current_time

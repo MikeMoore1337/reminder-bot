@@ -759,10 +759,11 @@ async def finalize_delivery_success(
             session.add(occurrence)
         else:
             occurrence.status = OccurrenceState.DELIVERED.value
-            occurrence.action_revision = (
+            occurrence.action_revision = max(
+                occurrence.action_revision,
                 effective_occurrence_revision
                 if effective_occurrence_revision is not None
-                else reminder.action_revision
+                else reminder.action_revision,
             )
             occurrence.delivered_at = current_time
             occurrence.snoozed_until_utc = None

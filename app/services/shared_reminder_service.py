@@ -309,6 +309,34 @@ async def _build_shared_reminder_view(
     )
 
 
+def _is_current_delivered_occurrence(
+    reminder: Reminder,
+    occurrence: ReminderOccurrence,
+) -> bool:
+    return (
+        occurrence.status == OccurrenceState.DELIVERED.value
+        and reminder.last_delivery_occurrence_utc is not None
+        and _as_utc(reminder.last_delivery_occurrence_utc) == _as_utc(occurrence.occurrence_at_utc)
+    )
+
+
+async def _load_current_delivered_occurrence(
+    session: AsyncSession,
+    reminder: Reminder,
+) -> ReminderOccurrence | None:
+    if reminder.last_delivery_occurrence_utc is None:
+        return None
+    return await session.scalar(
+        select(ReminderOccurrence)
+        .where(
+            ReminderOccurrence.reminder_id == reminder.id,
+            ReminderOccurrence.occurrence_at_utc == reminder.last_delivery_occurrence_utc,
+            ReminderOccurrence.status == OccurrenceState.DELIVERED.value,
+        )
+        .limit(1)
+    )
+
+
 async def create_invite(
     owner: User,
     reminder_id: int,
@@ -723,15 +751,7 @@ async def get_shared_reminder_card(
             membership_id=_membership.id if _membership is not None else None,
             membership_revision=_membership.revision if _membership is not None else None,
         )
-        occurrence = await session.scalar(
-            select(ReminderOccurrence)
-            .where(
-                ReminderOccurrence.reminder_id == reminder.id,
-                ReminderOccurrence.status == OccurrenceState.DELIVERED.value,
-            )
-            .order_by(ReminderOccurrence.id.desc())
-            .limit(1)
-        )
+        occurrence = await _load_current_delivered_occurrence(session, reminder)
         return SharedReminderCard(entry=entry, occurrence=occurrence)
 
 
@@ -748,16 +768,7 @@ async def get_shared_occurrence(
         )
         if reminder is None:
             return None
-        occurrence = await session.scalar(
-            select(ReminderOccurrence)
-            .where(
-                ReminderOccurrence.reminder_id == reminder.id,
-                ReminderOccurrence.status == OccurrenceState.DELIVERED.value,
-            )
-            .order_by(ReminderOccurrence.id.desc())
-            .limit(1)
-        )
-        return occurrence
+        return await _load_current_delivered_occurrence(session, reminder)
 
 
 async def resolve_shared_occurrence_target(
@@ -776,7 +787,7 @@ async def resolve_shared_occurrence_target(
             occurrence.reminder_id,
             for_update=False,
         )
-        if reminder is None or occurrence.status != OccurrenceState.DELIVERED.value:
+        if reminder is None or not _is_current_delivered_occurrence(reminder, occurrence):
             return None
         return SharedOccurrenceTarget(
             reminder_id=reminder.id,
@@ -827,9 +838,7 @@ async def _load_shared_action_target(
         return None
     if (
         occurrence.action_revision != expected_revision
-        or occurrence.status != OccurrenceState.DELIVERED.value
-        or reminder.last_delivery_occurrence_utc is None
-        or _as_utc(reminder.last_delivery_occurrence_utc) != _as_utc(occurrence.occurrence_at_utc)
+        or not _is_current_delivered_occurrence(reminder, occurrence)
         or reminder.state
         in {
             ReminderState.COMPLETED.value,
@@ -1241,15 +1250,18 @@ async def prepare_shared_delivery_recipients(
         )
         if len(sent_action_revisions) > 1:
             raise SharedReminderError("Несогласованные поколения доставки")
-        shared_action_revision = (
-            sent_action_revisions[0] if sent_action_revisions else occurrence.action_revision
-        )
+        shared_action_revision = occurrence.action_revision
+        if sent_action_revisions:
+            # A semantic edit may have advanced the occurrence generation
+            # after an earlier recipient was sent.  A retry may only advance
+            # this generation, never restore the older SENT-row revision.
+            shared_action_revision = max(shared_action_revision, sent_action_revisions[0])
         # The parent revision identifies the worker claim. Once one recipient
         # has received Telegram controls, the occurrence revision becomes the
         # stable callback generation for every recipient of this occurrence.
         # A retry must not rewrite the generation persisted with an already
         # sent message.
-        occurrence.action_revision = shared_action_revision
+        occurrence.action_revision = max(occurrence.action_revision, shared_action_revision)
         delivery_ids: list[int] = []
         for recipient_user_id, chat_id, _membership_id, membership_revision, _is_owner in specs:
             row = existing.get((recipient_user_id, membership_revision))
@@ -1609,15 +1621,22 @@ async def get_shared_delivery_status(
             if row is None:
                 complete = False
                 continue
+            if row.state == ReminderDeliveryState.SENT.value:
+                if row.action_revision > effective_action_revision:
+                    complete = False
+                    continue
+                # A semantic edit can advance the occurrence generation
+                # without redelivering a recipient that already received the
+                # old message.  The old message remains a successful delivery;
+                # the newer occurrence revision fences its old callbacks.
+                if is_owner:
+                    owner_message_id = row.message_id
+                successful_delivery_count += 1
+                continue
             if row.state == ReminderDeliveryState.FAILED.value and row.error_kind == "terminal":
                 continue
             if row.action_revision != effective_action_revision:
                 complete = False
-                continue
-            if row.state == ReminderDeliveryState.SENT.value and is_owner:
-                owner_message_id = row.message_id
-            if row.state == ReminderDeliveryState.SENT.value:
-                successful_delivery_count += 1
                 continue
             complete = False
         return SharedDeliveryStatus(

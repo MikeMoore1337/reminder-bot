@@ -1030,6 +1030,136 @@ async def test_shared_card_callbacks_bind_membership_generation_and_actor(monkey
 
 
 @pytest.mark.asyncio
+async def test_shared_card_ignores_superseded_occurrence_after_reschedule(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1321, chat_id=2321)
+        participant = await _add_user(session_factory, telegram_user_id=1322, chat_id=2322)
+        reminder_id, occurrence_id, _membership_id, _delivery_id = await _add_delivered_shared(
+            session_factory,
+            owner,
+            participant,
+            now=NOW,
+        )
+
+        old_card = await shared_reminder_service.get_shared_reminder_card(
+            participant,
+            reminder_id,
+        )
+        assert old_card is not None and old_card.occurrence is not None
+        old_markup = shared_handler._entry_markup(old_card.entry, old_card.occurrence)
+        assert old_markup is not None
+        old_done_payload = next(
+            button.callback_data
+            for row in old_markup.inline_keyboard
+            for button in row
+            if (parsed := parse_callback(button.callback_data)) is not None
+            and parsed.action == CallbackAction.DONE
+        )
+
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        new_local_dt = datetime(2026, 9, 10, 9, 30)
+        edited = await reminder_service.edit_reminder(
+            owner,
+            reminder_id,
+            expected_revision=4,
+            local_dt=new_local_dt,
+            expected_occurrence_id=occurrence_id,
+            expected_occurrence_at_utc=NOW,
+            expected_message_id=700,
+        )
+        assert edited is not None
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            old_occurrence = await session.get(ReminderOccurrence, occurrence_id)
+            assert reminder is not None
+            assert old_occurrence is not None
+            assert reminder.state == ReminderState.SCHEDULED.value
+            assert reminder.last_delivery_occurrence_utc is None
+            assert reminder.remind_at_utc.replace(tzinfo=UTC) == datetime(
+                2026,
+                9,
+                10,
+                6,
+                30,
+                tzinfo=UTC,
+            )
+            assert old_occurrence.status == OccurrenceState.DELIVERED.value
+
+        assert (
+            await shared_reminder_service.get_shared_occurrence(
+                participant,
+                reminder_id,
+            )
+            is None
+        )
+        current_card = await shared_reminder_service.get_shared_reminder_card(
+            participant,
+            reminder_id,
+        )
+        assert current_card is not None
+        assert current_card.occurrence is None
+        assert current_card.entry.reminder.state == ReminderState.SCHEDULED.value
+        assert shared_handler._entry_markup(current_card.entry, current_card.occurrence) is None
+        assert (
+            await shared_reminder_service.resolve_shared_occurrence_target(
+                participant,
+                occurrence_id,
+            )
+            is None
+        )
+
+        answers: list[tuple[str, dict[str, object]]] = []
+
+        async def answer(text: str, **kwargs: object) -> None:
+            answers.append((text, kwargs))
+
+        monkeypatch.setattr(
+            shared_handler, "get_or_create_user", AsyncMock(return_value=participant)
+        )
+        await shared_handler.cmd_shared(
+            SimpleNamespace(
+                chat=SimpleNamespace(id=participant.chat_id, type="private"),
+                from_user=SimpleNamespace(id=participant.telegram_user_id),
+                answer=answer,
+            ),
+            SimpleNamespace(args=None),
+        )
+        assert len(answers) == 1
+        card_text, card_kwargs = answers[0]
+        assert "Состояние: запланировано" in card_text
+        assert "Когда: 10.09.2026 09:30" in card_text
+        assert "08.09.2026 18:00" not in card_text
+        assert card_kwargs["reply_markup"] is None
+
+        stale_answers: list[str] = []
+
+        async def answer_stale(_callback: CallbackQuery, text: str, **kwargs: object) -> None:
+            del kwargs
+            stale_answers.append(text)
+
+        monkeypatch.setattr(
+            reminders_handler, "get_or_create_user", AsyncMock(return_value=participant)
+        )
+        monkeypatch.setattr(CallbackQuery, "answer", answer_stale)
+        callback = CallbackQuery.model_construct(
+            id="superseded-shared-callback",
+            from_user=SimpleNamespace(id=participant.telegram_user_id),
+            message=Message.model_construct(
+                message_id=9401,
+                chat=SimpleNamespace(id=participant.chat_id, type="private"),
+            ),
+            data=old_done_payload,
+        )
+        await reminders_handler.reminder_callback(callback)
+        assert stale_answers == [reminders_handler.STALE_FEEDBACK]
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_owner_snooze_resets_shared_recipient_delivery_rows(monkeypatch) -> None:
     engine, connection, session_factory = await _open_sqlite(monkeypatch)
     try:
@@ -1442,6 +1572,220 @@ async def test_shared_worker_retry_preserves_successful_recipient(monkeypatch) -
             expected_revision=first_owner_done.revision,
             expected_message_id=guest_message_id,
         )
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_partial_retry_after_edit_never_rolls_back_generation(
+    monkeypatch,
+) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1503, chat_id=2503)
+        guest = await _add_user(session_factory, telegram_user_id=1504, chat_id=2504)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(guest, invite.token, now_utc=NOW)
+        ).accepted
+
+        clock = [NOW]
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: clock[0])
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: clock[0])
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: clock[0])
+        bot = _FakeBot(fail_chat_id=guest.chat_id)
+
+        assert await worker.process_due_reminders(bot) == 0
+        old_owner_done = next(
+            parsed
+            for row in bot.calls[0]["reply_markup"].inline_keyboard
+            for button in row
+            if (parsed := parse_callback(button.callback_data)) is not None
+            and parsed.action == CallbackAction.DONE
+        )
+        old_revision = old_owner_done.revision
+        occurrence_id = old_owner_done.target_id
+        old_owner_message_id = bot.sent_message_ids[0]
+
+        edited = await reminder_service.edit_reminder(
+            owner,
+            reminder_id,
+            expected_revision=old_revision,
+            text="edited shared reminder",
+            expected_occurrence_id=occurrence_id,
+            expected_occurrence_at_utc=NOW,
+            expected_message_id=old_owner_message_id,
+        )
+        assert edited is not None
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            occurrence = await session.get(ReminderOccurrence, occurrence_id)
+            owner_row = await session.scalar(
+                select(ReminderDelivery).where(
+                    ReminderDelivery.occurrence_id == occurrence_id,
+                    ReminderDelivery.recipient_user_id == owner.id,
+                )
+            )
+            guest_row = await session.scalar(
+                select(ReminderDelivery).where(
+                    ReminderDelivery.occurrence_id == occurrence_id,
+                    ReminderDelivery.recipient_user_id == guest.id,
+                )
+            )
+            assert reminder is not None
+            assert occurrence is not None
+            assert owner_row is not None
+            assert guest_row is not None
+            assert reminder.action_revision == old_revision + 1
+            assert occurrence.action_revision == old_revision + 1
+            assert owner_row.action_revision == old_revision
+            assert guest_row.action_revision == old_revision
+
+        bot.fail_chat_id = None
+        clock[0] = NOW + timedelta(seconds=11)
+        assert await worker.process_due_reminders(bot) == 1
+        assert [call["chat_id"] for call in bot.calls] == [
+            owner.chat_id,
+            guest.chat_id,
+            guest.chat_id,
+        ]
+        assert "edited shared reminder" in bot.calls[-1]["text"]
+        new_guest_done = next(
+            parsed
+            for row in bot.calls[-1]["reply_markup"].inline_keyboard
+            for button in row
+            if (parsed := parse_callback(button.callback_data)) is not None
+            and parsed.action == CallbackAction.DONE
+        )
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            occurrence = await session.get(ReminderOccurrence, occurrence_id)
+            rows = {
+                row.recipient_user_id: row
+                for row in (await session.scalars(select(ReminderDelivery))).all()
+            }
+            assert reminder is not None
+            assert occurrence is not None
+            assert occurrence.action_revision == old_revision + 1
+            assert reminder.action_revision > occurrence.action_revision
+            assert rows[owner.id].state == ReminderDeliveryState.SENT.value
+            assert rows[owner.id].action_revision == old_revision
+            assert rows[guest.id].state == ReminderDeliveryState.SENT.value
+            assert rows[guest.id].action_revision == old_revision + 1
+
+        assert new_guest_done.revision == old_revision + 1
+        assert not await reminder_service.validate_action_target(
+            owner,
+            reminder_id,
+            action=CallbackAction.DONE.value,
+            expected_revision=old_revision,
+            expected_occurrence_id=occurrence_id,
+            expected_message_id=old_owner_message_id,
+        )
+        current_card = await shared_reminder_service.get_shared_reminder_card(guest, reminder_id)
+        assert current_card is not None and current_card.occurrence is not None
+        assert current_card.occurrence.action_revision == old_revision + 1
+        current_markup = shared_handler._entry_markup(
+            current_card.entry,
+            current_card.occurrence,
+        )
+        assert current_markup is not None
+        current_done = next(
+            parsed
+            for row in current_markup.inline_keyboard
+            for button in row
+            if (parsed := parse_callback(button.callback_data)) is not None
+            and parsed.action == CallbackAction.DONE
+        )
+        assert current_done.revision == old_revision + 1
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_multiple_partial_retries_keep_callback_generation(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1505, chat_id=2505)
+        guest = await _add_user(session_factory, telegram_user_id=1506, chat_id=2506)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(guest, invite.token, now_utc=NOW)
+        ).accepted
+
+        clock = [NOW]
+        monkeypatch.setattr(worker, "worker_metrics", worker.WorkerMetrics())
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: clock[0])
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: clock[0])
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: clock[0])
+        bot = _FakeBot(
+            failures={
+                guest.chat_id: [
+                    ConnectionError("temporary participant outage"),
+                    ConnectionError("temporary participant outage"),
+                ]
+            }
+        )
+
+        assert await worker.process_due_reminders(bot) == 0
+        owner_done = next(
+            parsed
+            for row in bot.calls[0]["reply_markup"].inline_keyboard
+            for button in row
+            if (parsed := parse_callback(button.callback_data)) is not None
+            and parsed.action == CallbackAction.DONE
+        )
+        stable_revision = owner_done.revision
+        occurrence_id = owner_done.target_id
+        owner_message_id = bot.sent_message_ids[0]
+
+        clock[0] = NOW + timedelta(seconds=11)
+        assert await worker.process_due_reminders(bot) == 0
+        async with session_factory() as session:
+            occurrence = await session.get(ReminderOccurrence, occurrence_id)
+            assert occurrence is not None
+            assert occurrence.action_revision == stable_revision
+
+        clock[0] = NOW + timedelta(seconds=31)
+        assert await worker.process_due_reminders(bot) == 1
+        assert [call["chat_id"] for call in bot.calls] == [
+            owner.chat_id,
+            guest.chat_id,
+            guest.chat_id,
+            guest.chat_id,
+        ]
+
+        async with session_factory() as session:
+            occurrence = await session.get(ReminderOccurrence, occurrence_id)
+            rows = {
+                row.recipient_user_id: row
+                for row in (await session.scalars(select(ReminderDelivery))).all()
+            }
+            assert occurrence is not None
+            assert occurrence.action_revision == stable_revision
+            assert rows[owner.id].action_revision == stable_revision
+            assert rows[guest.id].action_revision == stable_revision
+            assert rows[owner.id].state == ReminderDeliveryState.SENT.value
+            assert rows[guest.id].state == ReminderDeliveryState.SENT.value
+
+        assert await reminder_service.validate_action_target(
+            owner,
+            reminder_id,
+            action=CallbackAction.DONE.value,
+            expected_revision=stable_revision,
+            expected_occurrence_id=occurrence_id,
+            expected_message_id=owner_message_id,
+        )
+        assert worker.worker_metrics.retried == 2
+        assert worker.worker_metrics.delivered == 1
     finally:
         await connection.close()
         await engine.dispose()
