@@ -30,6 +30,8 @@ from app.utils.datetime_utils import utc_now
 
 MAX_SHARED_PARTICIPANTS = 5
 MAX_PENDING_SHARED_INVITES = 5
+SHARED_PAGE_SIZE = 20
+MAX_SHARED_PAGE_NUMBER = 1_000_000
 SHARED_INVITE_TTL = timedelta(hours=24)
 SHARED_INVITE_RETENTION = timedelta(days=7)
 SHARED_MEMBERSHIP_RETENTION = timedelta(days=30)
@@ -41,6 +43,11 @@ _ACTIVE_REMINDER_STATES = (
     ReminderState.SCHEDULED.value,
     ReminderState.SNOOZED.value,
     ReminderState.DELIVERED.value,
+)
+_TERMINAL_REMINDER_STATES = (
+    ReminderState.COMPLETED.value,
+    ReminderState.CANCELLED.value,
+    ReminderState.FAILED.value,
 )
 
 
@@ -82,6 +89,15 @@ class SharedReminderView:
     participant_count: int
     members: tuple[SharedMemberView, ...] = ()
     pending_invites: tuple[SharedInviteView, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SharedReminderPage:
+    items: tuple[SharedReminderView, ...]
+    page: int
+    page_size: int
+    has_previous: bool
+    has_next: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +348,8 @@ async def accept_invite(
         if invite.state == SharedInviteState.ACCEPTED.value:
             if invite.accepted_by_user_id != user.id:
                 return InviteAcceptance(False, reason="used")
+            if membership is None or membership.state != SharedMembershipState.ACTIVE.value:
+                return InviteAcceptance(False, reason="unavailable")
             return InviteAcceptance(
                 False,
                 already_member=True,
@@ -402,28 +420,10 @@ async def revoke_membership(
         if membership is None:
             return False
 
-        old_revision = membership.revision
-        membership.state = SharedMembershipState.REVOKED.value
-        membership.revoked_at = current_time
-        membership.revision += 1
-        await session.execute(
-            update(ReminderDelivery)
-            .where(
-                ReminderDelivery.reminder_id == membership.reminder_id,
-                ReminderDelivery.recipient_user_id == membership.user_id,
-                ReminderDelivery.membership_revision == old_revision,
-                ReminderDelivery.state.in_(
-                    (
-                        ReminderDeliveryState.PENDING.value,
-                        ReminderDeliveryState.PROCESSING.value,
-                    )
-                ),
-            )
-            .values(
-                state=ReminderDeliveryState.CANCELLED.value,
-                lease_until=None,
-                lease_token=None,
-            )
+        await _revoke_membership_in_session(
+            session,
+            membership,
+            now_utc=current_time,
         )
         return True
 
@@ -461,7 +461,67 @@ async def revoke_invite(
         return True
 
 
-async def list_shared_reminders(user: User) -> list[SharedReminderView]:
+async def _revoke_membership_in_session(
+    session: AsyncSession,
+    membership: SharedReminderMembership,
+    *,
+    now_utc: datetime,
+) -> None:
+    """Revoke one locked membership and fence its unfinished deliveries."""
+
+    old_revision = membership.revision
+    membership.state = SharedMembershipState.REVOKED.value
+    membership.revoked_at = _as_utc(now_utc)
+    membership.revision += 1
+    await session.execute(
+        update(ReminderDelivery)
+        .where(
+            ReminderDelivery.reminder_id == membership.reminder_id,
+            ReminderDelivery.recipient_user_id == membership.user_id,
+            ReminderDelivery.membership_revision == old_revision,
+            ReminderDelivery.state.in_(
+                (
+                    ReminderDeliveryState.PENDING.value,
+                    ReminderDeliveryState.PROCESSING.value,
+                )
+            ),
+        )
+        .values(
+            state=ReminderDeliveryState.CANCELLED.value,
+            lease_until=None,
+            lease_token=None,
+        )
+    )
+
+
+async def expire_terminal_memberships_in_session(
+    session: AsyncSession,
+    reminder_id: int,
+    *,
+    now_utc: datetime,
+) -> int:
+    """Turn active participant memberships into retention-safe tombstones."""
+
+    result = await session.execute(
+        select(SharedReminderMembership)
+        .where(
+            SharedReminderMembership.reminder_id == reminder_id,
+            SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
+        )
+        .with_for_update()
+    )
+    memberships = list(result.scalars())
+    for membership in memberships:
+        await _revoke_membership_in_session(session, membership, now_utc=now_utc)
+    return len(memberships)
+
+
+async def _list_shared_reminders(
+    user: User,
+    *,
+    limit: int,
+    offset: int,
+) -> list[SharedReminderView]:
     async with SessionLocal() as session:
         current_time = _as_utc(utc_now())
         participant_exists = exists(
@@ -499,6 +559,8 @@ async def list_shared_reminders(user: User) -> list[SharedReminderView]:
                 func.coalesce(Reminder.delivery_at_utc, Reminder.remind_at_utc).asc(),
                 Reminder.id.asc(),
             )
+            .limit(limit)
+            .offset(offset)
         )
         reminders = list(result.scalars().all())
         views: list[SharedReminderView] = []
@@ -515,6 +577,7 @@ async def list_shared_reminders(user: User) -> list[SharedReminderView]:
                         SharedReminderMembership.state == SharedMembershipState.ACTIVE.value,
                     )
                     .order_by(SharedReminderMembership.id.asc())
+                    .limit(MAX_SHARED_PARTICIPANTS)
                 )
                 members = tuple(SharedMemberView(int(row[0]), int(row[1])) for row in member_result)
                 invite_result = await session.execute(
@@ -529,6 +592,7 @@ async def list_shared_reminders(user: User) -> list[SharedReminderView]:
                         SharedReminderInvite.expires_at > current_time,
                     )
                     .order_by(SharedReminderInvite.id.asc())
+                    .limit(MAX_PENDING_SHARED_INVITES)
                 )
                 pending_invites = tuple(
                     SharedInviteView(int(row[0]), int(row[1]), row[2]) for row in invite_result
@@ -543,6 +607,47 @@ async def list_shared_reminders(user: User) -> list[SharedReminderView]:
                 )
             )
         return views
+
+
+async def list_shared_reminders(
+    user: User,
+    *,
+    limit: int = SHARED_PAGE_SIZE,
+    offset: int = 0,
+) -> list[SharedReminderView]:
+    """Return a bounded compatibility slice of shared reminders."""
+
+    if limit < 1:
+        return []
+    return await _list_shared_reminders(
+        user,
+        limit=min(limit, SHARED_PAGE_SIZE),
+        offset=max(offset, 0),
+    )
+
+
+async def list_shared_reminders_page(
+    user: User,
+    *,
+    page: int = 1,
+    page_size: int = SHARED_PAGE_SIZE,
+) -> SharedReminderPage:
+    """Load one deterministic, bounded page plus one probe row for navigation."""
+
+    bounded_page = min(max(page, 1), MAX_SHARED_PAGE_NUMBER)
+    bounded_page_size = min(max(page_size, 1), SHARED_PAGE_SIZE)
+    views = await _list_shared_reminders(
+        user,
+        limit=bounded_page_size + 1,
+        offset=(bounded_page - 1) * bounded_page_size,
+    )
+    return SharedReminderPage(
+        items=tuple(views[:bounded_page_size]),
+        page=bounded_page,
+        page_size=bounded_page_size,
+        has_previous=bounded_page > 1,
+        has_next=len(views) > bounded_page_size,
+    )
 
 
 async def get_shared_occurrence(
@@ -722,6 +827,11 @@ async def complete_shared_reminder(
         reminder.attempt_count = 0
         reminder.next_retry_at = None
         reminder.error_text = None
+        await expire_terminal_memberships_in_session(
+            session,
+            reminder.id,
+            now_utc=current_time,
+        )
         await session.execute(
             update(ReminderDelivery)
             .where(
@@ -1304,6 +1414,30 @@ async def cleanup_expired_shared_data(
 ) -> dict[str, int]:
     current_time = _as_utc(now_utc or utc_now())
     async with SessionLocal() as session, session.begin():
+        terminal_reminders = await session.execute(
+            select(Reminder)
+            .where(Reminder.state.in_(_TERMINAL_REMINDER_STATES))
+            .order_by(Reminder.id.asc())
+            .with_for_update()
+        )
+        for reminder in terminal_reminders.scalars():
+            terminal_at = current_time
+            if (
+                reminder.state == ReminderState.COMPLETED.value
+                and reminder.completed_at is not None
+            ):
+                terminal_at = reminder.completed_at
+            elif (
+                reminder.state == ReminderState.CANCELLED.value
+                and reminder.cancelled_at is not None
+            ):
+                terminal_at = reminder.cancelled_at
+            await expire_terminal_memberships_in_session(
+                session,
+                reminder.id,
+                now_utc=terminal_at,
+            )
+
         expired_result = cast(
             CursorResult[Any],
             await session.execute(

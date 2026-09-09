@@ -82,6 +82,16 @@ async def _require_private(message: Message) -> bool:
     return False
 
 
+def _parse_shared_page(command: CommandObject | None) -> int:
+    value = ((command.args if command is not None else None) or "").strip().split(maxsplit=1)
+    if not value:
+        return 1
+    try:
+        return min(max(1, int(value[0])), shared_reminder_service.MAX_SHARED_PAGE_NUMBER)
+    except ValueError:
+        return 1
+
+
 @router.message(Command("share"))
 async def cmd_share(message: Message, command: CommandObject, bot: Bot) -> None:
     if not await _require_private(message):
@@ -127,57 +137,114 @@ def _render_shared_header(entry: shared_reminder_service.SharedReminderView) -> 
     )
 
 
+def _render_owner_controls(
+    entry: shared_reminder_service.SharedReminderView,
+    timezone_name: str,
+) -> str:
+    if not entry.is_owner:
+        return ""
+
+    members = ", ".join(f"#{member.membership_id}" for member in entry.members) or "нет"
+    lines = [f"Участники: <code>{escape(members)}</code>"]
+    if entry.pending_invites:
+        lines.append("Активные ссылки:")
+        lines.extend(
+            f"<code>#{invite.invite_id}</code> до <code>{from_utc_to_user(invite.expires_at, timezone_name).strftime('%d.%m.%Y %H:%M')}</code>"
+            for invite in entry.pending_invites
+        )
+    else:
+        lines.append("Активных ссылок: нет")
+    return "\n" + "\n".join(lines)
+
+
+def _shared_entry_markup(
+    entry: shared_reminder_service.SharedReminderView,
+    occurrence: ReminderOccurrence | None,
+) -> InlineKeyboardMarkup | None:
+    base_markup = _entry_markup(entry, occurrence)
+    rows = list(base_markup.inline_keyboard) if base_markup is not None else []
+    if entry.is_owner:
+        for member in entry.members:
+            rows.extend(
+                revoke_membership_kb(
+                    member.membership_id,
+                    member.revision,
+                    button_text=f"Отозвать доступ #{member.membership_id}",
+                ).inline_keyboard
+            )
+        for invite in entry.pending_invites:
+            rows.extend(
+                revoke_invite_kb(
+                    invite.invite_id,
+                    invite.revision,
+                    button_text=f"Отозвать ссылку #{invite.invite_id}",
+                ).inline_keyboard
+            )
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
 @router.message(Command("shared"))
-async def cmd_shared(message: Message) -> None:
+async def cmd_shared(message: Message, command: CommandObject | None = None) -> None:
     if not await _require_private(message):
         return
     telegram_user_id, chat_id = _ids(message)
     user = await get_or_create_user(telegram_user_id, chat_id)
-    entries = await shared_reminder_service.list_shared_reminders(user)
+    page = await shared_reminder_service.list_shared_reminders_page(
+        user,
+        page=_parse_shared_page(command),
+    )
+    entries = page.items
     if not entries:
-        await message.answer(
-            "🤝 Общих напоминаний пока нет.\n\n"
-            "Владелец может создать ссылку командой <code>/share ID</code>.",
-            parse_mode="HTML",
-        )
+        if page.has_previous:
+            await message.answer(
+                f"🤝 На странице <code>{page.page}</code> общих напоминаний нет. "
+                f"Открой <code>/shared {page.page - 1}</code>.",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                "🤝 Общих напоминаний пока нет.\n\n"
+                "Владелец может создать ссылку командой <code>/share ID</code>.",
+                parse_mode="HTML",
+            )
         return
 
     timezone_name = user.timezone
-    for entry in entries:
+    # One card contains all management controls for that reminder. Together
+    # with one optional navigation message this bounds the Bot API fan-out to
+    # SHARED_PAGE_SIZE + 1 calls per command invocation.
+    for entry in entries[: shared_reminder_service.SHARED_PAGE_SIZE]:
         occurrence = await shared_reminder_service.get_shared_occurrence(
             user,
             entry.reminder.id,
         )
         display_state = OccurrenceState.DELIVERED.value if occurrence is not None else None
-        await message.answer(
+        card_text = (
             f"{_render_shared_header(entry)}\n\n"
             + _shared_reminder_text(
                 entry.reminder,
                 timezone_name,
                 display_state=display_state,
                 display_at_utc=occurrence.delivery_at_utc if occurrence is not None else None,
-            ),
-            reply_markup=_entry_markup(entry, occurrence),
+            )
+            + _render_owner_controls(entry, timezone_name)
+        )
+        await message.answer(
+            card_text,
+            reply_markup=_shared_entry_markup(entry, occurrence),
             parse_mode="HTML",
         )
-        if entry.is_owner:
-            for member in entry.members:
-                await message.answer(
-                    f"Участник <code>#{member.membership_id}</code>",
-                    reply_markup=revoke_membership_kb(
-                        member.membership_id,
-                        member.revision,
-                    ),
-                    parse_mode="HTML",
-                )
-            for invite in entry.pending_invites:
-                expires_local = from_utc_to_user(invite.expires_at, timezone_name)
-                await message.answer(
-                    f"Активная ссылка <code>#{invite.invite_id}</code> до "
-                    f"<code>{expires_local.strftime('%d.%m.%Y %H:%M')}</code>",
-                    reply_markup=revoke_invite_kb(invite.invite_id, invite.revision),
-                    parse_mode="HTML",
-                )
+    if page.has_previous or page.has_next:
+        start = (page.page - 1) * page.page_size + 1
+        end = start + len(entries) - 1
+        navigation: list[str] = []
+        if page.has_previous:
+            navigation.append(f"предыдущая: /shared {page.page - 1}")
+        if page.has_next:
+            navigation.append(f"следующая: /shared {page.page + 1}")
+        await message.answer(
+            f"Показаны {start}–{end} · {'; '.join(navigation)}",
+        )
 
 
 async def _remove_keyboard(callback: CallbackQuery) -> None:

@@ -557,6 +557,11 @@ async def claim_due_reminders(
                 reminder.error_text = "delivery attempt limit exhausted"
                 reminder.last_message_id = None
                 reminder.last_delivery_occurrence_utc = None
+                await shared_reminder_service.expire_terminal_memberships_in_session(
+                    session,
+                    reminder.id,
+                    now_utc=current_time,
+                )
                 _clear_processing_state(reminder)
                 exhausted_count += 1
                 continue
@@ -893,6 +898,11 @@ async def finalize_delivery_failure(
         if terminal:
             reminder.status = "failed"
             reminder.state = ReminderState.FAILED.value
+            await shared_reminder_service.expire_terminal_memberships_in_session(
+                session,
+                reminder.id,
+                now_utc=current_time,
+            )
         else:
             delay = retry_delay_seconds(
                 reminder.retry_count,

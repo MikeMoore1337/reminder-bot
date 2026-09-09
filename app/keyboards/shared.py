@@ -5,12 +5,17 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.callbacks import CallbackAction, CallbackOrigin, CallbackTarget, encode_callback
 
 
-def revoke_membership_kb(membership_id: int, revision: int) -> InlineKeyboardMarkup:
+def revoke_membership_kb(
+    membership_id: int,
+    revision: int,
+    *,
+    button_text: str = "Отозвать доступ",
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Отозвать доступ",
+                    text=button_text,
                     callback_data=encode_callback(
                         CallbackAction.REVOKE,
                         CallbackTarget.MEMBERSHIP,
@@ -24,12 +29,17 @@ def revoke_membership_kb(membership_id: int, revision: int) -> InlineKeyboardMar
     )
 
 
-def revoke_invite_kb(invite_id: int, revision: int) -> InlineKeyboardMarkup:
+def revoke_invite_kb(
+    invite_id: int,
+    revision: int,
+    *,
+    button_text: str = "Отозвать ссылку",
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Отозвать ссылку",
+                    text=button_text,
                     callback_data=encode_callback(
                         CallbackAction.REVOKE,
                         CallbackTarget.INVITE,

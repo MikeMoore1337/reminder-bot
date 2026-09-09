@@ -33,6 +33,7 @@ from app.db.models import (
     VoiceReminderDraft,
 )
 from app.db.session import SessionLocal
+from app.services import shared_reminder_service
 from app.services.adaptive_service import record_snooze_event_in_session
 from app.services.message_context import (
     MessageContextSnapshot,
@@ -1350,6 +1351,11 @@ async def cancel_reminder(
         reminder.state = ReminderState.CANCELLED.value
         reminder.cancelled_at = now_utc
         reminder.action_revision += 1
+        await shared_reminder_service.expire_terminal_memberships_in_session(
+            session,
+            reminder.id,
+            now_utc=now_utc,
+        )
         if occurrence is not None:
             occurrence.status = OccurrenceState.CANCELLED.value
             occurrence.cancelled_at = now_utc
@@ -1760,6 +1766,11 @@ async def complete_reminder(
                     "done", reminder_id=reminder_id, revision=expected_revision, reason="state"
                 )
                 return False
+            await shared_reminder_service.expire_terminal_memberships_in_session(
+                session,
+                reminder.id,
+                now_utc=now_utc,
+            )
             _record_action("completed", action="done", reminder_id=reminder.id)
             _record_action("action_success", action="done", reminder_id=reminder.id)
             return True
@@ -1880,6 +1891,12 @@ async def complete_reminder(
                         _clear_delivery_identity(parent)
 
         await _cancel_shared_delivery_rows(session, occurrence.id)
+        if reminder.state == ReminderState.COMPLETED.value:
+            await shared_reminder_service.expire_terminal_memberships_in_session(
+                session,
+                reminder.id,
+                now_utc=now_utc,
+            )
         _record_action("completed", action="done", reminder_id=reminder.id)
         _record_action("action_success", action="done", reminder_id=reminder.id)
         return True

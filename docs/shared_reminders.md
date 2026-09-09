@@ -58,9 +58,14 @@ Telegram forwarded/reply/media context владельца не включает�
 
 `shared_reminder_memberships`, приглашения и per-recipient delivery metadata
 удаляются по bounded retention policy worker-а: истёкшие invite metadata — через
-7 дней, отозванные memberships — через 30 дней, delivery rows terminal
-occurrence — через 30 дней. Личные reminders и их ownership migration не
-изменяются; существующие строки после миграции остаются private.
+7 дней, memberships автоматически переводятся в revoked при terminal reminder
+и затем удерживаются 30 дней, delivery rows terminal occurrence — через 30 дней.
+Личные reminders и их ownership migration не изменяются; существующие строки
+после миграции остаются private.
+
+`/shared` выдаёт по 20 reminders за вызов. Если результатов больше, используй
+`/shared 2`, `/shared 3` и так далее; owner controls участников и pending links
+остаются на карточке соответствующего reminder.
 
 Production secrets, Telegram/BotFather права, `DEPLOY_ENABLED`, migrations и
 production DB writes этим Issue не включаются. Для применения миграции и первой

@@ -28,6 +28,7 @@ from app.db.models import (
     SharedReminderMembership,
     User,
 )
+from app.handlers import shared as shared_handler
 from app.handlers import ui
 from app.services import reminder_service, shared_reminder_service, timezone_service
 from app.services.message_context import MessageContextSnapshot
@@ -236,6 +237,8 @@ async def test_shared_invites_are_scoped_hashed_expiring_and_revocable(monkeypat
         )
         old_token = await shared_reminder_service.accept_invite(guest, invite.token, now_utc=NOW)
         assert old_token.accepted is False
+        assert old_token.already_member is False
+        assert old_token.reason == "unavailable"
         async with session_factory() as session:
             membership = await session.get(SharedReminderMembership, membership_id)
             assert membership is not None
@@ -385,6 +388,128 @@ async def test_shared_participant_and_pending_invite_limits_are_bounded(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_shared_listing_pages_are_bounded_and_deterministic(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1161, chat_id=2161)
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: NOW)
+        reminder_ids: list[int] = []
+        for index in range(shared_reminder_service.SHARED_PAGE_SIZE + 2):
+            reminder_id = await _add_reminder(
+                session_factory,
+                owner,
+                now=NOW + timedelta(minutes=index),
+            )
+            await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+            reminder_ids.append(reminder_id)
+
+        first = await shared_reminder_service.list_shared_reminders_page(owner, page=1)
+        second = await shared_reminder_service.list_shared_reminders_page(owner, page=2)
+
+        assert [entry.reminder.id for entry in first.items] == reminder_ids[:20]
+        assert len(first.items) == shared_reminder_service.SHARED_PAGE_SIZE
+        assert first.has_previous is False
+        assert first.has_next is True
+        assert [entry.reminder.id for entry in second.items] == reminder_ids[20:]
+        assert second.has_previous is True
+        assert second.has_next is False
+        assert all(len(entry.pending_invites) == 1 for entry in first.items)
+        assert len(await shared_reminder_service.list_shared_reminders(owner, limit=10_000)) == 20
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_command_keeps_owner_controls_within_bounded_fanout(monkeypatch) -> None:
+    members = tuple(
+        shared_reminder_service.SharedMemberView(membership_id=100 + index, revision=1)
+        for index in range(shared_reminder_service.MAX_SHARED_PARTICIPANTS)
+    )
+    invites = tuple(
+        shared_reminder_service.SharedInviteView(
+            invite_id=200 + index,
+            revision=1,
+            expires_at=NOW + timedelta(hours=1),
+        )
+        for index in range(shared_reminder_service.MAX_PENDING_SHARED_INVITES)
+    )
+    entries = tuple(
+        shared_reminder_service.SharedReminderView(
+            reminder=Reminder(
+                id=5000 + index,
+                user_id=1,
+                chat_id=2,
+                text=f"shared {index}",
+                remind_at_utc=NOW,
+                delivery_at_utc=NOW,
+                schedule_timezone="Europe/Moscow",
+                status="pending",
+                state=ReminderState.SCHEDULED.value,
+                recurrence_type=RecurrenceType.NONE.value,
+                mode="normal",
+                kind=ReminderKind.ORDINARY.value,
+                action_revision=0,
+                deadline_plan_state=None,
+            ),
+            is_owner=True,
+            participant_count=shared_reminder_service.MAX_SHARED_PARTICIPANTS,
+            members=members,
+            pending_invites=invites,
+        )
+        for index in range(shared_reminder_service.SHARED_PAGE_SIZE)
+    )
+    page = shared_reminder_service.SharedReminderPage(
+        items=entries,
+        page=1,
+        page_size=shared_reminder_service.SHARED_PAGE_SIZE,
+        has_previous=False,
+        has_next=True,
+    )
+    answers: list[tuple[str, dict[str, object]]] = []
+
+    async def answer(text: str, **kwargs: object) -> None:
+        answers.append((text, kwargs))
+
+    async def fake_occurrence(*args, **kwargs):
+        return None
+
+    async def fake_user(*args, **kwargs):
+        return SimpleNamespace(id=1, chat_id=2, timezone="Europe/Moscow")
+
+    async def fake_page(*args, **kwargs):
+        return page
+
+    monkeypatch.setattr(shared_handler, "get_or_create_user", fake_user)
+    monkeypatch.setattr(
+        shared_handler.shared_reminder_service, "get_shared_occurrence", fake_occurrence
+    )
+    monkeypatch.setattr(
+        shared_handler.shared_reminder_service, "list_shared_reminders_page", fake_page
+    )
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=2, type="private"),
+        from_user=SimpleNamespace(id=1),
+        answer=answer,
+    )
+
+    await shared_handler.cmd_shared(message, SimpleNamespace(args=None))
+
+    assert len(answers) == shared_reminder_service.SHARED_PAGE_SIZE + 1
+    assert "Участники:" in answers[0][0]
+    assert "#100" in answers[0][0]
+    markup = answers[0][1]["reply_markup"]
+    parsed_callbacks = [
+        parsed
+        for row in markup.inline_keyboard
+        for button in row
+        if (parsed := parse_callback(button.callback_data)) is not None
+    ]
+    assert any(parsed.target == CallbackTarget.MEMBERSHIP for parsed in parsed_callbacks)
+    assert any(parsed.target == CallbackTarget.INVITE for parsed in parsed_callbacks)
+
+
+@pytest.mark.asyncio
 async def test_participant_actions_require_revision_message_and_are_idempotent(monkeypatch) -> None:
     engine, connection, session_factory = await _open_sqlite(monkeypatch)
     try:
@@ -429,7 +554,69 @@ async def test_participant_actions_require_revision_message_and_are_idempotent(m
             membership = await session.get(SharedReminderMembership, membership_id)
             assert reminder is not None and reminder.state == ReminderState.COMPLETED.value
             assert occurrence is not None and occurrence.status == OccurrenceState.COMPLETED.value
-            assert membership is not None and membership.state == SharedMembershipState.ACTIVE.value
+            assert membership is not None
+            assert membership.state == SharedMembershipState.REVOKED.value
+            assert membership.revision == 2
+            assert membership.revoked_at.replace(tzinfo=UTC) == NOW
+
+        assert not await shared_reminder_service.validate_shared_action_target(
+            participant,
+            reminder_id,
+            occurrence_id,
+            expected_revision=4,
+            expected_message_id=777,
+        )
+        with pytest.raises(shared_reminder_service.SharedReminderError):
+            await shared_reminder_service.create_invite(
+                owner,
+                reminder_id,
+                now_utc=NOW + timedelta(days=31),
+            )
+        retained = await shared_reminder_service.cleanup_expired_shared_data(
+            now_utc=NOW + timedelta(days=29)
+        )
+        assert retained["deleted_memberships"] == 0
+        async with session_factory() as session:
+            assert await session.get(SharedReminderMembership, membership_id) is not None
+        first_expiry = await shared_reminder_service.cleanup_expired_shared_data(
+            now_utc=NOW + timedelta(days=31)
+        )
+        assert first_expiry["deleted_memberships"] == 0
+        second_expiry = await shared_reminder_service.cleanup_expired_shared_data(
+            now_utc=NOW + timedelta(days=31)
+        )
+        assert second_expiry["deleted_memberships"] == 1
+        async with session_factory() as session:
+            assert await session.get(SharedReminderMembership, membership_id) is None
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_owner_completion_expires_shared_memberships(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        owner = await _add_user(session_factory, telegram_user_id=1211, chat_id=2211)
+        participant = await _add_user(session_factory, telegram_user_id=1212, chat_id=2212)
+        reminder_id, occurrence_id, membership_id, _delivery_id = await _add_delivered_shared(
+            session_factory, owner, participant, now=NOW
+        )
+
+        assert await reminder_service.complete_reminder(
+            owner,
+            reminder_id,
+            expected_revision=4,
+            expected_occurrence_id=occurrence_id,
+            expected_message_id=700,
+        )
+        async with session_factory() as session:
+            membership = await session.get(SharedReminderMembership, membership_id)
+            assert membership is not None
+            assert membership.state == SharedMembershipState.REVOKED.value
+            assert membership.revision == 2
+            assert membership.revoked_at.replace(tzinfo=UTC) == NOW
     finally:
         await connection.close()
         await engine.dispose()
@@ -676,6 +863,11 @@ async def test_shared_worker_all_terminal_failures_finalize_as_failed(monkeypatc
             assert len(rows) == 2
             assert all(row.state == ReminderDeliveryState.FAILED.value for row in rows)
             assert all(row.error_kind == "terminal" for row in rows)
+            memberships = list((await session.scalars(select(SharedReminderMembership))).all())
+            assert len(memberships) == 1
+            assert memberships[0].state == SharedMembershipState.REVOKED.value
+            assert memberships[0].revision == 2
+            assert memberships[0].revoked_at.replace(tzinfo=UTC) == NOW
     finally:
         await connection.close()
         await engine.dispose()
@@ -723,6 +915,16 @@ async def test_shared_worker_fences_cancelled_reminder_after_claim_before_send(m
                 )
             )
             assert reminder is not None and reminder.state == ReminderState.CANCELLED.value
+            membership = await session.scalar(
+                select(SharedReminderMembership).where(
+                    SharedReminderMembership.reminder_id == reminder_id,
+                    SharedReminderMembership.user_id == participant.id,
+                )
+            )
+            assert membership is not None
+            assert membership.state == SharedMembershipState.REVOKED.value
+            assert membership.revision == 2
+            assert membership.revoked_at.replace(tzinfo=UTC) == NOW
             assert owner_row is not None
             assert owner_row.state == ReminderDeliveryState.CANCELLED.value
             assert owner_row.lease_token is None
