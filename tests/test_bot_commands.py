@@ -21,6 +21,7 @@ from app.telegram_metadata import (
     HELP_TEXT,
     METADATA_LANGUAGE_CODES,
     PUBLIC_COMMAND_DEFINITIONS,
+    START_TEXT,
 )
 
 
@@ -175,3 +176,19 @@ def test_help_mentions_every_public_command_and_hides_admin_only_commands() -> N
         assert f"/{definition.command}" in HELP_TEXT
     assert "/stats" not in HELP_TEXT
     assert "/failed" not in HELP_TEXT
+
+
+def test_public_copy_distinguishes_immediate_text_save_from_confirmed_flows() -> None:
+    assert "сразу сохранит" in BOT_METADATA.description
+    assert "сразу сохраню" in START_TEXT
+    assert "сохранённый результат" in HELP_TEXT
+    assert "время неоднознач" in START_TEXT
+    assert "время неоднознач" in HELP_TEXT
+    assert "расшифровку и предпросмотр перед «Создать»" in START_TEXT
+    assert "предпросмотр плана и явное подтверждение" in START_TEXT
+    assert "расшифровку и предпросмотр" in BOT_METADATA.description
+    assert "расшифровку и предпросмотр" in HELP_TEXT
+    assert "предпросмотр плана и явное подтверждение" in BOT_METADATA.description
+    assert "предпросмотр плана и явное подтверждение" in HELP_TEXT
+    assert "покажет результат перед созданием" not in BOT_METADATA.description
+    assert "попросит подтвердить создание" not in HELP_TEXT
