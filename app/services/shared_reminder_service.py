@@ -326,15 +326,19 @@ async def _load_current_delivered_occurrence(
 ) -> ReminderOccurrence | None:
     if reminder.last_delivery_occurrence_utc is None:
         return None
-    return await session.scalar(
-        select(ReminderOccurrence)
-        .where(
-            ReminderOccurrence.reminder_id == reminder.id,
-            ReminderOccurrence.occurrence_at_utc == reminder.last_delivery_occurrence_utc,
-            ReminderOccurrence.status == OccurrenceState.DELIVERED.value,
-        )
-        .limit(1)
+    occurrence = cast(
+        ReminderOccurrence | None,
+        await session.scalar(
+            select(ReminderOccurrence)
+            .where(
+                ReminderOccurrence.reminder_id == reminder.id,
+                ReminderOccurrence.occurrence_at_utc == reminder.last_delivery_occurrence_utc,
+                ReminderOccurrence.status == OccurrenceState.DELIVERED.value,
+            )
+            .limit(1)
+        ),
     )
+    return occurrence
 
 
 async def create_invite(
