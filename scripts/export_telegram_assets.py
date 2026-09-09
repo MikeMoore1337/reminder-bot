@@ -198,7 +198,7 @@ class Canvas:
 
 def logo(c: Canvas, x: float, y: float, size: float, color: Color) -> None:
     r = size * 0.32
-    for degree in range(100, 321, 2):
+    for degree in range(0, 360, 2):
         a, b = math.radians(degree), math.radians(degree + 2)
         c.line(
             x + r * math.cos(a),
@@ -208,17 +208,16 @@ def logo(c: Canvas, x: float, y: float, size: float, color: Color) -> None:
             color,
             size * 0.062,
         )
-    c.line(x, y - size * 0.18, x, y, color, size * 0.062)
-    c.line(x, y, x + size * 0.10, y + size * 0.055, color, size * 0.062)
-    c.line(x + size * 0.10, y + size * 0.22, x + size * 0.20, y + size * 0.32, color, size * 0.07)
-    c.line(x + size * 0.20, y + size * 0.32, x + size * 0.40, y + size * 0.10, color, size * 0.07)
+    c.line(x - size * 0.12, y - size * 0.12, x, y, color, size * 0.062)
+    c.line(x, y, x + size * 0.16, y - size * 0.16, color, size * 0.062)
+    c.circle(x, y - size * 0.235, size * 0.026, (164, 224, 255))
 
 
 def render_welcome() -> Canvas:
     c = Canvas(1600, 900, scale=2)
     c.fill(PAPER)
     c.rounded_rectangle(72, 64, 152, 144, 24, BLUE)
-    logo(c, 110, 102, 80, WHITE)
+    logo(c, 112, 104, 80, WHITE)
     c.text("brand", 174, 84, INK)
     c.text("headline1", 72, 214, INK)
     c.text("headline2", 72, 322, BLUE)
@@ -247,7 +246,7 @@ def render_welcome() -> Canvas:
 def render_avatar() -> Canvas:
     c = Canvas(1024, 1024, scale=2)
     c.fill(BLUE)
-    logo(c, 478, 478, 900, WHITE)
+    logo(c, 512, 512, 900, WHITE)
     return c
 
 
