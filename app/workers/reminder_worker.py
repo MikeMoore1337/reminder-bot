@@ -1071,6 +1071,7 @@ def _delivery_text(
     reminder: Reminder,
     context: MessageContextSnapshot | None,
     *,
+    include_context: bool = True,
     media_unavailable: bool = False,
 ) -> str:
     if reminder.kind == ReminderKind.DEADLINE.value:
@@ -1120,7 +1121,9 @@ def _delivery_text(
         prefix = f"🔔 Важное напоминание\n\n{persistence_hint}\n\n"
     else:
         prefix = "⏰ Напоминание\n\n"
-    if context is not None:
+    if not include_context:
+        context_text = ""
+    elif context is not None:
         context_text = format_context_for_delivery(
             context,
             media_unavailable=media_unavailable,
@@ -1173,11 +1176,13 @@ async def _send_delivery(
     *,
     reply_markup: InlineKeyboardMarkup,
     chat_id: int | None = None,
+    include_context: bool = True,
 ) -> Any:
     destination_chat_id = reminder.chat_id if chat_id is None else chat_id
-    delivery_text = _delivery_text(reminder, context)
+    delivery_text = _delivery_text(reminder, context, include_context=include_context)
     if (
-        context is not None
+        include_context
+        and context is not None
         and context.media_file_id
         and context.media_kind in {"photo", "document"}
         and len(delivery_text) <= 1024
@@ -1207,6 +1212,7 @@ async def _send_delivery(
                 delivery_text = _delivery_text(
                     reminder,
                     context,
+                    include_context=include_context,
                     media_unavailable=True,
                 )
     return await bot.send_message(
@@ -1309,6 +1315,7 @@ async def _process_shared_delivery(
                     reminder,
                     context,
                     chat_id=target.chat_id,
+                    include_context=target.is_owner,
                     reply_markup=reminder_actions_kb(
                         reminder.id,
                         occurrence_id=occurrence_id,

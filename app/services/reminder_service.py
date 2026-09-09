@@ -1196,7 +1196,7 @@ async def _reset_shared_delivery_rows(session: Any, occurrence_id: int) -> None:
 
 
 async def _cancel_shared_delivery_rows(session: Any, occurrence_id: int) -> None:
-    """Fence pending shared recipients when an owner completes an occurrence."""
+    """Fence non-terminal shared recipients when an occurrence terminates."""
 
     await session.execute(
         update(ReminderDelivery)
@@ -1349,6 +1349,18 @@ async def cancel_reminder(
             if occurrence.status != OccurrenceState.DELIVERED.value:
                 occurrence = None
 
+        if occurrence is None and reminder.status == "processing":
+            occurrence = await session.scalar(
+                select(ReminderOccurrence)
+                .where(
+                    ReminderOccurrence.reminder_id == reminder.id,
+                    ReminderOccurrence.status == OccurrenceState.PROCESSING.value,
+                )
+                .order_by(ReminderOccurrence.id.desc())
+                .limit(1)
+                .with_for_update()
+            )
+
         if reminder.state in {
             ReminderState.COMPLETED.value,
             ReminderState.CANCELLED.value,
@@ -1373,12 +1385,15 @@ async def cancel_reminder(
             occurrence.status = OccurrenceState.CANCELLED.value
             occurrence.cancelled_at = now_utc
             occurrence.action_revision += 1
+            await _cancel_shared_delivery_rows(session, occurrence.id)
 
-        if reminder.status != "processing":
-            reminder.status = "sent"
-            reminder.delivery_at_utc = None
-            reminder.snoozed_until_utc = None
-            _reset_delivery_retry(reminder)
+        reminder.status = "sent"
+        reminder.delivery_at_utc = None
+        reminder.snoozed_until_utc = None
+        _reset_delivery_retry(reminder)
+        reminder.processing_started_at = None
+        reminder.lease_until = None
+        reminder.lease_token = None
 
         if reminder.parent_reminder_id is None:
             await _cancel_children(session, reminder.id, now_utc)

@@ -1856,6 +1856,12 @@ async def cleanup_expired_shared_data(
             ),
         )
         delivery_cutoff = current_time - SHARED_DELIVERY_RETENTION
+        terminal_parent = exists(
+            select(Reminder.id).where(
+                Reminder.id == ReminderOccurrence.reminder_id,
+                Reminder.state.in_(_TERMINAL_REMINDER_STATES),
+            )
+        )
         deleted_deliveries = cast(
             CursorResult[Any],
             await session.execute(
@@ -1863,12 +1869,15 @@ async def cleanup_expired_shared_data(
                     ReminderDelivery.created_at <= delivery_cutoff,
                     ReminderDelivery.occurrence_id.in_(
                         select(ReminderOccurrence.id).where(
-                            ReminderOccurrence.status.in_(
-                                (
-                                    OccurrenceState.COMPLETED.value,
-                                    OccurrenceState.CANCELLED.value,
-                                    OccurrenceState.FAILED.value,
-                                )
+                            or_(
+                                ReminderOccurrence.status.in_(
+                                    (
+                                        OccurrenceState.COMPLETED.value,
+                                        OccurrenceState.CANCELLED.value,
+                                        OccurrenceState.FAILED.value,
+                                    )
+                                ),
+                                terminal_parent,
                             )
                         )
                     ),

@@ -1293,7 +1293,10 @@ async def test_shared_worker_fanout_is_bounded_private_and_idempotent(monkeypatc
         owner_call = next(call for call in bot.calls if call["chat_id"] == owner.chat_id)
         participant_calls = [call for call in bot.calls if call["chat_id"] != owner.chat_id]
         assert "OWNER SECRET CONTEXT" in owner_call["text"]
+        assert "📎 Контекст" in owner_call["text"]
         assert all("OWNER SECRET CONTEXT" not in call["text"] for call in participant_calls)
+        assert all("📎 Контекст" not in call["text"] for call in participant_calls)
+        assert all("пересланное сообщение" not in call["text"] for call in participant_calls)
         assert _callback_actions(owner_call) >= {
             CallbackAction.DONE,
             CallbackAction.SNOOZE,
@@ -1315,6 +1318,47 @@ async def test_shared_worker_fanout_is_bounded_private_and_idempotent(monkeypatc
 
         assert await worker.process_due_reminders(bot) == 0
         assert len(bot.calls) == 3
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_suppresses_unavailable_context_for_participants(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1411, chat_id=2411)
+        participant = await _add_user(session_factory, telegram_user_id=1412, chat_id=2412)
+        reminder_id = await _add_reminder(
+            session_factory,
+            owner,
+            now=NOW,
+            text="reminder without shared context metadata",
+            context_kind="forwarded",
+        )
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(participant, invite.token, now_utc=NOW)
+        ).accepted
+
+        monkeypatch.setattr(worker, "get_context_for_delivery", AsyncMock(return_value=None))
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: NOW)
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: NOW)
+        bot = _FakeBot()
+
+        assert await worker.process_due_reminders(bot) == 1
+        owner_call = next(call for call in bot.calls if call["chat_id"] == owner.chat_id)
+        participant_call = next(
+            call for call in bot.calls if call["chat_id"] == participant.chat_id
+        )
+        assert "reminder without shared context metadata" in participant_call["text"]
+        assert "📎 Контекст" in owner_call["text"]
+        assert "истекло или недоступно" in owner_call["text"]
+        assert "📎 Контекст" not in participant_call["text"]
+        assert "пересланное сообщение" not in participant_call["text"]
+        assert "истекло или недоступно" not in participant_call["text"]
     finally:
         await connection.close()
         await engine.dispose()
@@ -1430,6 +1474,150 @@ async def test_shared_worker_fences_cancelled_reminder_after_claim_before_send(m
             assert owner_row.state == ReminderDeliveryState.CANCELLED.value
             assert owner_row.lease_token is None
             assert owner_row.lease_until is None
+            participant_rows = list(
+                (
+                    await session.scalars(
+                        select(ReminderDelivery).where(
+                            ReminderDelivery.reminder_id == reminder_id,
+                            ReminderDelivery.recipient_user_id == participant.id,
+                        )
+                    )
+                ).all()
+            )
+            assert len(participant_rows) == 1
+            assert participant_rows[0].state == ReminderDeliveryState.CANCELLED.value
+            assert participant_rows[0].lease_token is None
+            assert participant_rows[0].lease_until is None
+            occurrence = await session.scalar(
+                select(ReminderOccurrence).where(ReminderOccurrence.reminder_id == reminder_id)
+            )
+            assert occurrence is not None
+            assert occurrence.status == OccurrenceState.CANCELLED.value
+            assert reminder.status == "sent"
+            assert reminder.processing_started_at is None
+            assert reminder.lease_until is None
+            assert reminder.lease_token is None
+
+        assert not await reminder_service.cancel_reminder(owner, reminder_id)
+        assert await worker.claim_due_reminders(10, now_utc=NOW) == []
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_shared_processing_occurrence_preserves_sent_and_fences_remaining_rows(
+    monkeypatch,
+) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1441, chat_id=2441)
+        participant = await _add_user(session_factory, telegram_user_id=1442, chat_id=2442)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(participant, invite.token, now_utc=NOW)
+        ).accepted
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            membership = await session.scalar(
+                select(SharedReminderMembership).where(
+                    SharedReminderMembership.reminder_id == reminder_id,
+                    SharedReminderMembership.user_id == participant.id,
+                )
+            )
+            assert reminder is not None and membership is not None
+            reminder.status = "processing"
+            reminder.processing_started_at = NOW
+            reminder.lease_until = NOW + timedelta(seconds=60)
+            reminder.lease_token = "cancel-processing-parent"
+            reminder.next_retry_at = NOW + timedelta(seconds=10)
+            reminder.attempt_count = 1
+            occurrence = ReminderOccurrence(
+                reminder_id=reminder_id,
+                occurrence_at_utc=NOW,
+                delivery_at_utc=NOW,
+                status=OccurrenceState.PROCESSING.value,
+                action_revision=reminder.action_revision,
+            )
+            session.add(occurrence)
+            await session.flush()
+            session.add_all(
+                [
+                    ReminderDelivery(
+                        reminder_id=reminder_id,
+                        occurrence_id=occurrence.id,
+                        recipient_user_id=owner.id,
+                        membership_revision=0,
+                        action_revision=reminder.action_revision,
+                        chat_id=owner.chat_id,
+                        state=ReminderDeliveryState.SENT.value,
+                        message_id=9901,
+                        sent_at=NOW,
+                    ),
+                    ReminderDelivery(
+                        reminder_id=reminder_id,
+                        occurrence_id=occurrence.id,
+                        recipient_user_id=participant.id,
+                        membership_revision=membership.revision,
+                        action_revision=reminder.action_revision,
+                        chat_id=participant.chat_id,
+                        state=ReminderDeliveryState.PROCESSING.value,
+                        attempt_count=1,
+                        lease_until=NOW + timedelta(seconds=60),
+                        lease_token="cancel-processing-recipient",
+                    ),
+                ]
+            )
+            await session.commit()
+            occurrence_id = occurrence.id
+
+        monkeypatch.setattr(worker, "settings", _settings())
+        monkeypatch.setattr(worker, "utc_now", lambda: NOW)
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        monkeypatch.setattr(shared_reminder_service, "utc_now", lambda: NOW)
+
+        assert await reminder_service.cancel_reminder(owner, reminder_id)
+        assert not await reminder_service.cancel_reminder(owner, reminder_id)
+        assert await worker.claim_due_reminders(10, now_utc=NOW) == []
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            occurrence = await session.get(ReminderOccurrence, occurrence_id)
+            rows = {
+                row.recipient_user_id: row
+                for row in (
+                    await session.scalars(
+                        select(ReminderDelivery).where(
+                            ReminderDelivery.occurrence_id == occurrence_id
+                        )
+                    )
+                ).all()
+            }
+            membership = await session.scalar(
+                select(SharedReminderMembership).where(
+                    SharedReminderMembership.reminder_id == reminder_id,
+                    SharedReminderMembership.user_id == participant.id,
+                )
+            )
+            assert reminder is not None
+            assert reminder.state == ReminderState.CANCELLED.value
+            assert reminder.status == "sent"
+            assert reminder.delivery_at_utc is None
+            assert reminder.next_retry_at is None
+            assert reminder.processing_started_at is None
+            assert reminder.lease_until is None
+            assert reminder.lease_token is None
+            assert occurrence is not None
+            assert occurrence.status == OccurrenceState.CANCELLED.value
+            assert rows[owner.id].state == ReminderDeliveryState.SENT.value
+            assert rows[owner.id].message_id == 9901
+            assert rows[participant.id].state == ReminderDeliveryState.CANCELLED.value
+            assert rows[participant.id].lease_until is None
+            assert rows[participant.id].lease_token is None
+            assert membership is not None
+            assert membership.state == SharedMembershipState.REVOKED.value
     finally:
         await connection.close()
         await engine.dispose()
@@ -2696,6 +2884,171 @@ async def test_shared_cleanup_removes_failed_occurrence_deliveries_then_tombston
         assert second["deleted_memberships"] == 1
         async with session_factory() as session:
             assert await session.get(SharedReminderMembership, membership_id) is None
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_cleanup_removes_cancelled_delivery_then_tombstone(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1665, chat_id=2665)
+        participant = await _add_user(session_factory, telegram_user_id=1666, chat_id=2666)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(participant, invite.token, now_utc=NOW)
+        ).accepted
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            membership = await session.scalar(
+                select(SharedReminderMembership).where(
+                    SharedReminderMembership.reminder_id == reminder_id,
+                    SharedReminderMembership.user_id == participant.id,
+                )
+            )
+            assert reminder is not None and membership is not None
+            reminder.status = "processing"
+            reminder.lease_token = "retention-parent"
+            occurrence = ReminderOccurrence(
+                reminder_id=reminder_id,
+                occurrence_at_utc=NOW,
+                delivery_at_utc=NOW,
+                status=OccurrenceState.PROCESSING.value,
+                action_revision=reminder.action_revision,
+            )
+            session.add(occurrence)
+            await session.flush()
+            delivery = ReminderDelivery(
+                reminder_id=reminder_id,
+                occurrence_id=occurrence.id,
+                recipient_user_id=participant.id,
+                membership_revision=membership.revision,
+                action_revision=reminder.action_revision,
+                chat_id=participant.chat_id,
+                state=ReminderDeliveryState.PROCESSING.value,
+                lease_until=NOW + timedelta(seconds=60),
+                lease_token="retention-recipient",
+            )
+            session.add(delivery)
+            await session.commit()
+            occurrence_id = occurrence.id
+            delivery_id = delivery.id
+
+        monkeypatch.setattr(reminder_service, "utc_now", lambda: NOW)
+        assert await reminder_service.cancel_reminder(owner, reminder_id)
+
+        retention_time = NOW + timedelta(days=31)
+        async with session_factory() as session:
+            await session.execute(
+                update(SharedReminderMembership)
+                .where(
+                    SharedReminderMembership.reminder_id == reminder_id,
+                    SharedReminderMembership.user_id == participant.id,
+                )
+                .values(revoked_at=NOW - timedelta(days=31))
+            )
+            await session.execute(
+                update(ReminderDelivery)
+                .where(ReminderDelivery.occurrence_id == occurrence_id)
+                .values(created_at=NOW - timedelta(days=31))
+            )
+            await session.commit()
+
+        first = await shared_reminder_service.cleanup_expired_shared_data(now_utc=retention_time)
+        assert first["deleted_deliveries"] == 1
+        assert first["deleted_memberships"] == 0
+        async with session_factory() as session:
+            assert await session.get(ReminderDelivery, delivery_id) is None
+            assert await session.get(ReminderOccurrence, occurrence_id) is not None
+
+        second = await shared_reminder_service.cleanup_expired_shared_data(now_utc=retention_time)
+        assert second["deleted_memberships"] == 1
+        async with session_factory() as session:
+            assert (
+                await session.scalar(
+                    select(SharedReminderMembership).where(
+                        SharedReminderMembership.reminder_id == reminder_id,
+                        SharedReminderMembership.user_id == participant.id,
+                    )
+                )
+                is None
+            )
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_cleanup_does_not_retain_delivery_for_terminal_parent_with_stale_occurrence(
+    monkeypatch,
+) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1667, chat_id=2667)
+        participant = await _add_user(session_factory, telegram_user_id=1668, chat_id=2668)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+        assert (
+            await shared_reminder_service.accept_invite(participant, invite.token, now_utc=NOW)
+        ).accepted
+
+        old_time = NOW - timedelta(days=31)
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            membership = await session.scalar(
+                select(SharedReminderMembership).where(
+                    SharedReminderMembership.reminder_id == reminder_id,
+                    SharedReminderMembership.user_id == participant.id,
+                )
+            )
+            assert reminder is not None and membership is not None
+            reminder.state = ReminderState.CANCELLED.value
+            reminder.status = "sent"
+            reminder.cancelled_at = old_time
+            membership.state = SharedMembershipState.REVOKED.value
+            membership.revision = 2
+            membership.revoked_at = old_time
+            occurrence = ReminderOccurrence(
+                reminder_id=reminder_id,
+                occurrence_at_utc=NOW,
+                delivery_at_utc=NOW,
+                status=OccurrenceState.PROCESSING.value,
+                action_revision=reminder.action_revision,
+                created_at=old_time,
+            )
+            session.add(occurrence)
+            await session.flush()
+            delivery = ReminderDelivery(
+                reminder_id=reminder_id,
+                occurrence_id=occurrence.id,
+                recipient_user_id=participant.id,
+                membership_revision=1,
+                action_revision=reminder.action_revision,
+                chat_id=participant.chat_id,
+                state=ReminderDeliveryState.PROCESSING.value,
+                lease_until=NOW + timedelta(seconds=60),
+                lease_token="stale-processing-recipient",
+                created_at=old_time,
+            )
+            session.add(delivery)
+            await session.commit()
+            occurrence_id = occurrence.id
+            delivery_id = delivery.id
+
+        first = await shared_reminder_service.cleanup_expired_shared_data(now_utc=NOW)
+        assert first["deleted_deliveries"] == 1
+        assert first["deleted_memberships"] == 0
+        async with session_factory() as session:
+            assert await session.get(ReminderDelivery, delivery_id) is None
+            stale_occurrence = await session.get(ReminderOccurrence, occurrence_id)
+            assert stale_occurrence is not None
+            assert stale_occurrence.status == OccurrenceState.PROCESSING.value
+
+        second = await shared_reminder_service.cleanup_expired_shared_data(now_utc=NOW)
+        assert second["deleted_memberships"] == 1
     finally:
         await connection.close()
         await engine.dispose()
