@@ -25,18 +25,26 @@ deployment, БД и `mtproxy` этим документом не меняютс�
 | Avatar/profile picture | `assets/telegram/avatar.png` | `assets/telegram/avatar.svg` + `scripts/export_telegram_assets.py` |
 | Welcome / Description Picture | `assets/telegram/welcome.png` | `assets/telegram/welcome.svg` + `scripts/export_telegram_assets.py` |
 
-PNG-файлы уже закоммичены и подходят для загрузки. SVG и генератор не используют
-AI-generated raster text, системный шрифт или сетевой сервис. Для повторной
+PNG-файлы закоммичены и подходят для загрузки. SVG и PNG строятся из одной
+векторной геометрии. Контуры надписей сохранены в `assets/telegram/lettering.json`;
+экспорт не требует системного шрифта, дополнительных библиотек или сети.
+Для повторной
 генерации из корня репозитория:
 
 ```text
 python scripts/export_telegram_assets.py
 ```
 
-Аватар — простой символ часов и выполненного действия, без мелкого текста и с
-безопасной зоной для circular crop. Welcome visual показывает тот же символ и
-три ключевые возможности: текст, голос и повторы. Основной текст остаётся в
-caption `/start`, поэтому он доступен для копирования и локализации.
+Аватар — белый знак часов и галочки на синем фоне, без мелкого текста и с
+безопасной зоной для circular crop. Welcome visual показывает пример обычной
+фразы и карточку подтверждения: «Напомни завтра в 9 позвонить маме».
+Основной текст остаётся в caption `/start`, поэтому доступен для копирования.
+
+Для изменения надписей есть необязательный authoring-скрипт
+`scripts/outline_telegram_lettering.ps1` (Windows, Segoe UI): он переводит
+текст в контуры и обновляет `lettering.json`. Файл шрифта не распространяется.
+Обычная повторная генерация использует сохранённые контуры и работает также
+на Linux без шрифтов. После изменения контуров повторите PNG/SVG export.
 
 ## Минимальный owner checkpoint после merge
 
