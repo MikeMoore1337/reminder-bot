@@ -174,8 +174,8 @@ def _owner_matches(reminder: Reminder, user: User) -> bool:
     return reminder.user_id == user.id and reminder.chat_id == user.chat_id
 
 
-def _shareable(reminder: Reminder) -> bool:
-    """Return whether the deliberately small v1 shared contract applies."""
+def _sharing_contract_supported(reminder: Reminder) -> bool:
+    """Return whether the persistent v1 shared contract applies."""
 
     return (
         reminder.kind == ReminderKind.ORDINARY.value
@@ -184,8 +184,13 @@ def _shareable(reminder: Reminder) -> bool:
         and reminder.parent_reminder_id is None
         and is_private_chat_id(reminder.chat_id)
         and reminder.state in _ACTIVE_REMINDER_STATES
-        and reminder.status != "processing"
     )
+
+
+def _shareable(reminder: Reminder) -> bool:
+    """Return whether the deliberately small v1 shared contract applies now."""
+
+    return _sharing_contract_supported(reminder) and reminder.status != "processing"
 
 
 async def _load_owner_reminder(
@@ -424,10 +429,20 @@ async def accept_invite(
         reminder = await session.scalar(
             select(Reminder).where(Reminder.id == invite.reminder_id).with_for_update()
         )
-        if reminder is None or not _shareable(reminder):
+        if reminder is None or not _sharing_contract_supported(reminder):
             invite.state = SharedInviteState.REVOKED.value
             invite.revoked_at = current_time
             invite.revision += 1
+            return InviteAcceptance(False, reason="unavailable")
+
+        if reminder.status == "processing":
+            if (
+                invite.state == SharedInviteState.PENDING.value
+                and _as_utc(invite.expires_at) <= current_time
+            ):
+                invite.state = SharedInviteState.EXPIRED.value
+                invite.revision += 1
+                return InviteAcceptance(False, reason="expired")
             return InviteAcceptance(False, reason="unavailable")
 
         if _owner_matches(reminder, user):

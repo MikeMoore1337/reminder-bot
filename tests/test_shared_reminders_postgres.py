@@ -20,7 +20,9 @@ from app.db.models import (
     ReminderDeliveryState,
     ReminderOccurrence,
     ReminderState,
+    SharedInviteState,
     SharedMembershipState,
+    SharedReminderInvite,
     SharedReminderMembership,
     User,
 )
@@ -394,3 +396,100 @@ async def test_postgres_shared_card_locks_are_scoped_and_owner_is_independent(mo
             )
     finally:
         await _close_postgres(engine, session_factory, owner.id, participant.id)
+
+
+@pytest.mark.asyncio
+async def test_postgres_shared_invite_acceptance_serializes_with_processing_transition(
+    monkeypatch,
+) -> None:
+    (
+        engine,
+        session_factory,
+        owner,
+        _participant,
+        reminder_ids,
+        _occurrence_ids,
+    ) = await _open_postgres()
+    monkeypatch.setattr(shared_reminder_service, "SessionLocal", session_factory)
+    acceptance_task: asyncio.Task[shared_reminder_service.InviteAcceptance] | None = None
+    guest_id: int | None = None
+    try:
+        async with session_factory() as session, session.begin():
+            guest = User(
+                telegram_user_id=9_914_000_003,
+                chat_id=9_914_000_103,
+                timezone="Europe/Moscow",
+            )
+            session.add(guest)
+            await session.flush()
+            guest_id = guest.id
+
+        invite = await shared_reminder_service.create_invite(
+            owner,
+            reminder_ids[0],
+            now_utc=NOW,
+        )
+
+        async with session_factory() as session, session.begin():
+            reminder = await session.scalar(
+                select(Reminder).where(Reminder.id == reminder_ids[0]).with_for_update()
+            )
+            assert reminder is not None
+            reminder.status = "processing"
+            reminder.processing_started_at = NOW
+            reminder.lease_until = NOW + timedelta(minutes=1)
+            reminder.lease_token = "invite-processing-race"
+            await session.flush()
+
+            acceptance_task = asyncio.create_task(
+                shared_reminder_service.accept_invite(
+                    guest,
+                    invite.token,
+                    now_utc=NOW,
+                )
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(acceptance_task), timeout=0.1)
+
+        temporary = await asyncio.wait_for(acceptance_task, timeout=1.0)
+        assert temporary == shared_reminder_service.InviteAcceptance(
+            False,
+            reason="unavailable",
+        )
+        async with session_factory() as session:
+            stored = await session.scalar(
+                select(SharedReminderInvite).where(
+                    SharedReminderInvite.token_hash
+                    == shared_reminder_service._token_hash(invite.token)
+                )
+            )
+            assert stored is not None
+            assert stored.state == SharedInviteState.PENDING.value
+            assert stored.revision == 1
+            assert stored.revoked_at is None
+            assert stored.accepted_by_user_id is None
+
+        async with session_factory() as session, session.begin():
+            reminder = await session.scalar(
+                select(Reminder).where(Reminder.id == reminder_ids[0]).with_for_update()
+            )
+            assert reminder is not None
+            reminder.status = "sent"
+            reminder.processing_started_at = None
+            reminder.lease_until = None
+            reminder.lease_token = None
+
+        accepted = await shared_reminder_service.accept_invite(
+            guest,
+            invite.token,
+            now_utc=NOW,
+        )
+        assert accepted == shared_reminder_service.InviteAcceptance(True, reason="accepted")
+    finally:
+        if acceptance_task is not None and not acceptance_task.done():
+            acceptance_task.cancel()
+            await asyncio.gather(acceptance_task, return_exceptions=True)
+        if guest_id is not None:
+            async with session_factory() as session, session.begin():
+                await session.execute(delete(User).where(User.id == guest_id))
+        await _close_postgres(engine, session_factory, owner.id, _participant.id)

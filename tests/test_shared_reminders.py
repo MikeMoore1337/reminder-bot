@@ -293,6 +293,152 @@ async def test_shared_invites_are_scoped_hashed_expiring_and_revocable(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_shared_invite_remains_pending_during_processing_and_can_retry(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1011, chat_id=2011)
+        guest = await _add_user(session_factory, telegram_user_id=1012, chat_id=2012)
+        second_guest = await _add_user(session_factory, telegram_user_id=1013, chat_id=2013)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            assert reminder is not None
+            reminder.status = "processing"
+            reminder.processing_started_at = NOW
+            reminder.lease_until = NOW + timedelta(minutes=1)
+            reminder.lease_token = "invite-processing"
+            await session.commit()
+
+        for _ in range(2):
+            unavailable = await shared_reminder_service.accept_invite(
+                guest,
+                invite.token,
+                now_utc=NOW,
+            )
+            assert unavailable == shared_reminder_service.InviteAcceptance(
+                False,
+                reason="unavailable",
+            )
+            async with session_factory() as session:
+                pending = await session.scalar(
+                    select(SharedReminderInvite).where(
+                        SharedReminderInvite.token_hash
+                        == shared_reminder_service._token_hash(invite.token)
+                    )
+                )
+                membership = await session.scalar(
+                    select(SharedReminderMembership).where(
+                        SharedReminderMembership.reminder_id == reminder_id,
+                        SharedReminderMembership.user_id == guest.id,
+                    )
+                )
+                assert pending is not None
+                assert pending.state == SharedInviteState.PENDING.value
+                assert pending.revision == 1
+                assert pending.revoked_at is None
+                assert pending.accepted_by_user_id is None
+                assert membership is None
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            assert reminder is not None
+            reminder.status = "pending"
+            reminder.processing_started_at = None
+            reminder.lease_until = None
+            reminder.lease_token = None
+            await session.commit()
+
+        accepted = await shared_reminder_service.accept_invite(
+            guest,
+            invite.token,
+            now_utc=NOW,
+        )
+        assert accepted == shared_reminder_service.InviteAcceptance(True, reason="accepted")
+
+        used = await shared_reminder_service.accept_invite(
+            second_guest,
+            invite.token,
+            now_utc=NOW,
+        )
+        assert used == shared_reminder_service.InviteAcceptance(False, reason="used")
+        async with session_factory() as session:
+            stored = await session.scalar(
+                select(SharedReminderInvite).where(
+                    SharedReminderInvite.token_hash
+                    == shared_reminder_service._token_hash(invite.token)
+                )
+            )
+            assert stored is not None
+            assert stored.state == SharedInviteState.ACCEPTED.value
+            assert stored.revision == 2
+            assert stored.accepted_by_user_id == guest.id
+            assert stored.revoked_at is None
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_invite_permanently_revokes_for_unsupported_reminder(monkeypatch) -> None:
+    engine, connection, session_factory = await _open_sqlite(monkeypatch)
+    try:
+        owner = await _add_user(session_factory, telegram_user_id=1021, chat_id=2021)
+        guest = await _add_user(session_factory, telegram_user_id=1022, chat_id=2022)
+        reminder_id = await _add_reminder(session_factory, owner, now=NOW)
+        invite = await shared_reminder_service.create_invite(owner, reminder_id, now_utc=NOW)
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            assert reminder is not None
+            reminder.status = "processing"
+            await session.commit()
+
+        temporary = await shared_reminder_service.accept_invite(
+            guest,
+            invite.token,
+            now_utc=NOW,
+        )
+        assert temporary == shared_reminder_service.InviteAcceptance(
+            False,
+            reason="unavailable",
+        )
+
+        async with session_factory() as session:
+            reminder = await session.get(Reminder, reminder_id)
+            assert reminder is not None
+            reminder.status = "pending"
+            reminder.kind = ReminderKind.DEADLINE.value
+            await session.commit()
+
+        permanent = await shared_reminder_service.accept_invite(
+            guest,
+            invite.token,
+            now_utc=NOW,
+        )
+        assert permanent == shared_reminder_service.InviteAcceptance(
+            False,
+            reason="unavailable",
+        )
+        async with session_factory() as session:
+            stored = await session.scalar(
+                select(SharedReminderInvite).where(
+                    SharedReminderInvite.token_hash
+                    == shared_reminder_service._token_hash(invite.token)
+                )
+            )
+            assert stored is not None
+            assert stored.state == SharedInviteState.REVOKED.value
+            assert stored.revision == 2
+            assert stored.revoked_at is not None
+            assert stored.accepted_by_user_id is None
+    finally:
+        await connection.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_group_shared_start_is_side_effect_free(monkeypatch) -> None:
     engine, connection, session_factory = await _open_sqlite(monkeypatch)
     monkeypatch.setattr(timezone_service, "SessionLocal", session_factory)
