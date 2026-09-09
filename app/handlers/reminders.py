@@ -256,8 +256,10 @@ async def _create_and_answer(
     *,
     show_hint: bool = False,
     context: MessageContextSnapshot | None = None,
+    user: User | None = None,
+    input_text: str | None = None,
 ) -> None:
-    if not await require_private_chat(message):
+    if user is None and not await require_private_chat(message):
         return
     ids = _message_ids(message)
     if ids is None:
@@ -265,17 +267,19 @@ async def _create_and_answer(
         return
 
     telegram_user_id, chat_id = ids
-    user = await get_or_create_user(telegram_user_id=telegram_user_id, chat_id=chat_id)
+    if user is None:
+        user = await get_or_create_user(telegram_user_id=telegram_user_id, chat_id=chat_id)
 
     if context is None and is_contextual_message(message):
         context = extract_message_context(message)
 
     raw_text = _message_input_text(message)
+    parser_text = raw_text if input_text is None else input_text
     now_local = now_in_timezone(user.timezone)
     parsed = (
-        parse_context_reminder_input(raw_text, now_local=now_local)
+        parse_context_reminder_input(parser_text, now_local=now_local)
         if context is not None
-        else parse_reminder_input(raw_text, now_local=now_local)
+        else parse_reminder_input(parser_text, now_local=now_local)
     )
     if isinstance(parsed, DeadlineRequest):
         if context is not None and parsed.text == "__telegram_context__":
@@ -369,13 +373,14 @@ async def _handle_clarification(
     user: User,
     *,
     now_utc: datetime | None = None,
+    input_text: str | None = None,
 ) -> bool:
     current_time = now_utc or utc_now()
     clarification = await get_active_clarification(user, now_utc=current_time)
     if clarification is None:
         return False
 
-    raw_value = _message_input_text(message)
+    raw_value = _message_input_text(message) if input_text is None else input_text
     context = deserialize_context_snapshot(clarification.context_snapshot)
     parsed = (
         parse_context_clarification_answer(
@@ -444,12 +449,17 @@ async def _handle_clarification(
     return True
 
 
-async def _handle_action_draft(message: Message, user: User) -> bool:
+async def _handle_action_draft(
+    message: Message,
+    user: User,
+    *,
+    input_text: str | None = None,
+) -> bool:
     draft = await reminder_service.get_active_action_draft(user)
     if draft is None:
         return False
 
-    raw_value = (message.text or "").strip()
+    raw_value = _message_input_text(message) if input_text is None else input_text
     if draft.action_type == "snooze":
         try:
             reminder = await apply_custom_snooze_draft(user, draft, raw_value)
@@ -571,13 +581,35 @@ async def cmd_remind(message: Message) -> None:
     await _create_and_answer(message, show_hint=True)
 
 
+def _canonical_deadline_input(message: Message) -> str | None:
+    parts = _message_input_text(message).split(maxsplit=1)
+    if len(parts) == 1:
+        return None
+    return f"/deadline {parts[1]}"
+
+
 @router.message(Command("deadline"))
 async def cmd_deadline(message: Message) -> None:
-    if len((message.text or "").split(maxsplit=1)) == 1:
-        if await require_private_chat(message):
-            await message.answer(DEADLINE_FORMAT_HINT)
+    if not await require_private_chat(message):
         return
-    await _create_and_answer(message)
+
+    input_text = _canonical_deadline_input(message)
+    if input_text is None:
+        await message.answer(DEADLINE_FORMAT_HINT)
+        return
+
+    ids = _message_ids(message)
+    if ids is None:
+        await message.answer("Не удалось определить пользователя")
+        return
+    telegram_user_id, chat_id = ids
+    user = await get_or_create_user(telegram_user_id=telegram_user_id, chat_id=chat_id)
+
+    if await _handle_action_draft(message, user, input_text=input_text):
+        return
+    if await _handle_clarification(message, user, input_text=input_text):
+        return
+    await _create_and_answer(message, user=user, input_text=input_text)
 
 
 @router.message(Command("cancel"))
