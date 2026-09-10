@@ -72,14 +72,23 @@ bounded process/size limits. Затем запускается тот же
 - `schedule_correct`, `body_correct` и
   `fully_correct_reminder_interpretation` относительно явного
   `expected_product`;
-- wall-clock latency нормализации и STT, timeout/crash/error category;
+- wall-clock latency нормализации и STT, отдельный wall time процесса
+  `whisper-cli`, timeout/crash/error category;
+- process CPU time `user`, `system` и `total`, отношение CPU-time к process
+  wall time и best-effort mean/peak process CPU utilization;
 - optional `peak_rss_bytes`. На Linux `--measure-rss` снимает high-water
   `VmHWM` процесса через `/proc`; метод и отсутствие измерения явно записываются
-  в report. Это best-effort process measurement, а не выдуманная оценка RAM.
+  в report. CPU всегда снимается тем же `/proc` без новой runtime dependency.
+  Sampling относится только к subprocess, созданному STT adapter: ffmpeg,
+  вызываемый до него converter, в STT CPU metric не входит. Перед reap
+  процесса выполняется финальный sample; если `/proc/<pid>` уже исчез, в
+  report сохраняется последнее корректное значение. Это best-effort process
+  measurement, а не выдуманная оценка RAM.
 
 В summary по модели считаются mean, median и nearest-rank p95 STT latency,
 parser success rate, schedule/body rates, fully-correct rate, fail-closed rate,
-timeout/crash/error counts и максимальный измеренный RSS. Fully-correct rate
+timeout/crash/error counts, process wall/CPU time statistics, CPU/wall ratio,
+utilization statistics и максимальный измеренный RSS. Fully-correct rate
 имеет denominator только у samples с ожидаемым parsed/deadline reminder;
 negative/clarification samples отдельно входят в `safety_fail_closed_rate`.
 Ошибки STT не считаются успешной интерпретацией.
@@ -118,8 +127,8 @@ review после capacity audit разумно начинать с такого
 - измеренный peak RSS вместе с обычным потреблением bot/worker/db оставляет
   подтверждённый запас физической RAM (начальный operational target — не менее
   256 MiB, не считать swap запасом);
-- threads остаются `2`, concurrency остаётся `1`, пока measurements на 2-vCPU
-  host не докажут безопасное и полезное изменение.
+- concurrency остаётся `1`; threads выбираются по фактическому CPU-time, RSS и
+  voice UX на целевом host, а не по одной только wall-clock latency.
 
 Текущий capacity snapshot — 2 vCPU, около 2.06 GB RAM, около 1.02 GB available
 RAM, около 2.15 GB swap и около 22.3 GiB свободного места на filesystem с

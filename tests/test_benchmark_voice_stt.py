@@ -221,6 +221,51 @@ def test_wer_and_cer_use_deterministic_normalization() -> None:
     assert character_error_rate("Кот.", "кит") == pytest.approx(1 / 3)
 
 
+def test_proc_stat_parser_handles_spaces_in_command_name() -> None:
+    fields_after_state = ["0"] * 13
+    fields_after_state[10] = "123"
+    fields_after_state[11] = "45"
+
+    assert benchmark_voice_stt._parse_proc_stat_cpu_ticks(
+        "42 (whisper cli worker) S " + " ".join(fields_after_state)
+    ) == (123, 45)
+
+
+def test_process_resource_monitor_keeps_last_cpu_sample_after_proc_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 42
+        returncode = None
+
+        async def wait(self) -> int:
+            return 0
+
+    monitor = benchmark_voice_stt._ProcessResourceMonitor(
+        measure_rss=False,
+        clock_ticks_per_second=100,
+        procfs_available=True,
+    )
+    readings = iter([(100, 50), (140, 70), None])
+    monkeypatch.setattr(
+        benchmark_voice_stt,
+        "_read_proc_cpu_ticks",
+        lambda _pid: next(readings),
+    )
+    monitor.attach(FakeProcess(), started_at=10.0, start_sampling=False)  # type: ignore[arg-type]
+    monitor.sample(now=11.0)
+    monitor.sample(now=12.0)
+    measurement = monitor.snapshot()
+
+    assert measurement.process_wall_seconds == pytest.approx(2.0)
+    assert measurement.cpu_user_seconds == pytest.approx(0.4)
+    assert measurement.cpu_system_seconds == pytest.approx(0.2)
+    assert measurement.cpu_total_seconds == pytest.approx(0.6)
+    assert measurement.cpu_time_wall_ratio == pytest.approx(0.3)
+    assert measurement.cpu_utilization_mean_percent == pytest.approx(60.0)
+    assert measurement.cpu_utilization_peak_percent == pytest.approx(60.0)
+
+
 def test_product_score_compares_schedule_and_body_against_ground_truth() -> None:
     expected = _product()
     correct = ParsedReminder(
@@ -306,6 +351,58 @@ def test_aggregate_results_reports_quality_errors_latency_and_rss() -> None:
     assert summary["timeout_count"] == 1
     assert summary["stt_latency_ms"]["p95_ms"] == 200.0
     assert summary["peak_rss_bytes_max"] == 1000
+
+
+def test_aggregate_results_reports_process_cpu_statistics() -> None:
+    product = {
+        "expected_kind": "clarification",
+        "parser_success": False,
+        "schedule_correct": None,
+        "body_correct": None,
+        "fully_correct": None,
+        "interpretation_correct": True,
+        "safety_fail_closed": True,
+    }
+    records = [
+        {
+            "model_path": "/models/small-q5_1.bin",
+            "status": "ok",
+            "product": product,
+            "stt_latency_ms": 100.0,
+            "stt_process_wall_seconds": 2.0,
+            "stt_cpu_user_seconds": 1.0,
+            "stt_cpu_system_seconds": 0.2,
+            "stt_cpu_total_seconds": 1.2,
+            "cpu_time_wall_ratio": 0.6,
+            "cpu_utilization_mean_percent": 60.0,
+            "cpu_utilization_peak_percent": 80.0,
+            "peak_rss_bytes": 1000,
+            "error": None,
+        },
+        {
+            "model_path": "/models/small-q5_1.bin",
+            "status": "ok",
+            "product": product,
+            "stt_latency_ms": 200.0,
+            "stt_process_wall_seconds": 3.0,
+            "stt_cpu_user_seconds": 2.0,
+            "stt_cpu_system_seconds": 0.4,
+            "stt_cpu_total_seconds": 2.4,
+            "cpu_time_wall_ratio": 0.8,
+            "cpu_utilization_mean_percent": 80.0,
+            "cpu_utilization_peak_percent": 120.0,
+            "peak_rss_bytes": 2000,
+            "error": None,
+        },
+    ]
+
+    summary = aggregate_results(records)["by_model"]["/models/small-q5_1.bin"]
+
+    assert summary["stt_cpu_total_seconds"]["mean_seconds"] == pytest.approx(1.8)
+    assert summary["stt_cpu_total_seconds"]["p95_seconds"] == pytest.approx(2.4)
+    assert summary["cpu_time_wall_ratio"]["mean_ratio"] == pytest.approx(0.7)
+    assert summary["cpu_utilization_peak_percent"]["p95_percent"] == pytest.approx(120.0)
+    assert summary["cpu_measured_count"] == 2
 
 
 def test_validate_inputs_rejects_missing_model_audio_and_path_escape(tmp_path: Path) -> None:

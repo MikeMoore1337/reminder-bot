@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import sys
 import time
 import unicodedata
@@ -605,8 +606,60 @@ def _latency_stats(values: Sequence[float]) -> dict[str, Any]:
     }
 
 
+def _seconds_stats(values: Sequence[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "mean_seconds": None,
+            "median_seconds": None,
+            "p95_seconds": None,
+        }
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "mean_seconds": sum(ordered) / len(ordered),
+        "median_seconds": ordered[len(ordered) // 2]
+        if len(ordered) % 2
+        else (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2,
+        "p95_seconds": _percentile(ordered, 0.95),
+    }
+
+
+def _ratio_stats(values: Sequence[float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0, "mean_ratio": None, "median_ratio": None, "p95_ratio": None}
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "mean_ratio": sum(ordered) / len(ordered),
+        "median_ratio": ordered[len(ordered) // 2]
+        if len(ordered) % 2
+        else (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2,
+        "p95_ratio": _percentile(ordered, 0.95),
+    }
+
+
+def _percent_stats(values: Sequence[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "mean_percent": None,
+            "median_percent": None,
+            "p95_percent": None,
+        }
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "mean_percent": sum(ordered) / len(ordered),
+        "median_percent": ordered[len(ordered) // 2]
+        if len(ordered) % 2
+        else (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2,
+        "p95_percent": _percentile(ordered, 0.95),
+    }
+
+
 def aggregate_results(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate quality, product, error, latency, and RSS metrics by model."""
+    """Aggregate quality, product, error, latency, RSS, and CPU metrics by model."""
 
     by_model: dict[str, list[dict[str, Any]]] = {}
     for record in records:
@@ -655,6 +708,41 @@ def aggregate_results(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             for record in model_records
             if record["peak_rss_bytes"] is not None
         ]
+        process_wall_values = [
+            float(record["stt_process_wall_seconds"])
+            for record in model_records
+            if record.get("stt_process_wall_seconds") is not None
+        ]
+        cpu_user_values = [
+            float(record["stt_cpu_user_seconds"])
+            for record in model_records
+            if record.get("stt_cpu_user_seconds") is not None
+        ]
+        cpu_system_values = [
+            float(record["stt_cpu_system_seconds"])
+            for record in model_records
+            if record.get("stt_cpu_system_seconds") is not None
+        ]
+        cpu_total_values = [
+            float(record["stt_cpu_total_seconds"])
+            for record in model_records
+            if record.get("stt_cpu_total_seconds") is not None
+        ]
+        cpu_ratio_values = [
+            float(record["cpu_time_wall_ratio"])
+            for record in model_records
+            if record.get("cpu_time_wall_ratio") is not None
+        ]
+        cpu_mean_utilization_values = [
+            float(record["cpu_utilization_mean_percent"])
+            for record in model_records
+            if record.get("cpu_utilization_mean_percent") is not None
+        ]
+        cpu_peak_utilization_values = [
+            float(record["cpu_utilization_peak_percent"])
+            for record in model_records
+            if record.get("cpu_utilization_peak_percent") is not None
+        ]
 
         def rate(numerator: int, denominator: int) -> float | None:
             return numerator / denominator if denominator else None
@@ -674,8 +762,16 @@ def aggregate_results(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "error_count": len(errors),
             "error_counts": error_counts,
             "stt_latency_ms": _latency_stats(latencies),
+            "stt_process_wall_seconds": _seconds_stats(process_wall_values),
+            "stt_cpu_user_seconds": _seconds_stats(cpu_user_values),
+            "stt_cpu_system_seconds": _seconds_stats(cpu_system_values),
+            "stt_cpu_total_seconds": _seconds_stats(cpu_total_values),
+            "cpu_time_wall_ratio": _ratio_stats(cpu_ratio_values),
+            "cpu_utilization_mean_percent": _percent_stats(cpu_mean_utilization_values),
+            "cpu_utilization_peak_percent": _percent_stats(cpu_peak_utilization_values),
             "peak_rss_bytes_max": max(rss_values) if rss_values else None,
             "peak_rss_measured_count": len(rss_values),
+            "cpu_measured_count": len(cpu_total_values),
         }
 
     return {
@@ -683,20 +779,136 @@ def aggregate_results(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-class _PeakRssMonitor:
-    """Best-effort Linux process high-water sampling for an adapter process."""
+def _parse_proc_stat_cpu_ticks(value: str) -> tuple[int, int]:
+    """Parse Linux /proc/<pid>/stat utime and stime fields.
 
-    def __init__(self) -> None:
+    The command name is wrapped in parentheses and may itself contain spaces
+    or parentheses, so splitting the complete line is not safe.
+    """
+
+    try:
+        fields_after_comm = value.rsplit(") ", 1)[1].split()
+        user_ticks = int(fields_after_comm[11])
+        system_ticks = int(fields_after_comm[12])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("invalid /proc stat CPU fields") from exc
+    return user_ticks, system_ticks
+
+
+def _read_proc_cpu_ticks(pid: int) -> tuple[int, int] | None:
+    if not sys.platform.startswith("linux") or not Path("/proc").is_dir():
+        return None
+    try:
+        value = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+        return _parse_proc_stat_cpu_ticks(value)
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _proc_clock_ticks_per_second() -> int | None:
+    if not sys.platform.startswith("linux") or not Path("/proc").is_dir():
+        return None
+    try:
+        value = int(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, OSError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessMeasurement:
+    process_wall_seconds: float | None
+    cpu_user_seconds: float | None
+    cpu_system_seconds: float | None
+    cpu_total_seconds: float | None
+    cpu_time_wall_ratio: float | None
+    cpu_utilization_mean_percent: float | None
+    cpu_utilization_peak_percent: float | None
+    peak_rss_bytes: int | None
+    cpu_method: str
+    rss_method: str
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "stt_process_wall_seconds": self.process_wall_seconds,
+            "stt_process_wall_ms": (
+                self.process_wall_seconds * 1000 if self.process_wall_seconds is not None else None
+            ),
+            "stt_cpu_user_seconds": self.cpu_user_seconds,
+            "stt_cpu_system_seconds": self.cpu_system_seconds,
+            "stt_cpu_total_seconds": self.cpu_total_seconds,
+            "cpu_time_wall_ratio": self.cpu_time_wall_ratio,
+            "cpu_utilization_mean_percent": self.cpu_utilization_mean_percent,
+            "cpu_utilization_peak_percent": self.cpu_utilization_peak_percent,
+            "peak_rss_bytes": self.peak_rss_bytes,
+            "cpu_method": self.cpu_method,
+            "rss_method": self.rss_method,
+        }
+
+
+class _ProcessResourceMonitor:
+    """Best-effort Linux /proc measurement for one whisper-cli process.
+
+    CPU ticks are sampled while the process runs. The wait wrapper samples
+    before reaping the child, and every metric retains the last valid sample if
+    /proc disappears immediately after process termination.
+    """
+
+    def __init__(
+        self,
+        *,
+        measure_rss: bool,
+        clock_ticks_per_second: int | None = None,
+        procfs_available: bool | None = None,
+    ) -> None:
+        self._measure_rss = measure_rss
+        if procfs_available is None:
+            procfs_available = sys.platform.startswith("linux") and Path("/proc").is_dir()
+        self._clock_ticks_per_second = (
+            clock_ticks_per_second if procfs_available else None
+        ) or _proc_clock_ticks_per_second()
+        if procfs_available and self._clock_ticks_per_second:
+            self.cpu_method = "linux_proc_stat_poll"
+        else:
+            self.cpu_method = "unavailable"
+        self.rss_method = (
+            "linux_proc_vmhwm_poll"
+            if measure_rss and procfs_available
+            else "disabled"
+            if not measure_rss
+            else "unavailable"
+        )
         self.peak_rss_bytes: int | None = None
-        self.method = "unavailable"
         self._process: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
-        if sys.platform.startswith("linux") and Path("/proc").is_dir():
-            self.method = "linux_proc_vmhwm_poll"
+        self._started_at: float | None = None
+        self._finished_at: float | None = None
+        self._last_observation_at: float | None = None
+        self._first_cpu_ticks: tuple[int, int] | None = None
+        self._last_cpu_ticks: tuple[int, int] | None = None
+        self._last_cpu_sample_at: float | None = None
+        self._utilization_percent: list[float] = []
 
-    def attach(self, process: asyncio.subprocess.Process) -> None:
+    @property
+    def method(self) -> str:
+        """Compatibility alias for the pre-CPU RSS-only monitor."""
+
+        return self.rss_method
+
+    def attach(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        started_at: float | None = None,
+        start_sampling: bool = True,
+    ) -> None:
         self._process = process
-        if self.method != "unavailable":
+        self._started_at = time.monotonic() if started_at is None else started_at
+        self.sample(now=self._started_at)
+        self._wrap_wait(process)
+        if start_sampling and (
+            self.cpu_method != "unavailable" or self.rss_method != "unavailable"
+        ):
             self._task = asyncio.create_task(self._sample())
 
     @staticmethod
@@ -718,14 +930,67 @@ class _PeakRssMonitor:
             fallback = value
         return fallback
 
+    def _wrap_wait(self, process: asyncio.subprocess.Process) -> None:
+        original_wait = process.wait
+
+        async def monitored_wait(*args: Any, **kwargs: Any) -> int:
+            self.sample()
+            try:
+                return await original_wait(*args, **kwargs)
+            finally:
+                finished_at = time.monotonic()
+                self.sample(now=finished_at)
+                self._finished_at = finished_at
+
+        try:
+            process.wait = monitored_wait  # type: ignore[method-assign]
+        except (AttributeError, TypeError):
+            # The polling task remains useful for process implementations that
+            # do not allow instance method replacement.
+            return
+
+    def sample(self, *, now: float | None = None) -> None:
+        if self._process is None:
+            return
+        observation_at = time.monotonic() if now is None else now
+        self._last_observation_at = observation_at
+        if self.cpu_method != "unavailable":
+            cpu_ticks = _read_proc_cpu_ticks(self._process.pid)
+            if cpu_ticks is not None:
+                self._record_cpu_sample(observation_at, cpu_ticks)
+        if self.rss_method != "unavailable":
+            rss = self._read_rss_bytes(self._process.pid)
+            if rss is not None:
+                self.peak_rss_bytes = max(self.peak_rss_bytes or 0, rss)
+
+    def _record_cpu_sample(self, observed_at: float, cpu_ticks: tuple[int, int]) -> None:
+        if self._first_cpu_ticks is None:
+            self._first_cpu_ticks = cpu_ticks
+            self._last_cpu_ticks = cpu_ticks
+            self._last_cpu_sample_at = observed_at
+            return
+        if self._last_cpu_ticks is None or self._last_cpu_sample_at is None:
+            return
+        if any(
+            current < previous
+            for current, previous in zip(cpu_ticks, self._last_cpu_ticks, strict=True)
+        ):
+            return
+        elapsed = observed_at - self._last_cpu_sample_at
+        if elapsed > 0 and self._clock_ticks_per_second:
+            delta_ticks = sum(cpu_ticks) - sum(self._last_cpu_ticks)
+            self._utilization_percent.append(
+                (delta_ticks / self._clock_ticks_per_second) / elapsed * 100
+            )
+        self._last_cpu_ticks = cpu_ticks
+        self._last_cpu_sample_at = observed_at
+
     async def _sample(self) -> None:
         if self._process is None:
             return
         try:
             while True:
-                rss = self._read_rss_bytes(self._process.pid)
-                if rss is not None:
-                    self.peak_rss_bytes = max(self.peak_rss_bytes or 0, rss)
+                self.sample()
                 if self._process.returncode is not None:
                     return
                 await asyncio.sleep(0.02)
@@ -733,14 +998,66 @@ class _PeakRssMonitor:
             return
 
     async def stop(self) -> None:
+        if self._process is not None:
+            self.sample()
+            if self._finished_at is None and self._process.returncode is not None:
+                self._finished_at = time.monotonic()
         if self._task is None:
             return
-        final_rss = self._read_rss_bytes(self._process.pid) if self._process else None
-        if final_rss is not None:
-            self.peak_rss_bytes = max(self.peak_rss_bytes or 0, final_rss)
         self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
         self._task = None
+
+    def snapshot(self) -> _ProcessMeasurement:
+        process_wall_seconds: float | None = None
+        if self._started_at is not None:
+            end = self._finished_at or self._last_observation_at
+            if end is not None:
+                process_wall_seconds = max(0.0, end - self._started_at)
+
+        cpu_user_seconds: float | None = None
+        cpu_system_seconds: float | None = None
+        cpu_total_seconds: float | None = None
+        if (
+            self._first_cpu_ticks is not None
+            and self._last_cpu_ticks is not None
+            and self._clock_ticks_per_second
+        ):
+            user_ticks = self._last_cpu_ticks[0] - self._first_cpu_ticks[0]
+            system_ticks = self._last_cpu_ticks[1] - self._first_cpu_ticks[1]
+            if user_ticks >= 0 and system_ticks >= 0:
+                cpu_user_seconds = user_ticks / self._clock_ticks_per_second
+                cpu_system_seconds = system_ticks / self._clock_ticks_per_second
+                cpu_total_seconds = cpu_user_seconds + cpu_system_seconds
+
+        cpu_time_wall_ratio = None
+        if cpu_total_seconds is not None and process_wall_seconds and process_wall_seconds > 0:
+            cpu_time_wall_ratio = cpu_total_seconds / process_wall_seconds
+        mean_utilization = None
+        peak_utilization = None
+        if self._utilization_percent:
+            mean_utilization = sum(self._utilization_percent) / len(self._utilization_percent)
+            peak_utilization = max(self._utilization_percent)
+
+        return _ProcessMeasurement(
+            process_wall_seconds=process_wall_seconds,
+            cpu_user_seconds=cpu_user_seconds,
+            cpu_system_seconds=cpu_system_seconds,
+            cpu_total_seconds=cpu_total_seconds,
+            cpu_time_wall_ratio=cpu_time_wall_ratio,
+            cpu_utilization_mean_percent=mean_utilization,
+            cpu_utilization_peak_percent=peak_utilization,
+            peak_rss_bytes=self.peak_rss_bytes,
+            cpu_method=self.cpu_method,
+            rss_method=self.rss_method,
+        )
+
+
+class _MeasuredTranscriptionError(RuntimeError):
+    def __init__(self, cause: Exception, measurement: _ProcessMeasurement) -> None:
+        super().__init__("transcription failed after process measurement")
+        self.cause = cause
+        self.measurement = measurement
 
 
 async def _transcribe_with_measurement(
@@ -748,11 +1065,8 @@ async def _transcribe_with_measurement(
     audio_path: Path,
     *,
     measure_rss: bool,
-) -> tuple[str, int | None, str]:
-    if not measure_rss:
-        return await provider.transcribe(audio_path), None, "disabled"
-
-    monitor = _PeakRssMonitor()
+) -> tuple[str, _ProcessMeasurement]:
+    monitor = _ProcessResourceMonitor(measure_rss=measure_rss)
     original_create = asyncio.create_subprocess_exec
 
     async def monitored_create(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
@@ -761,11 +1075,23 @@ async def _transcribe_with_measurement(
         return process
 
     with patch.object(asyncio, "create_subprocess_exec", new=monitored_create):
+        transcript: str | None = None
+        captured_error: Exception | None = None
         try:
             transcript = await provider.transcribe(audio_path)
+        except Exception as exc:
+            captured_error = exc
         finally:
             await monitor.stop()
-    return transcript, monitor.peak_rss_bytes, monitor.method
+    measurement = monitor.snapshot()
+    if captured_error is not None:
+        raise _MeasuredTranscriptionError(captured_error, measurement) from captured_error
+    if transcript is None:  # pragma: no cover - provider protocol violation
+        raise _MeasuredTranscriptionError(
+            RuntimeError("provider returned no transcript"),
+            measurement,
+        )
+    return transcript, measurement
 
 
 def _default_provider(model_path: Path, config: BenchmarkConfig) -> WhisperCppSpeechToTextProvider:
@@ -799,7 +1125,16 @@ def _record_base(
         "model_size_bytes": model_path.stat().st_size,
         "normalization_latency_ms": normalization_latency_ms,
         "stt_latency_ms": None,
+        "stt_process_wall_seconds": None,
+        "stt_process_wall_ms": None,
+        "stt_cpu_user_seconds": None,
+        "stt_cpu_system_seconds": None,
+        "stt_cpu_total_seconds": None,
+        "cpu_time_wall_ratio": None,
+        "cpu_utilization_mean_percent": None,
+        "cpu_utilization_peak_percent": None,
         "peak_rss_bytes": None,
+        "cpu_method": "unavailable",
         "rss_method": "disabled",
         "status": "error",
         "error": None,
@@ -868,7 +1203,7 @@ async def run_benchmark(
                 provider = provider_factory(model_path, config)
                 stt_started = time.perf_counter()
                 try:
-                    transcript, peak_rss_bytes, rss_method = await _transcribe_with_measurement(
+                    transcript, measurement = await _transcribe_with_measurement(
                         provider,
                         normalized_path,
                         measure_rss=config.measure_rss,
@@ -890,8 +1225,6 @@ async def run_benchmark(
                         {
                             "status": "ok",
                             "stt_latency_ms": stt_latency_ms,
-                            "peak_rss_bytes": peak_rss_bytes,
-                            "rss_method": rss_method,
                             "transcript": normalized_transcript,
                             "normalized_transcript": _normalize_metric_text(normalized_transcript),
                             "normalized_exact_match": _normalize_metric_text(sample.expected)
@@ -901,6 +1234,18 @@ async def run_benchmark(
                             "product": score_product(expected_product, parsed),
                         }
                     )
+                    record.update(measurement.as_record())
+                except _MeasuredTranscriptionError as measured_exc:
+                    record.update(measured_exc.measurement.as_record())
+                    cause = measured_exc.cause
+                    if isinstance(cause, SpeechToTextError):
+                        record["error"] = {"stage": "stt", "category": cause.category}
+                    else:
+                        record["error"] = {
+                            "stage": "stt",
+                            "category": "provider_error",
+                            "type": type(cause).__name__,
+                        }
                 except SpeechToTextError as exc:
                     record["error"] = {"stage": "stt", "category": exc.category}
                 except Exception as exc:  # pragma: no cover - defensive runtime shield
@@ -924,6 +1269,7 @@ async def run_benchmark(
             "conversion_timeout_seconds": config.conversion_timeout_seconds,
             "conversion_command": config.conversion_command,
             "measure_rss": config.measure_rss,
+            "measure_cpu": True,
         },
         "records": records,
         "summary": summary,
