@@ -131,6 +131,8 @@ jobs:
           assert Path("/var/lib/reminder-bot/voice-temp").is_dir()
           print("VOICE_RUNTIME_MOUNT_SMOKE_OK")
           '
+          docker compose run --rm --no-deps --entrypoint python bot \
+            -m app.services.voice_runtime --require-media
           docker compose run --rm --no-deps --entrypoint python bot -c '
           import os
           import time

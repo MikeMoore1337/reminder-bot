@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 import time
@@ -526,6 +527,51 @@ def test_voice_conversion_rejects_decoded_output_over_duration_bound(monkeypatch
         assert captured["kwargs"]["stdout"] == asyncio.subprocess.PIPE
 
     asyncio.run(scenario())
+
+
+def test_voice_conversion_logs_safe_nonzero_diagnostic(monkeypatch, tmp_path, caplog):
+    async def scenario() -> None:
+        source = tmp_path / "input.ogg"
+        destination = tmp_path / "normalized.wav"
+        source.write_bytes(b"ogg")
+
+        class Stream:
+            async def read(self, _: int) -> bytes:
+                return b""
+
+        class Process:
+            returncode = 187
+            stdout = Stream()
+
+            async def wait(self) -> int:
+                return self.returncode
+
+            def kill(self) -> None:
+                raise AssertionError("failed process already exited")
+
+        async def fake_create(*args, **kwargs):
+            return Process()
+
+        monkeypatch.setattr("app.services.voice_media.asyncio.create_subprocess_exec", fake_create)
+        limits = VoiceMediaLimits(
+            max_file_size_bytes=10_000,
+            max_duration_seconds=1,
+            download_timeout_seconds=30,
+            conversion_timeout_seconds=30,
+            conversion_command=sys.executable,
+        )
+
+        with pytest.raises(VoiceMediaError, match="Не удалось подготовить"):
+            await convert_voice_to_wav(source, destination, limits)
+
+    caplog.set_level(logging.WARNING, logger="app.services.voice_media")
+    asyncio.run(scenario())
+
+    records = [record for record in caplog.records if record.name == "app.services.voice_media"]
+    assert len(records) == 1
+    assert records[0].message == "Voice media conversion failed"
+    assert records[0].extra_data == "stage=media category=conversion return_code=187"
+    assert str(tmp_path) not in records[0].extra_data
 
 
 def test_voice_flow_arbitration_clears_stale_scenarios(monkeypatch, tmp_path):

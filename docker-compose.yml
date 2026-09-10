@@ -37,6 +37,9 @@ services:
       - .env
     environment:
       VOICE_TEMP_DIR: ${VOICE_TEMP_DIR:-/var/lib/reminder-bot/voice-temp}
+      # The converter is part of the immutable application image. The mounted
+      # voice bundle remains deployment-owned for whisper.cpp and its model.
+      VOICE_CONVERSION_COMMAND: /usr/bin/ffmpeg
     volumes:
       - ${VOICE_RUNTIME_DIR:-/opt/reminder-bot/voice-runtime}:/opt/reminder-bot/voice:ro
       - voice_temp:/var/lib/reminder-bot/voice-temp

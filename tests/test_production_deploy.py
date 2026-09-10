@@ -203,6 +203,7 @@ def test_remote_deploy_script_contains_the_production_safety_contract() -> None:
         "--force-recreate",
         "--abort-on-container-exit",
         "--exit-code-from migrate",
+        "app.services.voice_runtime",
     )
     for fragment in required_fragments:
         assert fragment in script
@@ -425,6 +426,9 @@ if [[ "${1:-}" == "inspect" ]]; then
 fi
 
 if [[ "${1:-}" == "compose" ]]; then
+  if [[ "${VOICE_PREFLIGHT_FAIL:-0}" == "1" && "$*" == *"-m app.services.voice_runtime"* ]]; then
+    exit 42
+  fi
   if [[ "${CONSUME_UNSAFE_STDIN:-0}" == "1" \
     && "$*" == *" exec "* \
     && "$*" != *"--interactive=false"* ]]; then
@@ -564,6 +568,10 @@ def test_deploy_success_uses_exact_image_project_volume_backup_and_marker(tmp_pa
 
     calls = paths["calls"].read_text(encoding="utf-8")
     assert "compose -p reminder_bot config --quiet" in calls
+    assert (
+        "compose -p reminder_bot run --rm --no-deps --entrypoint python bot -m app.services.voice_runtime"
+        in calls
+    )
     assert "compose -p reminder_bot up -d --no-build db" in calls
     assert "compose -p reminder_bot --profile tools up --no-build --no-deps" in calls
     rollout = "compose -p reminder_bot up -d --no-build --no-deps --force-recreate bot worker"
@@ -571,6 +579,7 @@ def test_deploy_success_uses_exact_image_project_volume_backup_and_marker(tmp_pa
     assert "pg_dump" in calls
     assert "docker compose build" not in calls
     assert calls.index("pg_dump") < calls.index("migrate") < calls.index("bot worker")
+    assert calls.index("app.services.voice_runtime") < calls.index("up -d --no-build db")
     call_lines = calls.splitlines()
     migration_index = next(index for index, line in enumerate(call_lines) if "migrate" in line)
     post_migration_compose = [
@@ -586,6 +595,24 @@ def test_deploy_success_uses_exact_image_project_volume_backup_and_marker(tmp_pa
         for line in calls.splitlines()
         if line.startswith("compose")
     )
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS, reason="behavioral deployment contract requires Unix bash/flock/git"
+)
+def test_voice_runtime_preflight_failure_prevents_database_start(tmp_path: Path) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, _, _ = fixture
+
+    result = _run_deploy(fixture, VOICE_PREFLIGHT_FAIL="1")
+
+    assert result.returncode != 0
+    assert "voice runtime preflight failed" in result.stderr
+    calls = paths["calls"].read_text(encoding="utf-8")
+    assert "app.services.voice_runtime" in calls
+    assert "up -d --no-build db" not in calls
+    assert not paths["backup"].exists()
+    assert not (paths["state"] / "deployed-sha").exists()
 
 
 @pytest.mark.skipif(

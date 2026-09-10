@@ -125,6 +125,12 @@ validate_existing_volume() {
   [[ "${pg_version}" == "17" ]] || fail "production PostgreSQL volume is not PostgreSQL 17"
 }
 
+validate_voice_runtime() {
+  "${compose[@]}" run --rm --no-deps --entrypoint python bot \
+    -m app.services.voice_runtime \
+    || fail "voice runtime preflight failed"
+}
+
 prune_backups() {
   local backup_name index
   local -a backup_names valid_names
@@ -232,6 +238,8 @@ validate_existing_volume
 
 configured_app_images="$("${compose_tools[@]}" config --images | awk -v expected="${expected_image}" '$0 == expected { count++ } END { print count + 0 }')"
 [[ "${configured_app_images}" == "3" ]] || fail "migrate, bot, and worker do not share the exact image"
+
+validate_voice_runtime
 
 assert_current_master
 "${compose[@]}" up -d --no-build db

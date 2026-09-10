@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import shutil
@@ -13,6 +14,8 @@ from typing import Any, BinaryIO, cast
 
 from aiogram import Bot
 from aiogram.types import Voice
+
+logger = logging.getLogger(__name__)
 
 VOICE_ALLOWED_MIME_TYPES = frozenset({"audio/ogg", "audio/opus", "application/ogg"})
 VOICE_PCM_SAMPLE_RATE = 16_000
@@ -217,6 +220,20 @@ async def _abort_conversion(
     await _cancel_task(wait_task)
 
 
+def _log_conversion_failure(
+    category: str,
+    *,
+    return_code: int | None = None,
+    error_type: str | None = None,
+) -> None:
+    fields = ["stage=media", f"category={category}"]
+    if return_code is not None:
+        fields.append(f"return_code={return_code}")
+    if error_type is not None:
+        fields.append(f"error_type={error_type[:80]}")
+    logger.warning("Voice media conversion failed", extra={"extra_data": " ".join(fields)})
+
+
 def _remove_partial_output(destination: Path) -> None:
     with suppress(FileNotFoundError):
         destination.unlink()
@@ -229,7 +246,11 @@ async def convert_voice_to_wav(
 ) -> int:
     """Convert OGG/Opus to bounded mono 16 kHz PCM WAV using an external CLI."""
 
-    command = _command_parts(limits.conversion_command)
+    try:
+        command = _command_parts(limits.conversion_command)
+    except VoiceMediaError as exc:
+        _log_conversion_failure(exc.category)
+        raise
     argv = [
         *command,
         "-nostdin",
@@ -256,6 +277,7 @@ async def convert_voice_to_wav(
             stderr=asyncio.subprocess.DEVNULL,
         )
     except (FileNotFoundError, PermissionError, OSError) as exc:
+        _log_conversion_failure("conversion_unavailable", error_type=type(exc).__name__)
         raise VoiceMediaError(
             "conversion_unavailable", "Локальная обработка голосовых сообщений сейчас недоступна."
         ) from exc
@@ -263,6 +285,7 @@ async def convert_voice_to_wav(
     stdout = process.stdout
     if stdout is None:
         await _terminate_process(process)
+        _log_conversion_failure("conversion", error_type="missing_stdout")
         raise VoiceMediaError("conversion", "Не удалось подготовить голосовое сообщение.")
 
     max_wav_size = VOICE_WAV_HEADER_BYTES + limits.max_duration_seconds * VOICE_PCM_BYTES_PER_SECOND
@@ -276,12 +299,14 @@ async def convert_voice_to_wav(
     except TimeoutError as exc:
         await _abort_conversion(process, output_task, wait_task)
         _remove_partial_output(destination)
+        _log_conversion_failure("conversion_timeout")
         raise VoiceMediaError(
             "conversion_timeout", "Обработка голосового сообщения заняла слишком много времени."
         ) from exc
-    except VoiceMediaError:
+    except VoiceMediaError as exc:
         await _abort_conversion(process, output_task, wait_task)
         _remove_partial_output(destination)
+        _log_conversion_failure(exc.category)
         raise
     except asyncio.CancelledError:
         await _abort_conversion(process, output_task, wait_task)
@@ -290,9 +315,11 @@ async def convert_voice_to_wav(
 
     if return_code != 0 or process.returncode != 0:
         _remove_partial_output(destination)
+        _log_conversion_failure("conversion", return_code=return_code)
         raise VoiceMediaError("conversion", "Не удалось подготовить голосовое сообщение.")
     if size <= VOICE_WAV_HEADER_BYTES:
         _remove_partial_output(destination)
+        _log_conversion_failure("duration")
         raise VoiceMediaError("duration", "Голосовое сообщение превышает допустимую длительность.")
     return size
 
