@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.types import Voice
+from aiogram.types import Message, Voice
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -126,6 +126,23 @@ class _FakeProvider:
         return self.transcript
 
 
+def test_voice_transcript_parses_spoken_relative_number_words() -> None:
+    transcript = "Напомни через две минуты проверить голосовое напоминание"
+    now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
+
+    candidate, parsed = voice_service.parse_voice_transcript(
+        transcript,
+        now_local=now_local,
+    )
+
+    assert candidate == transcript
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.local_dt == now_local + timedelta(minutes=2)
+    assert parsed.text == "проверить голосовое напоминание"
+    assert parsed.recurrence_type == "none"
+    assert parsed.mode == "normal"
+
+
 def test_voice_metadata_allowlist_and_limits() -> None:
     limits = VoiceMediaLimits(
         max_file_size_bytes=100,
@@ -210,6 +227,96 @@ def test_voice_process_creates_persistent_preview_draft_and_cleans_media(monkeyp
                 assert await session.scalar(select(func.count()).select_from(Reminder)) == 0
                 saved = await session.get(VoiceReminderDraft, result.draft.id)
                 assert saved is not None
+        finally:
+            await connection.close()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_spoken_relative_voice_handler_keeps_confirmation_gate(monkeypatch, tmp_path):
+    async def scenario() -> None:
+        engine, connection, session_factory = await _open_sqlite(monkeypatch)
+        try:
+            now = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+            transcript = "Напомни через две минуты проверить голосовое напоминание"
+            monkeypatch.setattr(voice_service, "settings", _settings(tmp_path))
+            monkeypatch.setattr(voice_service, "utc_now", lambda: now)
+            voice_service.voice_metrics = voice_service.VoiceMetrics()
+            voice_service._stt_semaphore = None
+            voice_service._stt_semaphore_limit = None
+
+            async def fake_convert(
+                source: Path, destination: Path, limits: VoiceMediaLimits
+            ) -> int:
+                assert source.name == "input.ogg"
+                destination.write_bytes(b"RIFF" + b"0" * 100)
+                return destination.stat().st_size
+
+            monkeypatch.setattr(voice_service, "convert_voice_to_wav", fake_convert)
+            provider = _FakeProvider(transcript)
+            monkeypatch.setattr(voice_service, "_default_provider", lambda: provider)
+
+            user = await _add_user(session_factory)
+            monkeypatch.setattr(
+                reminders_handler,
+                "get_or_create_user",
+                AsyncMock(return_value=user),
+            )
+            preview_message = Message.model_construct(
+                message_id=9100,
+                chat=SimpleNamespace(id=user.chat_id, type="private"),
+            )
+            message_answers = AsyncMock(return_value=preview_message)
+            message_edits = AsyncMock()
+            monkeypatch.setattr(Message, "answer", message_answers)
+            monkeypatch.setattr(Message, "edit_reply_markup", message_edits)
+
+            voice_message = Message.model_construct(
+                message_id=7001,
+                from_user=SimpleNamespace(id=user.telegram_user_id),
+                chat=SimpleNamespace(id=user.chat_id, type="private"),
+                voice=_voice(),
+            )
+            await reminders_handler.voice_reminder_handler(voice_message, _FakeBot())
+
+            assert provider.paths
+            metrics = voice_service.get_voice_metrics()
+            assert metrics["stt_success"] == 1
+            assert metrics["parse_success"] == 1
+            message_answers.assert_awaited_once()
+            preview_text = message_answers.await_args.args[0]
+            assert "проверить голосовое напоминание" in preview_text
+            markup = message_answers.await_args.kwargs["reply_markup"]
+            create_data = markup.inline_keyboard[0][0].callback_data
+            parsed_callback = parse_callback(create_data)
+            assert parsed_callback is not None
+            assert parsed_callback.action == CallbackAction.CREATE
+
+            async with session_factory() as session:
+                assert await session.scalar(select(func.count()).select_from(Reminder)) == 0
+                draft = await session.scalar(select(VoiceReminderDraft))
+                assert draft is not None
+                assert draft.reminder_text == "проверить голосовое напоминание"
+                assert draft.datetime_semantics == "instant"
+
+            callback_answers = AsyncMock()
+            callback = SimpleNamespace(
+                data=create_data,
+                message=preview_message,
+                from_user=SimpleNamespace(id=user.telegram_user_id),
+                answer=callback_answers,
+            )
+            await reminders_handler.reminder_callback(callback)
+
+            callback_answers.assert_awaited_once_with("Напоминание сохранено", show_alert=False)
+            async with session_factory() as session:
+                reminders = list((await session.scalars(select(Reminder))).all())
+                assert len(reminders) == 1
+                assert reminders[0].text == "проверить голосовое напоминание"
+                assert (
+                    await session.scalar(select(func.count()).select_from(VoiceReminderDraft)) == 0
+                )
         finally:
             await connection.close()
             await engine.dispose()

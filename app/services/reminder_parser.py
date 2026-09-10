@@ -64,6 +64,11 @@ TODAY_RE = re.compile(r"^напомни\s+сегодня\s+в\s+(\d{1,2})(?::(\d
 TOMORROW_RE = re.compile(r"^напомни\s+завтра\s+в\s+(\d{1,2})(?::(\d{2}))?\s+(.+)$", re.IGNORECASE)
 IN_HOURS_RE = re.compile(r"^напомни\s+через\s+(\d+)\s+час(?:а|ов)?\s+(.+)$", re.IGNORECASE)
 IN_MINUTES_RE = re.compile(r"^напомни\s+через\s+(\d+)\s+мин(?:ут|уты|уту)?\s+(.+)$", re.IGNORECASE)
+_SPOKEN_RELATIVE_RE = re.compile(
+    r"^напомни\s+через\s+(?P<number>[а-яё]+(?:\s+[а-яё]+)?)\s+"
+    r"(?P<unit>час(?:а|ов)?|мин(?:ут|уты|уту)?)\s+(?P<text>.+)$",
+    re.IGNORECASE,
+)
 EVERY_DAY_RE = re.compile(
     r"^напомни\s+каждый\s+день\s+в\s+(\d{1,2})(?::(\d{2}))?\s+(.+)$", re.IGNORECASE
 )
@@ -148,6 +153,54 @@ _MODE_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RUSSIAN_NUMBER_WORDS = {
+    "один": 1,
+    "одна": 1,
+    "одну": 1,
+    "два": 2,
+    "две": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+    "одиннадцать": 11,
+    "двенадцать": 12,
+    "тринадцать": 13,
+    "четырнадцать": 14,
+    "пятнадцать": 15,
+    "шестнадцать": 16,
+    "семнадцать": 17,
+    "восемнадцать": 18,
+    "девятнадцать": 19,
+    "двадцать": 20,
+    "тридцать": 30,
+    "сорок": 40,
+    "пятьдесят": 50,
+    "шестьдесят": 60,
+}
+_RUSSIAN_TENS = {20, 30, 40, 50, 60}
+
+
+def _parse_russian_number_words(value: str) -> int | None:
+    words = value.casefold().replace("ё", "е").split()
+    if not 1 <= len(words) <= 2:
+        return None
+
+    first = _RUSSIAN_NUMBER_WORDS.get(words[0])
+    if first is None:
+        return None
+    if len(words) == 1:
+        return first
+
+    second = _RUSSIAN_NUMBER_WORDS.get(words[1])
+    if first not in _RUSSIAN_TENS or second is None or not 1 <= second <= 9:
+        return None
+    return first + second
+
 
 @dataclass(slots=True)
 class ParsedReminder:
@@ -212,6 +265,27 @@ def _add_elapsed_interval(base_dt: datetime, interval: timedelta) -> datetime:
     if base_dt.tzinfo is None:
         return base_dt + interval
     return (base_dt.astimezone(UTC) + interval).astimezone(base_dt.tzinfo)
+
+
+def _parse_spoken_relative_interval(
+    text: str,
+    now_local: datetime,
+) -> ParsedReminder | None:
+    match = _SPOKEN_RELATIVE_RE.match(text)
+    if match is None:
+        return None
+
+    amount = _parse_russian_number_words(match.group("number"))
+    if amount is None:
+        return None
+
+    unit = match.group("unit").casefold()
+    interval = timedelta(hours=amount) if unit.startswith("час") else timedelta(minutes=amount)
+    return ParsedReminder(
+        local_dt=_add_elapsed_interval(now_local, interval),
+        text=match.group("text").strip(),
+        datetime_semantics="instant",
+    )
 
 
 def _timezone_name(now_local: datetime) -> str:
@@ -913,6 +987,10 @@ def _parse_reminder_input(
             text=reminder_text.strip(),
             datetime_semantics="instant",
         )
+
+    spoken_relative = _parse_spoken_relative_interval(text, now_local)
+    if spoken_relative is not None:
+        return spoken_relative
 
     m = EVERY_DAY_RE.match(text)
     if m:
