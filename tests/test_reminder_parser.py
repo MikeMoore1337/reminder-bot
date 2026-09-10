@@ -129,6 +129,59 @@ def test_spoken_relative_number_words_do_not_normalize_reminder_body(
     assert parsed.text == expected_text
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_text", "amount"),
+    [
+        (
+            "напомни через 5 минут -1 градус",
+            "-1 градус",
+            timedelta(minutes=5),
+        ),
+        (
+            "напомни через пять минут -1 градус",
+            "-1 градус",
+            timedelta(minutes=5),
+        ),
+        (
+            "напомни через 5 минут .env файл",
+            ".env файл",
+            timedelta(minutes=5),
+        ),
+        (
+            "напомни через пять минут .gitignore проверить",
+            ".gitignore проверить",
+            timedelta(minutes=5),
+        ),
+        (
+            "напомни через 5 минут :8080 проверить",
+            ":8080 проверить",
+            timedelta(minutes=5),
+        ),
+        (
+            "напомни через две минуты, -1 градус",
+            "-1 градус",
+            timedelta(minutes=2),
+        ),
+        (
+            "напомни через две минуты. .env файл",
+            ".env файл",
+            timedelta(minutes=2),
+        ),
+    ],
+)
+def test_relative_body_leading_punctuation_is_preserved(
+    command: str,
+    expected_text: str,
+    amount: timedelta,
+) -> None:
+    parsed = parse_reminder_input(command, NOW_LOCAL)
+
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.local_dt == NOW_LOCAL + amount
+    assert parsed.text == expected_text
+    assert parsed.datetime_semantics == "instant"
+
+
 def test_unsupported_relative_number_words_stay_ambiguous() -> None:
     parsed = parse_reminder_input(
         "напомни через сто минут проверить тест",
