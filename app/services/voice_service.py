@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -33,9 +32,7 @@ from app.services.clarification_service import (
 from app.services.recurrence import decode_rule, encode_rule, legacy_rule
 from app.services.reminder_parser import (
     ClarificationRequest,
-    DeadlineRequest,
     ParsedReminder,
-    parse_reminder_input,
 )
 from app.services.reminder_service import (
     MAX_REMINDER_TEXT_LENGTH,
@@ -58,6 +55,7 @@ from app.services.voice_media import (
     new_voice_temp_dir,
     validate_voice_metadata,
 )
+from app.services.voice_transcript import parse_voice_transcript
 from app.utils.datetime_utils import from_utc_to_user, resolve_schedule_datetime, utc_now
 
 logger = logging.getLogger(__name__)
@@ -79,10 +77,6 @@ VOICE_CLARIFICATION_TRANSCRIPT_LIMIT = 1400
 VOICE_CLARIFICATION_PROMPT_LIMIT = 1000
 VOICE_CLARIFICATION_TTL_SUFFIX = "Черновик действует 15 минут. /cancel отменит его."
 VOICE_CORRECTION_EXAMPLE = "напомни через 2 минуты покормить собаку"
-_VOICE_COMMAND_PREFIX_RE = re.compile(
-    r"^(?:напомни|напомню|напомнить)(?:(?:\s*[,.:;—-]\s+|\s+)(.*))?$",
-    re.IGNORECASE,
-)
 
 
 def _stt_public_message(category: str) -> str:
@@ -285,38 +279,6 @@ def _get_stt_semaphore() -> asyncio.Semaphore:
         _stt_semaphore = asyncio.Semaphore(limit)
         _stt_semaphore_limit = limit
     return _stt_semaphore
-
-
-def _canonicalize_voice_command_prefix(transcript: str) -> str | None:
-    match = _VOICE_COMMAND_PREFIX_RE.fullmatch(transcript)
-    if match is None:
-        return None
-    remainder = (match.group(1) or "").strip()
-    return f"напомни {remainder}" if remainder else "напомни"
-
-
-def _voice_parse_candidates(transcript: str) -> list[str]:
-    normalized = transcript.strip()
-    canonical = _canonicalize_voice_command_prefix(normalized)
-    if canonical is not None:
-        return [canonical]
-    if normalized.lower().startswith("/remind"):
-        return [normalized]
-    return [f"напомни {normalized}"]
-
-
-def parse_voice_transcript(
-    transcript: str,
-    *,
-    now_local: datetime,
-) -> tuple[str, ParsedReminder | DeadlineRequest | ClarificationRequest | None]:
-    """Use the deterministic parser; adding the command prefix is explicit and bounded."""
-
-    for candidate in _voice_parse_candidates(transcript):
-        parsed = parse_reminder_input(candidate, now_local=now_local)
-        if parsed is not None:
-            return candidate, parsed
-    return transcript.strip(), None
 
 
 def _prepare_draft_values(
