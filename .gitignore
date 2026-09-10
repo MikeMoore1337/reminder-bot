@@ -181,3 +181,8 @@ stt-models/
 *.mp3
 *.ogg
 *.flac
+
+# Private voice benchmark corpus and generated reports
+/benchmarks/audio/
+/voice-benchmark.json
+/benchmarks/results/
