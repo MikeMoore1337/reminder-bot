@@ -5,6 +5,7 @@ from typing import Any, cast
 
 from sqlalchemy import delete, select
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import ActionDraft, Reminder, ReminderClarification, User, VoiceReminderDraft
 from app.db.session import SessionLocal
@@ -28,17 +29,27 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-async def create_clarification(
-    user: User,
+async def upsert_clarification_in_session(
+    session: AsyncSession,
+    owner: User,
     request: ClarificationRequest,
     *,
-    now_utc: datetime | None = None,
+    now_utc: datetime,
     expires_at: datetime | None = None,
     origin: str = CLARIFICATION_ORIGIN_TEXT,
     voice_transcript: str | None = None,
     source_message_id: int | None = None,
     context_snapshot: MessageContextSnapshot | None = None,
+    clear_action_draft: bool = True,
+    clear_voice_draft: bool = True,
 ) -> ReminderClarification:
+    """Upsert one clarification while the caller owns the surrounding transaction.
+
+    Voice edit transitions use this helper after locking and validating the
+    draft so deleting the preview draft and creating its clarification remain
+    one database transaction.
+    """
+
     raw_text = request.raw_text.strip()
     if not raw_text or len(raw_text) > MAX_CLARIFICATION_TEXT_LENGTH:
         raise ValueError("Запрос на уточнение слишком длинный")
@@ -60,9 +71,74 @@ async def create_clarification(
     )
     if origin == CLARIFICATION_ORIGIN_VOICE and serialized_context is not None:
         raise ValueError("Голосовое уточнение не может содержать Telegram context")
-    current_time = _as_utc(now_utc or datetime.now(UTC))
+    current_time = _as_utc(now_utc)
     expiry = _as_utc(expires_at or (current_time + CLARIFICATION_TTL))
     clarification_mode = normalize_reminder_mode(request.mode)
+
+    if clear_action_draft:
+        await session.execute(
+            delete(ActionDraft).where(
+                ActionDraft.user_id == owner.id,
+                ActionDraft.chat_id == owner.chat_id,
+            )
+        )
+    if clear_voice_draft:
+        await session.execute(
+            delete(VoiceReminderDraft).where(
+                VoiceReminderDraft.user_id == owner.id,
+                VoiceReminderDraft.chat_id == owner.chat_id,
+            )
+        )
+    existing = await session.scalar(
+        select(ReminderClarification)
+        .where(
+            ReminderClarification.user_id == owner.id,
+            ReminderClarification.chat_id == owner.chat_id,
+        )
+        .with_for_update()
+    )
+    if existing is None:
+        existing = ReminderClarification(
+            user_id=owner.id,
+            chat_id=owner.chat_id,
+            origin=origin,
+            voice_transcript=normalized_transcript,
+            source_message_id=normalized_source_id,
+            context_snapshot=serialized_context,
+            mode=clarification_mode,
+            raw_text=raw_text,
+            clarification_type=request.kind,
+            prompt=request.prompt,
+            expires_at=expiry,
+        )
+        session.add(existing)
+    else:
+        existing.origin = origin
+        existing.voice_transcript = normalized_transcript
+        existing.source_message_id = normalized_source_id
+        existing.context_snapshot = serialized_context
+        existing.mode = clarification_mode
+        existing.raw_text = raw_text
+        existing.clarification_type = request.kind
+        existing.prompt = request.prompt
+        existing.expires_at = expiry
+    await session.flush()
+    return existing
+
+
+async def create_clarification(
+    user: User,
+    request: ClarificationRequest,
+    *,
+    now_utc: datetime | None = None,
+    expires_at: datetime | None = None,
+    origin: str = CLARIFICATION_ORIGIN_TEXT,
+    voice_transcript: str | None = None,
+    source_message_id: int | None = None,
+    context_snapshot: MessageContextSnapshot | None = None,
+) -> ReminderClarification:
+    current_time = _as_utc(now_utc or datetime.now(UTC))
+    expiry = _as_utc(expires_at or (current_time + CLARIFICATION_TTL))
 
     async with SessionLocal() as session, session.begin():
         owner = await session.scalar(
@@ -70,53 +146,17 @@ async def create_clarification(
         )
         if owner is None:
             raise ValueError("Пользователь не найден")
-        await session.execute(
-            delete(ActionDraft).where(
-                ActionDraft.user_id == owner.id,
-                ActionDraft.chat_id == owner.chat_id,
-            )
+        return await upsert_clarification_in_session(
+            session,
+            owner,
+            request,
+            now_utc=current_time,
+            expires_at=expiry,
+            origin=origin,
+            voice_transcript=voice_transcript,
+            source_message_id=source_message_id,
+            context_snapshot=context_snapshot,
         )
-        await session.execute(
-            delete(VoiceReminderDraft).where(
-                VoiceReminderDraft.user_id == owner.id,
-                VoiceReminderDraft.chat_id == owner.chat_id,
-            )
-        )
-        existing = await session.scalar(
-            select(ReminderClarification)
-            .where(
-                ReminderClarification.user_id == user.id,
-                ReminderClarification.chat_id == user.chat_id,
-            )
-            .with_for_update()
-        )
-        if existing is None:
-            existing = ReminderClarification(
-                user_id=user.id,
-                chat_id=user.chat_id,
-                origin=origin,
-                voice_transcript=normalized_transcript,
-                source_message_id=normalized_source_id,
-                context_snapshot=serialized_context,
-                mode=clarification_mode,
-                raw_text=raw_text,
-                clarification_type=request.kind,
-                prompt=request.prompt,
-                expires_at=expiry,
-            )
-            session.add(existing)
-        else:
-            existing.origin = origin
-            existing.voice_transcript = normalized_transcript
-            existing.source_message_id = normalized_source_id
-            existing.context_snapshot = serialized_context
-            existing.mode = clarification_mode
-            existing.raw_text = raw_text
-            existing.clarification_type = request.kind
-            existing.prompt = request.prompt
-            existing.expires_at = expiry
-        await session.flush()
-        return existing
 
 
 async def get_active_clarification(

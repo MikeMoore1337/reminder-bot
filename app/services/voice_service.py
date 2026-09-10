@@ -27,6 +27,7 @@ from app.db.session import SessionLocal
 from app.services.clarification_service import (
     CLARIFICATION_ORIGIN_VOICE,
     create_clarification,
+    upsert_clarification_in_session,
 )
 from app.services.recurrence import decode_rule, encode_rule, legacy_rule
 from app.services.reminder_parser import (
@@ -69,6 +70,14 @@ VOICE_FLOW_BUSY_MESSAGE = (
     "Сейчас уже обрабатывается другое голосовое сообщение. Попробуй через несколько секунд."
 )
 VOICE_DRAFT_TTL = timedelta(minutes=15)
+VOICE_PREVIEW_TRANSCRIPT_LIMIT = 1200
+VOICE_PREVIEW_TEXT_LIMIT = 1200
+VOICE_PREVIEW_RECURRENCE_LIMIT = 160
+VOICE_PREVIEW_TIMEZONE_LIMIT = 128
+VOICE_CLARIFICATION_TRANSCRIPT_LIMIT = 1400
+VOICE_CLARIFICATION_PROMPT_LIMIT = 1000
+VOICE_CLARIFICATION_TTL_SUFFIX = "Черновик действует 15 минут. /cancel отменит его."
+VOICE_CORRECTION_EXAMPLE = "напомни через 2 минуты покормить собаку"
 
 
 def _stt_public_message(category: str) -> str:
@@ -172,6 +181,76 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _escape_bounded(value: str, *, max_encoded_length: int) -> str:
+    """Escape user text and keep the resulting HTML within a fixed bound."""
+
+    normalized = value.strip()
+    if not normalized:
+        return "—"
+    escaped = escape(normalized)
+    if len(escaped) <= max_encoded_length:
+        return escaped
+
+    suffix = "…"
+    if max_encoded_length <= len(suffix):
+        return suffix[:max_encoded_length]
+
+    low = 0
+    high = len(normalized)
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = escape(normalized[:middle]) + suffix
+        if len(candidate) <= max_encoded_length:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best or suffix
+
+
+def format_voice_clarification_prompt(
+    transcript: str,
+    parser_prompt: str | None = None,
+) -> str:
+    """Render a private, bounded correction prompt for a voice attempt."""
+
+    prompt = (parser_prompt or "Не удалось уверенно разобрать расписание.").strip()
+    if prompt.endswith(VOICE_CLARIFICATION_TTL_SUFFIX):
+        prompt = prompt[: -len(VOICE_CLARIFICATION_TTL_SUFFIX)].rstrip()
+    return (
+        "🎙 <b>Я распознал голосовое так:</b>\n"
+        f"{_escape_bounded(transcript, max_encoded_length=VOICE_CLARIFICATION_TRANSCRIPT_LIMIT)}\n\n"
+        f"{_escape_bounded(prompt, max_encoded_length=VOICE_CLARIFICATION_PROMPT_LIMIT)}\n\n"
+        "Отправь исправленную полную команду одним сообщением.\n"
+        f"Например: <code>{escape(VOICE_CORRECTION_EXAMPLE)}</code>\n\n"
+        f"{VOICE_CLARIFICATION_TTL_SUFFIX}"
+    )
+
+
+def _voice_clarification_request(
+    request: ClarificationRequest,
+    transcript: str,
+) -> ClarificationRequest:
+    return ClarificationRequest(
+        kind=request.kind,
+        prompt=format_voice_clarification_prompt(transcript, request.prompt),
+        raw_text=request.raw_text[:4096],
+        mode=request.mode,
+    )
+
+
+def _unsupported_voice_clarification_request(
+    candidate: str,
+    transcript: str,
+) -> ClarificationRequest:
+    return ClarificationRequest(
+        kind="unsupported",
+        prompt=format_voice_clarification_prompt(transcript),
+        raw_text=candidate[:4096],
+    )
 
 
 def _voice_limits() -> VoiceMediaLimits:
@@ -532,6 +611,72 @@ async def bind_voice_preview_message(
         return True
 
 
+async def start_voice_draft_correction(
+    user: User,
+    draft_id: int,
+    *,
+    expected_revision: int,
+    expected_message_id: int,
+    now_utc: datetime | None = None,
+) -> ReminderClarification | None:
+    """Atomically replace one validated voice draft with voice clarification."""
+
+    current_time = _as_utc(now_utc or utc_now())
+    async with SessionLocal() as session, session.begin():
+        owner = await session.scalar(
+            select(User).where(User.id == user.id, User.chat_id == user.chat_id).with_for_update()
+        )
+        if owner is None:
+            return None
+
+        draft = await session.scalar(
+            select(VoiceReminderDraft)
+            .where(
+                VoiceReminderDraft.id == draft_id,
+                VoiceReminderDraft.user_id == owner.id,
+                VoiceReminderDraft.chat_id == owner.chat_id,
+                VoiceReminderDraft.action_revision == expected_revision,
+            )
+            .with_for_update()
+        )
+        if draft is None:
+            return None
+        if _as_utc(draft.expires_at) <= current_time:
+            await session.delete(draft)
+            return None
+        if draft.preview_message_id is None or draft.preview_message_id != expected_message_id:
+            return None
+
+        transcript = draft.transcript.strip()
+        if not transcript:
+            return None
+        source_message_id = draft.source_message_id
+        request = ClarificationRequest(
+            kind="voice_correction",
+            prompt=format_voice_clarification_prompt(transcript),
+            raw_text=transcript[:4096],
+        )
+        await session.execute(
+            delete(ActionDraft).where(
+                ActionDraft.user_id == owner.id,
+                ActionDraft.chat_id == owner.chat_id,
+            )
+        )
+        await session.delete(draft)
+        await session.flush()
+        return await upsert_clarification_in_session(
+            session,
+            owner,
+            request,
+            now_utc=current_time,
+            origin=CLARIFICATION_ORIGIN_VOICE,
+            voice_transcript=transcript,
+            source_message_id=source_message_id,
+            clear_action_draft=False,
+            clear_voice_draft=False,
+        )
+
+
 async def confirm_voice_draft(
     user: User,
     draft_id: int,
@@ -690,13 +835,14 @@ def format_voice_draft_preview(draft: VoiceReminderDraft) -> str:
         recurrence = f"{draft.recurrence_type}, интервал {draft.recurrence_interval}"
     return (
         "🎙 <b>Проверь голосовое напоминание</b>\n\n"
-        f"<b>Расшифровка:</b> {escape(draft.transcript)}\n"
-        f"<b>Текст:</b> {escape(draft.reminder_text)}\n"
+        f"<b>Распознано голосом:</b> {_escape_bounded(draft.transcript, max_encoded_length=VOICE_PREVIEW_TRANSCRIPT_LIMIT)}\n"
+        f"<b>Текст:</b> {_escape_bounded(draft.reminder_text, max_encoded_length=VOICE_PREVIEW_TEXT_LIMIT)}\n"
         f"<b>Когда:</b> {local_dt.strftime('%d.%m.%Y %H:%M')}\n"
-        f"<b>Повтор:</b> {escape(recurrence)}\n"
+        f"<b>Повтор:</b> {_escape_bounded(recurrence, max_encoded_length=VOICE_PREVIEW_RECURRENCE_LIMIT)}\n"
         f"<b>Режим:</b> {'важное (с повтором)' if draft.mode == 'persistent' else 'обычное'}\n"
-        f"<b>Часовой пояс:</b> <code>{escape(draft.schedule_timezone)}</code>\n\n"
-        "Нажми «Создать», чтобы сохранить напоминание, или «Отмена»."
+        f"<b>Часовой пояс:</b> <code>{_escape_bounded(draft.schedule_timezone, max_encoded_length=VOICE_PREVIEW_TIMEZONE_LIMIT)}</code>\n\n"
+        "Нажми «Создать», чтобы сохранить напоминание, «Исправить» — чтобы изменить команду, "
+        "или «Отмена»."
     )
 
 
@@ -770,19 +916,30 @@ async def process_voice_message(
             now_local=from_utc_to_user(current_time, user.timezone),
         )
         if isinstance(parsed, ClarificationRequest):
+            voice_request = _voice_clarification_request(parsed, transcript)
             await create_clarification(
                 user,
-                parsed,
+                voice_request,
                 now_utc=current_time,
                 origin=CLARIFICATION_ORIGIN_VOICE,
                 voice_transcript=transcript,
                 source_message_id=source_message_id,
             )
             voice_metrics.parse_clarification += 1
-            return VoiceProcessResult(message=parsed.prompt)
+            return VoiceProcessResult(message=voice_request.prompt)
         if not isinstance(parsed, ParsedReminder):
+            voice_request = _unsupported_voice_clarification_request(candidate, transcript)
+            await create_clarification(
+                user,
+                voice_request,
+                now_utc=current_time,
+                origin=CLARIFICATION_ORIGIN_VOICE,
+                voice_transcript=transcript,
+                source_message_id=source_message_id,
+            )
             voice_metrics.failure("parse", "unsupported")
-            return VoiceProcessResult(message=VOICE_PARSE_FAILURE_MESSAGE)
+            voice_metrics.parse_clarification += 1
+            return VoiceProcessResult(message=voice_request.prompt)
 
         try:
             draft = await create_voice_draft(
