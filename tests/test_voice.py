@@ -730,7 +730,12 @@ def test_unsupported_voice_transcript_keeps_correction_path(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
-def test_voice_edit_transitions_atomically_and_correction_repreviews(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mode", ["normal", "persistent"])
+def test_voice_edit_transitions_atomically_and_correction_repreviews(
+    monkeypatch,
+    tmp_path,
+    mode,
+):
     async def scenario() -> None:
         engine, connection, session_factory = await _open_sqlite(monkeypatch)
         try:
@@ -741,6 +746,7 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(monkeypatch
             parsed = ParsedReminder(
                 local_dt=datetime(2026, 9, 8, 15, 0),
                 text="старый текст",
+                mode=mode,
             )
             draft = await voice_service.create_voice_draft(
                 user,
@@ -749,6 +755,7 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(monkeypatch
                 source_message_id=7300,
                 now_utc=now,
             )
+            assert draft.mode == mode
             assert await voice_service.bind_voice_preview_message(
                 user,
                 draft.id,
@@ -799,6 +806,7 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(monkeypatch
                 assert await session.scalar(select(VoiceReminderDraft)) is None
                 clarification = await session.scalar(select(ReminderClarification))
                 assert clarification is not None
+                assert clarification.mode == mode
                 assert clarification.voice_transcript == draft.transcript
                 assert clarification.source_message_id == 7300
                 assert await session.scalar(select(func.count()).select_from(Reminder)) == 0
@@ -815,6 +823,7 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(monkeypatch
             async with session_factory() as session:
                 corrected = await session.scalar(select(VoiceReminderDraft))
                 assert corrected is not None
+                assert corrected.mode == mode
                 assert corrected.transcript == draft.transcript
                 assert corrected.reminder_text == "проверить исправленное голосовое"
                 assert corrected.preview_message_id == 9500
@@ -822,6 +831,12 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(monkeypatch
                 corrected_revision = corrected.action_revision
                 assert await session.scalar(select(ReminderClarification)) is None
                 assert await session.scalar(select(func.count()).select_from(Reminder)) == 0
+            correction_preview = correction.answer.await_args.args[0]
+            assert (
+                "<b>Режим:</b> важное (с повтором)" in correction_preview
+                if mode == "persistent"
+                else "<b>Режим:</b> обычное" in correction_preview
+            )
 
             created = await voice_service.confirm_voice_draft(
                 user,
@@ -832,6 +847,7 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(monkeypatch
             )
             assert created is not None
             assert created.text == "проверить исправленное голосовое"
+            assert created.mode == mode
             async with session_factory() as session:
                 assert await session.scalar(select(func.count()).select_from(Reminder)) == 1
         finally:

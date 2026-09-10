@@ -655,6 +655,7 @@ async def start_voice_draft_correction(
             kind="voice_correction",
             prompt=format_voice_clarification_prompt(transcript),
             raw_text=transcript[:4096],
+            mode=draft.mode,
         )
         await session.execute(
             delete(ActionDraft).where(
