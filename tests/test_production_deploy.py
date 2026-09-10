@@ -204,6 +204,8 @@ def test_remote_deploy_script_contains_the_production_safety_contract() -> None:
         "--abort-on-container-exit",
         "--exit-code-from migrate",
         "app.services.voice_runtime",
+        "--interactive=false",
+        "< /dev/null",
     )
     for fragment in required_fragments:
         assert fragment in script
@@ -430,8 +432,9 @@ if [[ "${1:-}" == "compose" ]]; then
     exit 42
   fi
   if [[ "${CONSUME_UNSAFE_STDIN:-0}" == "1" \
-    && "$*" == *" exec "* \
-    && "$*" != *"--interactive=false"* ]]; then
+    && ("$*" == *" exec "* || "$*" == *" run "*) \
+    && "$*" != *"--interactive=false"* \
+    && "$(readlink /proc/$$/fd/0)" != "/dev/null" ]]; then
     cat >/dev/null
   fi
   if [[ "$*" == *"config --images"* ]]; then
@@ -569,8 +572,8 @@ def test_deploy_success_uses_exact_image_project_volume_backup_and_marker(tmp_pa
     calls = paths["calls"].read_text(encoding="utf-8")
     assert "compose -p reminder_bot config --quiet" in calls
     assert (
-        "compose -p reminder_bot run --rm --no-deps --entrypoint python bot -m app.services.voice_runtime"
-        in calls
+        "compose -p reminder_bot run --rm --no-deps --interactive=false "
+        "--entrypoint python bot -m app.services.voice_runtime" in calls
     )
     assert "compose -p reminder_bot up -d --no-build db" in calls
     assert "compose -p reminder_bot --profile tools up --no-build --no-deps" in calls
@@ -613,6 +616,32 @@ def test_voice_runtime_preflight_failure_prevents_database_start(tmp_path: Path)
     assert "up -d --no-build db" not in calls
     assert not paths["backup"].exists()
     assert not (paths["state"] / "deployed-sha").exists()
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS, reason="behavioral deployment contract requires Unix bash/flock/git"
+)
+def test_streamed_deploy_cannot_be_truncated_by_voice_preflight_stdin(tmp_path: Path) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, exact_sha, _ = fixture
+
+    result = _run_streamed_deploy(fixture, CONSUME_UNSAFE_STDIN="1")
+
+    assert result.returncode == 0, result.stderr
+    assert f"Deployment verdict: ACTIVE {exact_sha}" in result.stdout
+    assert (paths["state"] / "deployed-sha").read_text(encoding="utf-8") == f"{exact_sha}\n"
+    backups = list(paths["backup"].glob("*_pre-deploy_*.dump"))
+    assert len(backups) == 1
+    calls = paths["calls"].read_text(encoding="utf-8")
+    preflight = (
+        "compose -p reminder_bot run --rm --no-deps --interactive=false "
+        "--entrypoint python bot -m app.services.voice_runtime"
+    )
+    assert preflight in calls
+    assert calls.index("app.services.voice_runtime") < calls.index("up -d --no-build db")
+    assert "pg_dump" in calls
+    assert "migrate" in calls
+    assert "bot worker" in calls
 
 
 @pytest.mark.skipif(

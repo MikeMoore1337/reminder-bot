@@ -126,8 +126,9 @@ validate_existing_volume() {
 }
 
 validate_voice_runtime() {
-  "${compose[@]}" run --rm --no-deps --entrypoint python bot \
+  "${compose[@]}" run --rm --no-deps --interactive=false --entrypoint python bot \
     -m app.services.voice_runtime \
+    < /dev/null \
     || fail "voice runtime preflight failed"
 }
 
