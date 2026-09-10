@@ -93,6 +93,7 @@ from app.services.voice_service import (
     discard_voice_draft,
     format_voice_draft_preview,
     process_voice_message,
+    start_voice_draft_correction,
 )
 from app.utils.datetime_utils import from_utc_to_user, now_in_timezone, utc_now
 from app.workers.reminder_worker import snooze_presets_kb
@@ -398,7 +399,10 @@ async def _handle_clarification(
         )
     )
     if not isinstance(parsed, ParsedReminder):
-        await message.answer(clarification.prompt)
+        if clarification.origin == CLARIFICATION_ORIGIN_VOICE:
+            await message.answer(clarification.prompt, parse_mode="HTML")
+        else:
+            await message.answer(clarification.prompt)
         return True
 
     if context is not None and parsed.text == "__telegram_context__":
@@ -676,6 +680,7 @@ async def _send_voice_preview(
     sent = await message.answer(
         format_voice_draft_preview(draft),
         reply_markup=voice_draft_kb(draft.id, draft.action_revision),
+        parse_mode="HTML",
     )
     preview_message_id = getattr(sent, "message_id", None)
     if not isinstance(preview_message_id, int) or preview_message_id <= 0:
@@ -695,6 +700,7 @@ async def _send_voice_preview(
 async def _handle_voice_callback(callback: CallbackQuery, parsed: ReminderCallback) -> None:
     if parsed.origin != CallbackOrigin.VOICE or parsed.action not in {
         CallbackAction.CREATE,
+        CallbackAction.EDIT,
         CallbackAction.CANCEL,
     }:
         await callback.answer(STALE_FEEDBACK, show_alert=False)
@@ -708,6 +714,20 @@ async def _handle_voice_callback(callback: CallbackQuery, parsed: ReminderCallba
         telegram_user_id=callback.from_user.id,
         chat_id=callback_message.chat.id,
     )
+    if parsed.action == CallbackAction.EDIT:
+        clarification = await start_voice_draft_correction(
+            user,
+            parsed.target_id,
+            expected_revision=parsed.revision,
+            expected_message_id=callback_message.message_id,
+        )
+        if clarification is None:
+            await callback.answer(STALE_FEEDBACK, show_alert=False)
+            return
+        await callback.answer("Отправь исправленную команду", show_alert=False)
+        await _safe_remove_keyboard(callback_message)
+        await callback_message.answer(clarification.prompt, parse_mode="HTML")
+        return
     if parsed.action == CallbackAction.CREATE:
         try:
             reminder = await confirm_voice_draft(
@@ -818,7 +838,7 @@ async def voice_reminder_handler(message: Message, bot: Bot) -> None:
 
     if result.draft is None:
         if result.message:
-            await message.answer(result.message)
+            await message.answer(result.message, parse_mode="HTML")
         return
 
     await _send_voice_preview(message, user, result.draft)
