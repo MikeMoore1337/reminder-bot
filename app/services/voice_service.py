@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -78,6 +79,10 @@ VOICE_CLARIFICATION_TRANSCRIPT_LIMIT = 1400
 VOICE_CLARIFICATION_PROMPT_LIMIT = 1000
 VOICE_CLARIFICATION_TTL_SUFFIX = "Черновик действует 15 минут. /cancel отменит его."
 VOICE_CORRECTION_EXAMPLE = "напомни через 2 минуты покормить собаку"
+_VOICE_COMMAND_PREFIX_RE = re.compile(
+    r"^(?:напомни|напомню|напомнить)(?:(?:\s+|[,.:;—-]\s*)(.*))?$",
+    re.IGNORECASE,
+)
 
 
 def _stt_public_message(category: str) -> str:
@@ -282,9 +287,20 @@ def _get_stt_semaphore() -> asyncio.Semaphore:
     return _stt_semaphore
 
 
+def _canonicalize_voice_command_prefix(transcript: str) -> str | None:
+    match = _VOICE_COMMAND_PREFIX_RE.fullmatch(transcript)
+    if match is None:
+        return None
+    remainder = (match.group(1) or "").strip()
+    return f"напомни {remainder}" if remainder else "напомни"
+
+
 def _voice_parse_candidates(transcript: str) -> list[str]:
     normalized = transcript.strip()
-    if normalized.lower().startswith(("напомни", "/remind")):
+    canonical = _canonicalize_voice_command_prefix(normalized)
+    if canonical is not None:
+        return [canonical]
+    if normalized.lower().startswith("/remind"):
         return [normalized]
     return [f"напомни {normalized}"]
 

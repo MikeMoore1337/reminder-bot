@@ -133,20 +133,48 @@ class _FakeProvider:
 
 
 @pytest.mark.parametrize(
-    ("transcript", "expected_text"),
+    ("transcript", "expected_candidate", "expected_text"),
     [
         (
-            "Напомни через две минуты, проверить голосовое напоминание",
-            "проверить голосовое напоминание",
+            "Напомню, через две минуты проверить голосовое напоминание.",
+            "напомни через две минуты проверить голосовое напоминание.",
+            "проверить голосовое напоминание.",
+        ),
+        (
+            "Напомню через 2 минуты проверить голосовое напоминание.",
+            "напомни через 2 минуты проверить голосовое напоминание.",
+            "проверить голосовое напоминание.",
+        ),
+        (
+            "Напомнить через 2 минуты покормить собаку.",
+            "напомни через 2 минуты покормить собаку.",
+            "покормить собаку.",
+        ),
+        (
+            "Напомнить, через 2 минуты покормить собаку.",
+            "напомни через 2 минуты покормить собаку.",
+            "покормить собаку.",
+        ),
+        (
+            "Напомни через 2 минуты проверить тест",
+            "напомни через 2 минуты проверить тест",
+            "проверить тест",
+        ),
+        (
+            "Напомни, через 2 минуты проверить тест",
+            "напомни через 2 минуты проверить тест",
+            "проверить тест",
         ),
         (
             "Напомни через две минуты. Проверить голосовое напоминание.",
+            "напомни через две минуты. Проверить голосовое напоминание.",
             "Проверить голосовое напоминание.",
         ),
     ],
 )
 def test_voice_transcript_parses_spoken_relative_number_words(
     transcript: str,
+    expected_candidate: str,
     expected_text: str,
 ) -> None:
     now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
@@ -156,13 +184,55 @@ def test_voice_transcript_parses_spoken_relative_number_words(
         now_local=now_local,
     )
 
-    assert candidate == transcript
+    assert candidate == expected_candidate
     assert isinstance(parsed, ParsedReminder)
     assert parsed.local_dt == now_local + timedelta(minutes=2)
     assert parsed.text == expected_text
     assert parsed.recurrence_type == "none"
     assert parsed.mode == "normal"
     assert parsed.datetime_semantics == "instant"
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Я напомню через 2 минуты проверить тест",
+        "Он напомнит через 2 минуты проверить тест",
+        "Напоминание через 2 минуты проверить тест",
+        "Напомнюсь через 2 минуты проверить тест",
+    ],
+)
+def test_voice_alias_normalization_requires_an_exact_first_token(transcript: str) -> None:
+    now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
+
+    candidate, parsed = voice_service.parse_voice_transcript(
+        transcript,
+        now_local=now_local,
+    )
+
+    assert candidate == f"напомни {transcript}"
+    assert isinstance(parsed, ClarificationRequest)
+
+
+def test_voice_alias_without_schedule_stays_in_clarification() -> None:
+    now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
+
+    candidate, parsed = voice_service.parse_voice_transcript(
+        "Напомню купить молоко",
+        now_local=now_local,
+    )
+
+    assert candidate == "напомни купить молоко"
+    assert isinstance(parsed, ClarificationRequest)
+
+
+def test_text_parser_does_not_gain_voice_alias_semantics() -> None:
+    parsed = parse_reminder_input(
+        "напомнить через 2 минуты покормить собаку",
+        datetime(2026, 9, 8, 13, 0, 45, 123456),
+    )
+
+    assert not isinstance(parsed, ParsedReminder)
 
 
 def test_voice_metadata_allowlist_and_limits() -> None:
@@ -256,12 +326,29 @@ def test_voice_process_creates_persistent_preview_draft_and_cleans_media(monkeyp
     asyncio.run(scenario())
 
 
-def test_spoken_relative_voice_handler_keeps_confirmation_gate(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("transcript", "expected_text"),
+    [
+        (
+            "Напомню, через две минуты проверить голосовое напоминание.",
+            "проверить голосовое напоминание.",
+        ),
+        (
+            "Напомню, через 2 минуты проверить голосовое напоминание.",
+            "проверить голосовое напоминание.",
+        ),
+    ],
+)
+def test_spoken_relative_voice_handler_keeps_confirmation_gate(
+    monkeypatch,
+    tmp_path,
+    transcript,
+    expected_text,
+):
     async def scenario() -> None:
         engine, connection, session_factory = await _open_sqlite(monkeypatch)
         try:
             now = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
-            transcript = "Напомни через две минуты, проверить голосовое напоминание"
             monkeypatch.setattr(voice_service, "settings", _settings(tmp_path))
             monkeypatch.setattr(voice_service, "utc_now", lambda: now)
             voice_service.voice_metrics = voice_service.VoiceMetrics()
@@ -308,8 +395,13 @@ def test_spoken_relative_voice_handler_keeps_confirmation_gate(monkeypatch, tmp_
             assert metrics["parse_success"] == 1
             message_answers.assert_awaited_once()
             preview_text = message_answers.await_args.args[0]
-            assert "проверить голосовое напоминание" in preview_text
+            assert f"<b>Распознано голосом:</b> {transcript}" in preview_text
             markup = message_answers.await_args.kwargs["reply_markup"]
+            assert [button.text for row in markup.inline_keyboard for button in row] == [
+                "✅ Создать",
+                "✏️ Исправить",
+                "❌ Отмена",
+            ]
             create_data = markup.inline_keyboard[0][0].callback_data
             parsed_callback = parse_callback(create_data)
             assert parsed_callback is not None
@@ -319,7 +411,9 @@ def test_spoken_relative_voice_handler_keeps_confirmation_gate(monkeypatch, tmp_
                 assert await session.scalar(select(func.count()).select_from(Reminder)) == 0
                 draft = await session.scalar(select(VoiceReminderDraft))
                 assert draft is not None
-                assert draft.reminder_text == "проверить голосовое напоминание"
+                assert draft.transcript == transcript
+                assert draft.reminder_text == expected_text
+                assert draft.remind_at_utc.replace(tzinfo=UTC) == now + timedelta(minutes=2)
                 assert draft.datetime_semantics == "instant"
                 assert draft.recurrence_type == "none"
                 assert draft.mode == "normal"
@@ -337,7 +431,7 @@ def test_spoken_relative_voice_handler_keeps_confirmation_gate(monkeypatch, tmp_
             async with session_factory() as session:
                 reminders = list((await session.scalars(select(Reminder))).all())
                 assert len(reminders) == 1
-                assert reminders[0].text == "проверить голосовое напоминание"
+                assert reminders[0].text == expected_text
                 assert (
                     await session.scalar(select(func.count()).select_from(VoiceReminderDraft)) == 0
                 )
@@ -694,7 +788,7 @@ def test_unsupported_voice_transcript_keeps_correction_path(monkeypatch, tmp_pat
         engine, connection, session_factory = await _open_sqlite(monkeypatch)
         try:
             now = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
-            transcript = "Напомнить через 2 минуты покормить собаку."
+            transcript = "Напоминание через 2 минуты покормить собаку."
             monkeypatch.setattr(voice_service, "settings", _settings(tmp_path))
 
             async def fake_convert(
