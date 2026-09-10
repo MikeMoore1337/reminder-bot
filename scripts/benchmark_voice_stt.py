@@ -658,6 +658,13 @@ def _percent_stats(values: Sequence[float]) -> dict[str, Any]:
     }
 
 
+def _mean_stats(values: Sequence[float]) -> dict[str, Any]:
+    return {
+        "count": len(values),
+        "mean": sum(values) / len(values) if values else None,
+    }
+
+
 def aggregate_results(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate quality, product, error, latency, RSS, and CPU metrics by model."""
 
@@ -703,6 +710,8 @@ def aggregate_results(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             for record in model_records
             if record["stt_latency_ms"] is not None
         ]
+        wers = [float(record["wer"]) for record in model_records if record.get("wer") is not None]
+        cers = [float(record["cer"]) for record in model_records if record.get("cer") is not None]
         rss_values = [
             int(record["peak_rss_bytes"])
             for record in model_records
@@ -761,6 +770,8 @@ def aggregate_results(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "crash_count": error_counts.get("crashed", 0),
             "error_count": len(errors),
             "error_counts": error_counts,
+            "wer": _mean_stats(wers),
+            "cer": _mean_stats(cers),
             "stt_latency_ms": _latency_stats(latencies),
             "stt_process_wall_seconds": _seconds_stats(process_wall_values),
             "stt_cpu_user_seconds": _seconds_stats(cpu_user_values),

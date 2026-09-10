@@ -331,6 +331,8 @@ def test_aggregate_results_reports_quality_errors_latency_and_rss() -> None:
             "status": "ok",
             "product": product,
             "stt_latency_ms": 100.0,
+            "wer": 0.1,
+            "cer": 0.05,
             "peak_rss_bytes": 1000,
             "error": None,
         },
@@ -339,6 +341,8 @@ def test_aggregate_results_reports_quality_errors_latency_and_rss() -> None:
             "status": "error",
             "product": error_product,
             "stt_latency_ms": 200.0,
+            "wer": 0.3,
+            "cer": 0.15,
             "peak_rss_bytes": None,
             "error": {"category": "timeout"},
         },
@@ -349,6 +353,8 @@ def test_aggregate_results_reports_quality_errors_latency_and_rss() -> None:
     assert summary["fully_correct_reminder_interpretation_rate"] == pytest.approx(0.5)
     assert summary["parser_success_rate"] == pytest.approx(0.5)
     assert summary["timeout_count"] == 1
+    assert summary["wer"]["mean"] == pytest.approx(0.2)
+    assert summary["cer"]["mean"] == pytest.approx(0.1)
     assert summary["stt_latency_ms"]["p95_ms"] == 200.0
     assert summary["peak_rss_bytes_max"] == 1000
 
