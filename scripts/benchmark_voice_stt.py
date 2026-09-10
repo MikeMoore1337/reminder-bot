@@ -52,6 +52,7 @@ DEFAULT_CONVERSION_TIMEOUT_SECONDS = 30
 DEFAULT_THREADS = 2
 DEFAULT_MAX_FILE_SIZE_BYTES = 10_000_000
 DEFAULT_MAX_DURATION_SECONDS = 120
+PROCESS_RESOURCE_SAMPLE_INTERVAL_SECONDS = 0.02
 
 ProductKind = Literal["parsed", "deadline", "clarification", "unparsed"]
 ParsedValue = ParsedReminder | DeadlineRequest
@@ -898,6 +899,8 @@ class _ProcessResourceMonitor:
         self._first_cpu_ticks: tuple[int, int] | None = None
         self._last_cpu_ticks: tuple[int, int] | None = None
         self._last_cpu_sample_at: float | None = None
+        self._utilization_cpu_seconds = 0.0
+        self._utilization_wall_seconds = 0.0
         self._utilization_percent: list[float] = []
 
     @property
@@ -988,11 +991,12 @@ class _ProcessResourceMonitor:
         ):
             return
         elapsed = observed_at - self._last_cpu_sample_at
-        if elapsed > 0 and self._clock_ticks_per_second:
+        if elapsed >= PROCESS_RESOURCE_SAMPLE_INTERVAL_SECONDS and self._clock_ticks_per_second:
             delta_ticks = sum(cpu_ticks) - sum(self._last_cpu_ticks)
-            self._utilization_percent.append(
-                (delta_ticks / self._clock_ticks_per_second) / elapsed * 100
-            )
+            delta_cpu_seconds = delta_ticks / self._clock_ticks_per_second
+            self._utilization_cpu_seconds += delta_cpu_seconds
+            self._utilization_wall_seconds += elapsed
+            self._utilization_percent.append(delta_cpu_seconds / elapsed * 100)
         self._last_cpu_ticks = cpu_ticks
         self._last_cpu_sample_at = observed_at
 
@@ -1004,7 +1008,7 @@ class _ProcessResourceMonitor:
                 self.sample()
                 if self._process.returncode is not None:
                     return
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(PROCESS_RESOURCE_SAMPLE_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             return
 
@@ -1046,8 +1050,8 @@ class _ProcessResourceMonitor:
             cpu_time_wall_ratio = cpu_total_seconds / process_wall_seconds
         mean_utilization = None
         peak_utilization = None
-        if self._utilization_percent:
-            mean_utilization = sum(self._utilization_percent) / len(self._utilization_percent)
+        if self._utilization_wall_seconds > 0:
+            mean_utilization = self._utilization_cpu_seconds / self._utilization_wall_seconds * 100
             peak_utilization = max(self._utilization_percent)
 
         return _ProcessMeasurement(

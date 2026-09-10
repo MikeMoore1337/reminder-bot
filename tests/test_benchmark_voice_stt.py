@@ -266,6 +266,29 @@ def test_process_resource_monitor_keeps_last_cpu_sample_after_proc_disappears(
     assert measurement.cpu_utilization_peak_percent == pytest.approx(60.0)
 
 
+def test_process_resource_monitor_ignores_sub_interval_utilization_sample() -> None:
+    class FakeProcess:
+        pid = 42
+        returncode = None
+
+        async def wait(self) -> int:
+            return 0
+
+    monitor = benchmark_voice_stt._ProcessResourceMonitor(
+        measure_rss=False,
+        clock_ticks_per_second=100,
+        procfs_available=True,
+    )
+    monitor._process = FakeProcess()  # type: ignore[assignment]
+    monitor._record_cpu_sample(10.0, (100, 50))
+    monitor._record_cpu_sample(10.001, (110, 60))
+    measurement = monitor.snapshot()
+
+    assert measurement.cpu_total_seconds == pytest.approx(0.2)
+    assert measurement.cpu_utilization_mean_percent is None
+    assert measurement.cpu_utilization_peak_percent is None
+
+
 def test_product_score_compares_schedule_and_body_against_ground_truth() -> None:
     expected = _product()
     correct = ParsedReminder(
