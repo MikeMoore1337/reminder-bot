@@ -812,7 +812,7 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(
                 assert await session.scalar(select(func.count()).select_from(Reminder)) == 0
 
             correction = SimpleNamespace(
-                text="напомни через 2 минуты проверить исправленное голосовое",
+                text="напомни через 2 минуты проверить голосовое напоминание",
                 answer=AsyncMock(return_value=SimpleNamespace(message_id=9500)),
             )
             assert await reminders_handler._handle_clarification(
@@ -825,7 +825,7 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(
                 assert corrected is not None
                 assert corrected.mode == mode
                 assert corrected.transcript == draft.transcript
-                assert corrected.reminder_text == "проверить исправленное голосовое"
+                assert corrected.reminder_text == "проверить голосовое напоминание"
                 assert corrected.preview_message_id == 9500
                 corrected_id = corrected.id
                 corrected_revision = corrected.action_revision
@@ -846,7 +846,7 @@ def test_voice_edit_transitions_atomically_and_correction_repreviews(
                 now_utc=now,
             )
             assert created is not None
-            assert created.text == "проверить исправленное голосовое"
+            assert created.text == "проверить голосовое напоминание"
             assert created.mode == mode
             async with session_factory() as session:
                 assert await session.scalar(select(func.count()).select_from(Reminder)) == 1
