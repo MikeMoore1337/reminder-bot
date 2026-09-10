@@ -2,24 +2,30 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
+import scripts.benchmark_voice_stt as benchmark_voice_stt
 from app.services.reminder_parser import ClarificationRequest, ParsedReminder
 from app.services.speech_to_text import SpeechToTextError
+from app.services.voice_transcript import parse_voice_transcript
 from scripts.benchmark_voice_stt import (
     BenchmarkConfig,
     BenchmarkInputError,
     BenchmarkManifest,
+    BenchmarkOutputError,
     BenchmarkSample,
     ExpectedProduct,
     aggregate_results,
     character_error_rate,
     load_manifest,
+    main,
     run_benchmark,
     score_product,
     validate_benchmark_inputs,
     word_error_rate,
+    write_report,
 )
 
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
@@ -82,6 +88,112 @@ def test_load_manifest_parses_explicit_product_ground_truth(tmp_path: Path) -> N
     assert manifest.samples[0].expected_product is not None
     assert manifest.samples[0].expected_product.body == "проверить голосовое напоминание"
     assert manifest.samples[0].now_local == NOW
+
+
+def test_load_manifest_binds_helsinki_dst_datetimes_and_scores_parser_result(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "helsinki.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "timezone": "Europe/Helsinki",
+                "now_local": "2026-10-24T12:00:00+03:00",
+                "samples": [
+                    {
+                        "file": "dst.ogg",
+                        "expected": "Напомни завтра в 9 утра проверить тест",
+                        "tags": ["dst"],
+                        "expected_product": {
+                            "kind": "parsed",
+                            "local_datetime": "2026-10-25T09:00:00+02:00",
+                            "datetime_semantics": "wall_clock",
+                            "body": "утра проверить тест",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = load_manifest(path)
+    sample = manifest.samples[0]
+    expected_product = sample.expected_product
+
+    assert isinstance(sample.now_local.tzinfo, ZoneInfo)
+    assert sample.now_local.tzinfo.key == "Europe/Helsinki"
+    assert sample.now_local.utcoffset() == timedelta(hours=3)
+    assert expected_product is not None
+    assert expected_product.local_datetime is not None
+    assert isinstance(expected_product.local_datetime.tzinfo, ZoneInfo)
+    assert expected_product.local_datetime.tzinfo.key == "Europe/Helsinki"
+    assert expected_product.local_datetime.utcoffset() == timedelta(hours=2)
+
+    _, parsed = parse_voice_transcript(
+        sample.expected,
+        now_local=sample.now_local,
+    )
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.local_dt == expected_product.local_datetime
+    assert score_product(expected_product, parsed)["schedule_correct"] is True
+    assert score_product(expected_product, parsed)["fully_correct"] is True
+
+
+def test_load_manifest_binds_normal_moscow_datetime_to_zoneinfo(tmp_path: Path) -> None:
+    path = tmp_path / "moscow.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "timezone": "Europe/Moscow",
+                "now_local": "2026-09-10T12:00:00+03:00",
+                "samples": [
+                    {
+                        "file": "01.ogg",
+                        "expected": "Напомни завтра в 9 проверить тест",
+                        "expected_product": {
+                            "kind": "parsed",
+                            "local_datetime": "2026-09-11T09:00:00+03:00",
+                            "datetime_semantics": "wall_clock",
+                            "body": "проверить тест",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sample = load_manifest(path).samples[0]
+
+    assert isinstance(sample.now_local.tzinfo, ZoneInfo)
+    assert sample.now_local.tzinfo.key == "Europe/Moscow"
+    assert sample.now_local.utcoffset() == timedelta(hours=3)
+    assert sample.expected_product is not None
+    _, parsed = parse_voice_transcript(sample.expected, now_local=sample.now_local)
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.local_dt.utcoffset() == timedelta(hours=3)
+    assert score_product(sample.expected_product, parsed)["fully_correct"] is True
+
+
+def test_load_manifest_rejects_incompatible_explicit_timezone_offset(tmp_path: Path) -> None:
+    path = tmp_path / "incompatible.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "timezone": "Europe/Helsinki",
+                "now_local": "2026-10-24T12:00:00+02:00",
+                "samples": [{"file": "01.ogg", "expected": "x"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BenchmarkInputError, match="offset"):
+        load_manifest(path)
 
 
 @pytest.mark.parametrize(
@@ -295,3 +407,60 @@ def test_run_benchmark_counts_timeout_without_real_runtime(tmp_path: Path) -> No
     assert record["error"] == {"stage": "stt", "category": "timeout"}
     assert summary["timeout_count"] == 1
     assert summary["fully_correct_reminder_interpretation_rate"] == 0
+
+
+def test_write_report_creates_nested_output_directory(tmp_path: Path) -> None:
+    output = tmp_path / "nested" / "results" / "report.json"
+
+    write_report(output, {"status": "ok", "records": []})
+
+    assert json.loads(output.read_text(encoding="utf-8")) == {"status": "ok", "records": []}
+
+
+def test_write_report_fails_safely_for_directory_target(tmp_path: Path) -> None:
+    output = tmp_path / "existing-directory"
+    output.mkdir()
+
+    with pytest.raises(BenchmarkOutputError):
+        write_report(output, {"status": "ok"})
+
+
+def test_main_returns_two_for_unwritable_output_without_leaking_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "timezone": "UTC",
+                "now_local": "2026-09-10T12:00:00+00:00",
+                "samples": [{"file": "01.ogg", "expected": "x"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    output = tmp_path / "existing-directory"
+    output.mkdir()
+
+    async def fake_run_benchmark(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"status": "ok"}
+
+    monkeypatch.setattr(benchmark_voice_stt, "run_benchmark", fake_run_benchmark)
+
+    result = main(
+        [
+            "--manifest",
+            str(manifest),
+            "--model",
+            str(model),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert capsys.readouterr().err.strip() == "benchmark output cannot be written"

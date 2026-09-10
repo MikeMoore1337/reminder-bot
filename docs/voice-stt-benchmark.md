@@ -19,8 +19,16 @@
    заполните вручную по требуемому поведению продукта: ожидаемые локальные
    дата/время, семантика времени и body. Это ground truth, а не результат
    текущего parser.
-5. Укажите фиксированный `now_local` с offset. Он нужен для воспроизводимого
-   сравнения relative schedule.
+5. Укажите фиксированный `now_local` в объявленном IANA `timezone`. Manifest
+   datetime (`now_local` и `expected_product.local_datetime`) — это локальное
+   wall-clock значение: naive строка привязывается к `ZoneInfo`, а явный offset
+   должен быть допустимым offset этой зоны в указанную
+   дату. Несовместимый явный offset или невозможное локальное время с явным
+   offset отклоняются с безопасной validation error; это не бесшумная
+   конвертация в другой instant. Для naive DST gap используется production
+   policy (сдвиг вперёд), ambiguous time без offset выбирает более раннее
+   occurrence, а с offset сохраняет указанное occurrence. Это нужно для
+   воспроизводимого сравнения relative schedule и переходов DST.
 
 В example manifest уже есть 12 строк, включая relative intervals, spoken
 number, absolute time, короткую фразу с числом, negative case без schedule и
@@ -41,6 +49,9 @@ python scripts/benchmark_voice_stt.py --manifest voice-benchmark.json --samples-
 `--samples-dir` — корень для относительных `file` из manifest. Поддерживаются
 `.wav`, `.ogg` и `.opus`; каждый файл и model должен существовать, быть
 непустым, а sample path не может выйти за пределы этого каталога.
+Если указан `--output`, benchmark автоматически создаёт отсутствующие parent
+directories перед записью JSON; при невозможности записи завершает работу с
+безопасной ошибкой и кодом `2`.
 
 Каждый sample сначала проходит тот же production
 `convert_voice_to_wav`: mono, 16 kHz, signed 16-bit PCM WAV, с теми же

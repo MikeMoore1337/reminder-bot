@@ -15,11 +15,12 @@ import time
 import unicodedata
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -41,7 +42,7 @@ from app.services.voice_media import (
     convert_voice_to_wav,
 )
 from app.services.voice_transcript import parse_voice_transcript
-from app.utils.datetime_utils import validate_timezone
+from app.utils.datetime_utils import localize_in_timezone, validate_timezone
 
 ALLOWED_AUDIO_SUFFIXES = frozenset({".wav", ".ogg", ".opus"})
 DEFAULT_LANGUAGE = "ru"
@@ -59,6 +60,10 @@ Converter = Callable[[Path, Path, VoiceMediaLimits], Awaitable[int]]
 
 class BenchmarkInputError(ValueError):
     """Safe, deterministic validation error for benchmark inputs."""
+
+
+class BenchmarkOutputError(RuntimeError):
+    """Safe report-output error without exposing filesystem details."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +133,60 @@ def _parse_iso_datetime(value: Any, field: str) -> datetime:
         raise BenchmarkInputError(f"{field} имеет некорректный ISO datetime") from exc
 
 
-def _parse_expected_product(value: Any, field: str) -> ExpectedProduct:
+def _valid_local_offsets(local_dt: datetime, timezone: ZoneInfo) -> frozenset[timedelta]:
+    offsets: set[timedelta] = set()
+    for fold in (0, 1):
+        candidate = local_dt.replace(tzinfo=timezone, fold=fold)
+        round_trip = candidate.astimezone(UTC).astimezone(timezone)
+        if round_trip.replace(tzinfo=None) != local_dt:
+            continue
+        offset = candidate.utcoffset()
+        if offset is not None:
+            offsets.add(offset)
+    return frozenset(offsets)
+
+
+def _bind_datetime_to_timezone(
+    value: datetime,
+    timezone_name: str,
+    field: str,
+) -> datetime:
+    """Bind a manifest wall-clock datetime to its declared IANA timezone.
+
+    Naive values use the production DST policy. An explicit offset must match a
+    valid occurrence in the declared zone; otherwise the manifest fails closed.
+    """
+
+    timezone = ZoneInfo(timezone_name)
+    local_value = value.replace(tzinfo=None)
+    if value.tzinfo is not None:
+        supplied_offset = value.utcoffset()
+        valid_offsets = _valid_local_offsets(local_value, timezone)
+        if supplied_offset is None or not valid_offsets:
+            raise BenchmarkInputError(
+                f"{field} содержит недопустимое локальное время для timezone {timezone_name}"
+            )
+        if supplied_offset not in valid_offsets:
+            raise BenchmarkInputError(
+                f"{field} имеет несовместимый offset для timezone {timezone_name}"
+            )
+        for fold in (0, 1):
+            candidate = local_value.replace(tzinfo=timezone, fold=fold)
+            if candidate.utcoffset() == supplied_offset:
+                return candidate
+
+    try:
+        return localize_in_timezone(local_value, timezone_name)
+    except ValueError as exc:
+        raise BenchmarkInputError(f"{field} нельзя привязать к timezone {timezone_name}") from exc
+
+
+def _parse_expected_product(
+    value: Any,
+    field: str,
+    *,
+    timezone: str,
+) -> ExpectedProduct:
     if not isinstance(value, dict):
         raise BenchmarkInputError(f"{field} должен быть объектом")
 
@@ -152,7 +210,11 @@ def _parse_expected_product(value: Any, field: str) -> ExpectedProduct:
             raise BenchmarkInputError(f"{field}.body обязателен для parsed/deadline")
         if local_datetime is None:
             raise BenchmarkInputError(f"{field}.local_datetime обязателен для parsed/deadline")
-        parsed_local_datetime = _parse_iso_datetime(local_datetime, f"{field}.local_datetime")
+        parsed_local_datetime = _bind_datetime_to_timezone(
+            _parse_iso_datetime(local_datetime, f"{field}.local_datetime"),
+            timezone,
+            f"{field}.local_datetime",
+        )
         if datetime_semantics not in {"wall_clock", "instant"}:
             raise BenchmarkInputError(
                 f"{field}.datetime_semantics должен быть wall_clock или instant"
@@ -251,17 +313,26 @@ def load_manifest(path: Path) -> BenchmarkManifest:
             raise BenchmarkInputError(f"{field}.timezone неизвестен") from exc
         if now_value is None:
             raise BenchmarkInputError(f"{field}.now_local обязателен")
-        now_local = (
+        parsed_now_local = (
             now_value
             if isinstance(now_value, datetime)
             else _parse_iso_datetime(now_value, f"{field}.now_local")
+        )
+        now_local = _bind_datetime_to_timezone(
+            parsed_now_local,
+            timezone,
+            f"{field}.now_local",
         )
 
         explicit_product = raw_sample.get("expected_product")
         expected_product = (
             None
             if explicit_product is None
-            else _parse_expected_product(explicit_product, f"{field}.expected_product")
+            else _parse_expected_product(
+                explicit_product,
+                f"{field}.expected_product",
+                timezone=timezone,
+            )
         )
         samples.append(
             BenchmarkSample(
@@ -382,6 +453,20 @@ def character_error_rate(reference: str, hypothesis: str) -> float:
     hypothesis_chars = list(_normalize_metric_text(hypothesis))
     denominator = max(len(reference_chars), 1)
     return _edit_distance(reference_chars, hypothesis_chars) / denominator
+
+
+def write_report(path: Path, report: dict[str, Any]) -> None:
+    """Write a JSON report, creating only the requested output parents."""
+
+    try:
+        output_path = path.expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise BenchmarkOutputError from exc
 
 
 def _datetime_key(value: datetime) -> str:
@@ -906,13 +991,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"benchmark input error: {exc}", file=sys.stderr)
         return 2
 
-    rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output is None:
+        rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
         print(rendered, end="")
     else:
         try:
-            args.output.expanduser().write_text(rendered, encoding="utf-8")
-        except OSError:
+            write_report(args.output, report)
+        except BenchmarkOutputError:
             print("benchmark output cannot be written", file=sys.stderr)
             return 2
     return 0
