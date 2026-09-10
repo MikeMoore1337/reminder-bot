@@ -62,11 +62,19 @@ _NATURAL_DEADLINE_RE = re.compile(
 
 TODAY_RE = re.compile(r"^напомни\s+сегодня\s+в\s+(\d{1,2})(?::(\d{2}))?\s+(.+)$", re.IGNORECASE)
 TOMORROW_RE = re.compile(r"^напомни\s+завтра\s+в\s+(\d{1,2})(?::(\d{2}))?\s+(.+)$", re.IGNORECASE)
-IN_HOURS_RE = re.compile(r"^напомни\s+через\s+(\d+)\s+час(?:а|ов)?\s+(.+)$", re.IGNORECASE)
-IN_MINUTES_RE = re.compile(r"^напомни\s+через\s+(\d+)\s+мин(?:ут|уты|уту)?\s+(.+)$", re.IGNORECASE)
+_RELATIVE_BODY_SEPARATOR = r"(?:\s*[,.:;—-]\s*|\s+)"
+IN_HOURS_RE = re.compile(
+    rf"^напомни\s+через\s+(\d+)\s+час(?:а|ов)?{_RELATIVE_BODY_SEPARATOR}(.+)$",
+    re.IGNORECASE,
+)
+IN_MINUTES_RE = re.compile(
+    rf"^напомни\s+через\s+(\d+)\s+мин(?:ут|уты|уту)?{_RELATIVE_BODY_SEPARATOR}(.+)$",
+    re.IGNORECASE,
+)
 _SPOKEN_RELATIVE_RE = re.compile(
     r"^напомни\s+через\s+(?P<number>[а-яё]+(?:\s+[а-яё]+)?)\s+"
-    r"(?P<unit>час(?:а|ов)?|мин(?:ут|уты|уту)?)\s+(?P<text>.+)$",
+    rf"(?P<unit>час(?:а|ов)?|мин(?:ут|уты|уту)?){_RELATIVE_BODY_SEPARATOR}"
+    r"(?P<text>.+)$",
     re.IGNORECASE,
 )
 EVERY_DAY_RE = re.compile(

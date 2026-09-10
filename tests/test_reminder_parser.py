@@ -8,6 +8,38 @@ from app.services.reminder_parser import ClarificationRequest, ParsedReminder, p
 NOW_LOCAL = datetime(2026, 1, 1, 12, 0, 45, 123456, tzinfo=ZoneInfo("Europe/Moscow"))
 
 
+@pytest.mark.parametrize("separator", [" ", ", ", ". ", ": ", "; ", " - ", " — "])
+def test_spoken_relative_interval_accepts_bounded_body_separators(separator: str) -> None:
+    parsed = parse_reminder_input(
+        f"напомни через две минуты{separator}проверить тест",
+        NOW_LOCAL,
+    )
+
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.local_dt == NOW_LOCAL + timedelta(minutes=2)
+    assert parsed.text == "проверить тест"
+    assert parsed.datetime_semantics == "instant"
+
+
+@pytest.mark.parametrize(
+    ("command", "amount"),
+    [
+        ("напомни через 2 минуты, проверить тест", timedelta(minutes=2)),
+        ("напомни через 2 часа. проверить тест", timedelta(hours=2)),
+    ],
+)
+def test_digit_relative_interval_accepts_bounded_body_separators(
+    command: str,
+    amount: timedelta,
+) -> None:
+    parsed = parse_reminder_input(command, NOW_LOCAL)
+
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.local_dt == NOW_LOCAL + amount
+    assert parsed.text == "проверить тест"
+    assert parsed.datetime_semantics == "instant"
+
+
 @pytest.mark.parametrize(
     ("number_words", "unit", "amount"),
     [
@@ -69,15 +101,32 @@ def test_spoken_relative_number_forms_are_deterministically_bounded(
     assert parsed.text == "bounded test"
 
 
-def test_spoken_relative_number_words_do_not_normalize_reminder_body() -> None:
-    parsed = parse_reminder_input(
-        "напомни через две минуты купить две бутылки воды",
-        NOW_LOCAL,
-    )
+@pytest.mark.parametrize(
+    ("command", "expected_text"),
+    [
+        (
+            "напомни через две минуты купить две бутылки воды",
+            "купить две бутылки воды",
+        ),
+        (
+            "напомни через две минуты, купить две бутылки воды",
+            "купить две бутылки воды",
+        ),
+        (
+            "напомни через две минуты, купить молоко, хлеб и воду",
+            "купить молоко, хлеб и воду",
+        ),
+    ],
+)
+def test_spoken_relative_number_words_do_not_normalize_reminder_body(
+    command: str,
+    expected_text: str,
+) -> None:
+    parsed = parse_reminder_input(command, NOW_LOCAL)
 
     assert isinstance(parsed, ParsedReminder)
     assert parsed.local_dt == NOW_LOCAL + timedelta(minutes=2)
-    assert parsed.text == "купить две бутылки воды"
+    assert parsed.text == expected_text
 
 
 def test_unsupported_relative_number_words_stay_ambiguous() -> None:
