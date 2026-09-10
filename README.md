@@ -290,8 +290,9 @@ GitHub Actions запускается для PR в `master` и push в `master` 
 - `quality` — Python 3.12, dev lock, Ruff check/format и mypy;
 - `tests-postgres` — Python 3.12, PostgreSQL 16 service, полный pytest, миграционный upgrade/
   downgrade/re-upgrade и PostgreSQL concurrency tests;
-- `docker-smoke` — production image build, Compose config/migration validation и проверка
-  отсутствия dev tools в runtime image без Telegram API.
+- `docker-smoke` — production image build, Compose config/migration validation,
+  synthetic OGG/Opus -> mono 16 kHz PCM WAV voice preflight и проверка отсутствия
+  dev tools в runtime image без Telegram API.
 
 Lock freshness проверяется пересборкой обоих lockfiles и `git diff --exit-code`. CI не использует
 production secrets или production database.

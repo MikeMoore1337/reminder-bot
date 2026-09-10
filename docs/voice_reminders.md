@@ -32,8 +32,9 @@ STT выключен, пока не задан путь к модели; remote 
 
 ## Модель и bootstrap
 
-Модель, бинарник `whisper.cpp` и совместимый `ffmpeg` должны быть установлены
-владельцем вне Git и вне runtime temp directory. Используйте multilingual
+Модель и бинарник `whisper.cpp` должны быть установлены владельцем вне Git и
+вне runtime temp directory. Конвертер `ffmpeg` входит в immutable application
+image и проверяется до rollout. Используйте multilingual
 `base` либо конфигурируемый `tiny`/quantized low-resource вариант; `.en` модели
 для русского потока не подходят.
 
@@ -42,7 +43,6 @@ Compose поддерживает один лёгкий host runtime bundle, на
 
 ```text
 voice-runtime/
-  bin/ffmpeg
   bin/whisper-cli
   models/ggml-base.bin
 ```
@@ -60,15 +60,17 @@ VOICE_STT_COMMAND=/opt/reminder-bot/voice/bin/whisper-cli
 VOICE_STT_MODEL_PATH=/opt/reminder-bot/voice/models/ggml-base.bin
 VOICE_STT_LANGUAGE=ru
 VOICE_STT_THREADS=2
-VOICE_CONVERSION_COMMAND=/opt/reminder-bot/voice/bin/ffmpeg
 VOICE_TEMP_DIR=/var/lib/reminder-bot/voice-temp
 ```
 
 `VOICE_STT_COMMAND` разбирается как argv и запускается с `shell=False`. Не
 вставляйте в него shell pipelines, secrets или пользовательские значения.
-Базовый runtime image намеренно не содержит optional media stack и не
-подменяет host bundle. Команда конвертера разбирается в argv и не проходит
-через shell.
+Compose задаёт `VOICE_CONVERSION_COMMAND=/usr/bin/ffmpeg` из application image;
+значение из production `.env` не используется для converter path. Команда
+конвертера разбирается в argv и не проходит через shell. До production rollout
+deploy script запускает bounded synthetic OGG/Opus -> mono 16 kHz PCM WAV
+preflight; при отключённом STT он пропускается, а при включённом и сломанном
+runtime deployment завершается до `ACTIVE`.
 
 Production secrets, model installation, `DEPLOY_ENABLED`, первый deploy и
 production database operations остаются owner-only. Этот документ не является
@@ -91,4 +93,6 @@ production database operations остаются owner-only. Этот докум�
 
 Счётчики и bounded latency buckets доступны администраторской статистике:
 download/conversion/STT/parse/confirmation/cancellation/cleanup. В метриках нет
-содержимого аудио или текста.
+содержимого аудио или текста. Conversion failures дополнительно дают safe log с
+`stage=media`, категорией, return code или типом ошибки; raw ffmpeg stderr,
+пути, Telegram identifiers и secrets не логируются.
