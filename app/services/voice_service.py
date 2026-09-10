@@ -80,7 +80,7 @@ VOICE_CLARIFICATION_PROMPT_LIMIT = 1000
 VOICE_CLARIFICATION_TTL_SUFFIX = "Черновик действует 15 минут. /cancel отменит его."
 VOICE_CORRECTION_EXAMPLE = "напомни через 2 минуты покормить собаку"
 _VOICE_COMMAND_PREFIX_RE = re.compile(
-    r"^(?:напомни|напомню|напомнить)(?:(?:\s+|[,.:;—-]\s*)(.*))?$",
+    r"^(?:напомни|напомню|напомнить)(?:(?:\s*[,.:;—-]\s+|\s+)(.*))?$",
     re.IGNORECASE,
 )
 
