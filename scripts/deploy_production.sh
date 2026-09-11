@@ -17,6 +17,7 @@ fail() {
 
 repo_dir="$1"
 expected_sha="$2"
+env_file="${repo_dir}/.env"
 expected_image="reminder-bot:${expected_sha}"
 expected_image_source="https://github.com/MikeMoore1337/reminder-bot"
 compose_project="reminder_bot"
@@ -29,6 +30,9 @@ lock_path="${REMINDER_BOT_DEPLOY_LOCK_PATH:-${repo_dir}/locks/deploy.lock}"
 marker_path="${state_dir}/deployed-sha"
 backup_tmp=""
 marker_tmp=""
+pre_lock_env_fingerprint=""
+post_lock_env_fingerprint=""
+env_fingerprint=""
 
 [[ "${repo_dir}" == /* ]] || fail "repository path must be absolute"
 [[ "${repo_dir}" =~ ^/[A-Za-z0-9._/-]+$ ]] || fail "repository path contains unsupported characters"
@@ -37,26 +41,106 @@ marker_tmp=""
 [[ "${lock_wait_seconds}" =~ ^[0-9]+$ ]] || fail "lock wait must be an integer"
 (( lock_wait_seconds >= 1 && lock_wait_seconds <= 300 )) || fail "lock wait is out of bounds"
 
-for tool in awk chmod date docker find flock git mkdir mktemp mv rm sleep stat; do
+for tool in awk chmod date docker find flock git id mkdir mktemp mv rm sha256sum sleep stat; do
   command -v "${tool}" >/dev/null 2>&1 || fail "${tool} is required"
 done
 
 [[ -d "${repo_dir}/.git" ]] || fail "repository is not initialized at ${repo_dir}"
-[[ -f "${repo_dir}/.env" ]] || fail "production .env is missing"
-env_mode="$(stat -c '%a' -- "${repo_dir}/.env" 2>/dev/null)" || fail "cannot inspect production .env permissions"
-[[ "${env_mode}" == "600" ]] || fail "production .env must have mode 0600"
+
+validate_production_env() {
+  local env_metadata env_file_device env_file_inode env_file_uid env_file_gid env_mode
+  local effective_uid effective_gid
+
+  if [[ ! -e "${env_file}" && ! -L "${env_file}" ]]; then
+    fail "production .env is missing"
+  fi
+  [[ ! -L "${env_file}" ]] || fail "production .env must be a regular file; symlinks are not allowed"
+  [[ -f "${env_file}" ]] || fail "production .env must be a regular file"
+
+  env_metadata="$(stat -c '%d %i %u %g %a' -- "${env_file}" 2>/dev/null)" \
+    || fail "cannot inspect production .env metadata"
+  read -r env_file_device env_file_inode env_file_uid env_file_gid env_mode <<<"${env_metadata}"
+  [[ "${env_file_device}" =~ ^[0-9]+$ && "${env_file_inode}" =~ ^[0-9]+$ \
+    && "${env_file_uid}" =~ ^[0-9]+$ && "${env_file_gid}" =~ ^[0-9]+$ \
+    && "${env_mode}" =~ ^[0-9]+$ ]] \
+    || fail "cannot inspect production .env metadata"
+
+  effective_uid="$(id -u 2>/dev/null)" || fail "cannot determine deployment account uid"
+  effective_gid="$(id -g 2>/dev/null)" || fail "cannot determine deployment account gid"
+  [[ "${effective_uid}" =~ ^[0-9]+$ && "${effective_gid}" =~ ^[0-9]+$ ]] \
+    || fail "cannot determine deployment account identity"
+  if [[ "${env_file_uid}" != "${effective_uid}" || "${env_file_gid}" != "${effective_gid}" ]]; then
+    fail "production .env owner/group must match deployment account"
+  fi
+
+  [[ "${env_mode}" == "600" ]] || fail "production .env must have mode 0600"
+
+  if ! (exec {env_read_fd}<"${env_file}") 2>/dev/null; then
+    fail "production .env is not readable by deployment account"
+  fi
+}
+
+validate_bot_mode() {
+  local bot_mode_value
+
+  if ! bot_mode_value="$(awk -F= '
+    function trim(value) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      return value
+    }
+    $1 == "BOT_MODE" { mode = trim($2) }
+    END { if (mode == "polling") print "polling" }
+  ' "${env_file}" 2>/dev/null)"; then
+    fail "production .env could not be read while validating BOT_MODE"
+  fi
+  if [[ "${bot_mode_value}" != "polling" ]]; then
+    fail "production BOT_MODE must be polling"
+  fi
+}
+
+production_env_fingerprint() {
+  local env_metadata env_file_device env_file_inode env_file_uid env_file_gid env_mode
+  local effective_uid effective_gid checksum_output env_content_digest
+
+  [[ -e "${env_file}" && ! -L "${env_file}" && -f "${env_file}" ]] || return 1
+  env_metadata="$(stat -c '%d %i %u %g %a' -- "${env_file}" 2>/dev/null)" || return 1
+  read -r env_file_device env_file_inode env_file_uid env_file_gid env_mode <<<"${env_metadata}"
+  [[ "${env_file_device}" =~ ^[0-9]+$ && "${env_file_inode}" =~ ^[0-9]+$ \
+    && "${env_file_uid}" =~ ^[0-9]+$ && "${env_file_gid}" =~ ^[0-9]+$ \
+    && "${env_mode}" =~ ^[0-9]+$ ]] || return 1
+
+  effective_uid="$(id -u 2>/dev/null)" || return 1
+  effective_gid="$(id -g 2>/dev/null)" || return 1
+  [[ "${env_file_uid}" == "${effective_uid}" && "${env_file_gid}" == "${effective_gid}" ]] || return 1
+  [[ "${env_mode}" == "600" ]] || return 1
+  if ! (exec {env_read_fd}<"${env_file}") 2>/dev/null; then
+    return 1
+  fi
+
+  checksum_output="$(sha256sum -- "${env_file}" 2>/dev/null)" || return 1
+  env_content_digest="${checksum_output%% *}"
+  [[ "${env_content_digest}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s:%s:%s:%s:%s:%s\n' \
+    "${env_file_device}" "${env_file_inode}" "${env_file_uid}" "${env_file_gid}" \
+    "${env_mode}" "${env_content_digest}"
+}
+
+assert_production_env_unchanged() {
+  local current_env_fingerprint
+  if ! current_env_fingerprint="$(production_env_fingerprint)"; then
+    fail "production .env changed during deployment"
+  fi
+  [[ "${current_env_fingerprint}" == "${env_fingerprint}" ]] || \
+    fail "production .env changed during deployment"
+}
+
+validate_production_env
 
 # Polling production must have one bot owner. The HTTP probe remains available
 # on loopback, while the production host publish binding is forced below.
-if ! awk -F= '
-  function trim(value) {
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-    return value
-  }
-  $1 == "BOT_MODE" { mode = trim($2) }
-  END { exit(mode == "polling" ? 0 : 1) }
-' "${repo_dir}/.env"; then
-  fail "production BOT_MODE must be polling"
+validate_bot_mode
+if ! pre_lock_env_fingerprint="$(production_env_fingerprint)"; then
+  fail "production .env changed during deployment"
 fi
 
 cd "${repo_dir}"
@@ -79,6 +163,19 @@ exec {lock_fd}>"${lock_path}" || fail "cannot open deployment lock"
 if ! flock -w "${lock_wait_seconds}" "${lock_fd}"; then
   fail "another Reminder Bot deployment holds the server lock"
 fi
+
+if ! post_lock_env_fingerprint="$(production_env_fingerprint)"; then
+  fail "production .env changed during deployment"
+fi
+[[ "${post_lock_env_fingerprint}" == "${pre_lock_env_fingerprint}" ]] || \
+  fail "production .env changed during deployment"
+validate_production_env
+validate_bot_mode
+if ! env_fingerprint="$(production_env_fingerprint)"; then
+  fail "production .env changed during deployment"
+fi
+[[ "${env_fingerprint}" == "${post_lock_env_fingerprint}" ]] || \
+  fail "production .env changed during deployment"
 
 cleanup() {
   if [[ -n "${backup_tmp}" ]]; then
@@ -126,10 +223,12 @@ validate_existing_volume() {
 }
 
 validate_voice_runtime() {
+  assert_production_env_unchanged
   "${compose[@]}" run --rm --no-deps --interactive=false --entrypoint python bot \
     -m app.services.voice_runtime \
     < /dev/null \
     || fail "voice runtime preflight failed"
+  assert_production_env_unchanged
 }
 
 prune_backups() {
@@ -153,7 +252,9 @@ prune_backups() {
 wait_for_db_healthy() {
   local attempt db_id db_health
   for ((attempt = 1; attempt <= 30; attempt++)); do
+    assert_production_env_unchanged
     db_id="$("${compose[@]}" ps -q db 2>/dev/null || true)"
+    assert_production_env_unchanged
     if [[ -n "${db_id}" ]]; then
       db_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${db_id}" 2>/dev/null || true)"
       if [[ "${db_health}" == "healthy" ]]; then
@@ -176,6 +277,7 @@ create_backup() {
   backup_tmp="$(mktemp -- "${backup_dir}/.pre-deploy-${expected_sha}.XXXXXX")" \
     || fail "cannot create private backup temporary file"
 
+  assert_production_env_unchanged
   if "${compose[@]}" exec --interactive=false -T db sh -c \
     'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump --format=custom --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
     >"${backup_tmp}" </dev/null; then
@@ -183,6 +285,7 @@ create_backup() {
   else
     fail "PostgreSQL backup failed"
   fi
+  assert_production_env_unchanged
   [[ -s "${backup_tmp}" ]] || fail "PostgreSQL backup is empty"
   chmod 600 -- "${backup_tmp}"
   mv -f -- "${backup_tmp}" "${backup_path}"
@@ -193,7 +296,9 @@ create_backup() {
 container_id() {
   local service="$1"
   local id
+  assert_production_env_unchanged
   id="$("${compose[@]}" ps -q "${service}" 2>/dev/null || true)"
+  assert_production_env_unchanged
   [[ -n "${id}" ]] || fail "${service} container is missing"
   printf '%s\n' "${id}"
 }
@@ -211,7 +316,9 @@ require_exact_running_container() {
 
 verify_bot() {
   local bot_id bot_state bot_health bot_image
+  assert_production_env_unchanged
   bot_id="$("${compose[@]}" ps -q bot 2>/dev/null || true)"
+  assert_production_env_unchanged
   [[ -n "${bot_id}" ]] || return 1
   bot_state="$(docker inspect --format '{{.State.Status}}' "${bot_id}" 2>/dev/null || true)"
   [[ "${bot_state}" == "running" ]] || return 1
@@ -219,13 +326,17 @@ verify_bot() {
   [[ "${bot_image}" == "${expected_image}" ]] || return 1
   bot_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${bot_id}" 2>/dev/null || true)"
   [[ "${bot_health}" == "none" || "${bot_health}" == "healthy" ]] || return 1
-  "${compose[@]}" exec --interactive=false -T bot python -c \
+  assert_production_env_unchanged
+  if ! "${compose[@]}" exec --interactive=false -T bot python -c \
     'import urllib.request
 for path in ("/healthz", "/readyz"):
     with urllib.request.urlopen("http://127.0.0.1:8080" + path, timeout=2) as response:
         if response.status != 200:
             raise SystemExit(1)' \
-    </dev/null >/dev/null 2>&1
+    </dev/null >/dev/null 2>&1; then
+    return 1
+  fi
+  assert_production_env_unchanged
 }
 
 assert_current_master
@@ -235,15 +346,21 @@ git checkout --detach --quiet "${expected_sha}"
 
 validate_loaded_image
 validate_existing_volume
+assert_production_env_unchanged
 "${compose[@]}" config --quiet
+assert_production_env_unchanged
 
+assert_production_env_unchanged
 configured_app_images="$("${compose_tools[@]}" config --images | awk -v expected="${expected_image}" '$0 == expected { count++ } END { print count + 0 }')"
+assert_production_env_unchanged
 [[ "${configured_app_images}" == "3" ]] || fail "migrate, bot, and worker do not share the exact image"
 
 validate_voice_runtime
 
 assert_current_master
+assert_production_env_unchanged
 "${compose[@]}" up -d --no-build db
+assert_production_env_unchanged
 wait_for_db_healthy
 
 # The database may now be running, but no backup or migration is allowed for a
@@ -256,18 +373,23 @@ assert_current_master
 # --no-build on up, while `run` has no equivalent flag. The selected service is
 # independent because PostgreSQL was started and checked above.
 migration_status=0
+assert_production_env_unchanged
 if "${compose_tools[@]}" up --no-build --no-deps --abort-on-container-exit --exit-code-from migrate migrate; then
   migration_status=0
 else
   migration_status=$?
 fi
+assert_production_env_unchanged
 "${compose_tools[@]}" rm --force migrate >/dev/null 2>&1 || true
+assert_production_env_unchanged
 (( migration_status == 0 )) || fail "database migration failed"
 
 # Once migration has committed, a stale target is still a visible failure; no
 # automatic database downgrade is attempted.
 assert_current_master
+assert_production_env_unchanged
 "${compose[@]}" up -d --no-build --no-deps --force-recreate bot worker
+assert_production_env_unchanged
 
 bot_ready=0
 for ((attempt = 1; attempt <= 30; attempt++)); do

@@ -206,6 +206,18 @@ def test_remote_deploy_script_contains_the_production_safety_contract() -> None:
         "app.services.voice_runtime",
         "--interactive=false",
         "< /dev/null",
+        "validate_production_env",
+        "stat -c '%d %i %u %g %a'",
+        "sha256sum",
+        "production_env_fingerprint",
+        "production .env changed during deployment",
+        "id -u",
+        "id -g",
+        "owner/group must match deployment account",
+        "symlinks are not allowed",
+        "exec {env_read_fd}<",
+        "not readable by deployment account",
+        "could not be read while validating BOT_MODE",
     )
     for fragment in required_fragments:
         assert fragment in script
@@ -225,6 +237,20 @@ def test_remote_deploy_script_contains_the_production_safety_contract() -> None:
     backup_call = script.index("create_backup\nassert_current_master")
     migration_call = script.index("migration_status=0")
     assert backup_call < migration_call
+    env_preflight_call = script.index("\nvalidate_production_env\n")
+    env_post_lock_call = script.rindex("\nvalidate_production_env\n")
+    bot_mode_call = script.index("\nvalidate_bot_mode\n")
+    bot_mode_post_lock_call = script.rindex("\nvalidate_bot_mode\n")
+    lock_call = script.index("exec {lock_fd}")
+    assert (
+        env_preflight_call
+        < bot_mode_call
+        < lock_call
+        < env_post_lock_call
+        < bot_mode_post_lock_call
+    )
+    assert script.count("\nvalidate_bot_mode\n") == 2
+    assert script.count("assert_production_env_unchanged") >= 15
 
     compose_invocations = re.findall(r"(?m)^compose(?:_tools)?=\(docker compose.*$", script)
     assert compose_invocations
@@ -489,6 +515,21 @@ fi
     fake_sleep = fake_bin / "sleep"
     fake_sleep.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     fake_sleep.chmod(0o755)
+    real_stat = shutil.which("stat")
+    if real_stat is not None:
+        fake_stat = fake_bin / "stat"
+        fake_stat.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${STAT_OVERRIDE:-}" ]]; then
+  printf '%s\\n' "${STAT_OVERRIDE}"
+else
+  exec "${REAL_STAT:?}" "$@"
+fi
+""",
+            encoding="utf-8",
+        )
+        fake_stat.chmod(0o755)
 
     env = os.environ.copy()
     env.update(
@@ -503,6 +544,8 @@ fi
             "REMINDER_BOT_STATE_DIR": str(state_dir),
             "REMINDER_BOT_DEPLOY_LOCK_PATH": str(lock_path),
             "REMINDER_BOT_LOCK_WAIT_SECONDS": "1",
+            "REAL_STAT": real_stat or "",
+            "STAT_OVERRIDE": "",
         }
     )
     return (
@@ -514,6 +557,7 @@ fi
             "backup": backup_dir,
             "state": state_dir,
             "lock": lock_path,
+            "fake_bin": fake_bin,
         },
         exact_sha,
         env,
@@ -598,6 +642,118 @@ def test_deploy_success_uses_exact_image_project_volume_backup_and_marker(tmp_pa
         for line in calls.splitlines()
         if line.startswith("compose")
     )
+    assert "test-only" not in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS, reason="behavioral deployment contract requires Unix bash/flock/git"
+)
+def test_env_preflight_rejects_wrong_mode_before_bot_mode_and_docker(tmp_path: Path) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, _, _ = fixture
+    (paths["app"] / ".env").chmod(0o640)
+
+    result = _run_deploy(fixture)
+
+    assert result.returncode != 0
+    assert "production .env must have mode 0600" in result.stderr
+    assert "production BOT_MODE must be polling" not in result.stderr
+    assert "test-only" not in result.stdout + result.stderr
+    assert not paths["calls"].exists()
+    assert not paths["lock"].exists()
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS, reason="behavioral deployment contract requires Unix bash/flock/git"
+)
+def test_env_preflight_rejects_symlink_before_reading_target(tmp_path: Path) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, _, _ = fixture
+    env_file = paths["app"] / ".env"
+    secret_target = tmp_path / "secret.env"
+    secret_target.write_text(
+        "BOT_MODE=not-polling\nSECRET_VALUE=symlink-secret-value\n", encoding="utf-8"
+    )
+    secret_target.chmod(0o600)
+    env_file.unlink()
+    env_file.symlink_to(secret_target)
+
+    result = _run_deploy(fixture)
+
+    assert result.returncode != 0
+    assert "production .env must be a regular file; symlinks are not allowed" in result.stderr
+    assert "symlink-secret-value" not in result.stdout + result.stderr
+    assert "production BOT_MODE must be polling" not in result.stderr
+    assert not paths["calls"].exists()
+    assert not paths["lock"].exists()
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS or shutil.which("stat") is None,
+    reason="owner regression requires Unix stat and the deployment shell",
+)
+def test_env_preflight_rejects_owner_group_mismatch_before_bot_mode_and_docker(
+    tmp_path: Path,
+) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, _, _ = fixture
+
+    result = _run_deploy(fixture, STAT_OVERRIDE="123 456 99999 99998 600")
+
+    assert result.returncode != 0
+    assert "production .env owner/group must match deployment account" in result.stderr
+    assert "production BOT_MODE must be polling" not in result.stderr
+    assert "test-only" not in result.stdout + result.stderr
+    assert not paths["calls"].exists()
+    assert not paths["lock"].exists()
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS
+    or shutil.which("stat") is None
+    or not hasattr(os, "geteuid")
+    or os.geteuid() == 0,
+    reason="readability regression requires a non-root Unix deployment process",
+)
+def test_env_preflight_rejects_unreadable_file_before_bot_mode_and_docker(
+    tmp_path: Path,
+) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, _, _ = fixture
+    (paths["app"] / ".env").chmod(0o000)
+
+    result = _run_deploy(
+        fixture,
+        STAT_OVERRIDE=f"123 456 {os.geteuid()} {os.getegid()} 600",
+    )
+
+    assert result.returncode != 0
+    assert "production .env is not readable by deployment account" in result.stderr
+    assert "production BOT_MODE must be polling" not in result.stderr
+    assert "test-only" not in result.stdout + result.stderr
+    assert not paths["calls"].exists()
+    assert not paths["lock"].exists()
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS, reason="behavioral deployment contract requires Unix bash/flock/git"
+)
+def test_bot_mode_mismatch_is_reported_after_env_preflight(tmp_path: Path) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, _, _ = fixture
+    (paths["app"] / ".env").write_text(
+        "BOT_MODE=webhook\nPOSTGRES_PASSWORD=bot-mode-secret\n", encoding="utf-8"
+    )
+    (paths["app"] / ".env").chmod(0o600)
+
+    result = _run_deploy(fixture)
+
+    assert result.returncode != 0
+    assert "production BOT_MODE must be polling" in result.stderr
+    assert "could not be read while validating BOT_MODE" not in result.stderr
+    assert "bot-mode-secret" not in result.stdout + result.stderr
+    assert not paths["calls"].exists()
+    assert not paths["lock"].exists()
 
 
 @pytest.mark.skipif(
@@ -929,6 +1085,114 @@ def test_server_lock_blocks_a_second_deployment_before_docker(tmp_path: Path) ->
     assert result.returncode != 0
     assert "server lock" in result.stderr
     assert not paths["calls"].exists() or paths["calls"].read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.skipif(
+    not UNIX_DEPLOY_TOOLS or not hasattr(os, "mkfifo"),
+    reason="deployment race regression requires Unix bash/flock/git",
+)
+@pytest.mark.parametrize("replacement_kind", ("inode", "content"))
+def test_env_replacement_while_waiting_for_lock_fails_before_docker(
+    tmp_path: Path, replacement_kind: str
+) -> None:
+    fixture = _deployment_fixture(tmp_path)
+    paths, exact_sha, base_env = fixture
+    real_flock = shutil.which("flock")
+    assert real_flock is not None
+
+    flock_attempt = tmp_path / "flock-attempted"
+    fake_flock = paths["fake_bin"] / "flock"
+    fake_flock.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'attempted\\n' > "${FLOCK_ATTEMPT_FILE:?}"
+exec "${REAL_FLOCK:?}" "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_flock.chmod(0o755)
+
+    lock_ready = tmp_path / "lock-ready"
+    release_fifo = tmp_path / "release.fifo"
+    os.mkfifo(release_fifo)
+    holder = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            'exec 9>"$1"; "$REAL_FLOCK" -n 9; printf ready > "$2"; read -r < "$3"',
+            "lock-holder",
+            str(paths["lock"]),
+            str(lock_ready),
+            str(release_fifo),
+        ],
+        env={**base_env, "REAL_FLOCK": real_flock},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deploy: subprocess.Popen[str] | None = None
+    holder_released = False
+    try:
+        deadline = time.monotonic() + 5
+        while not lock_ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert lock_ready.exists(), "lock not held"
+
+        deploy_env = base_env.copy()
+        deploy_env.update(
+            {
+                "FLOCK_ATTEMPT_FILE": str(flock_attempt),
+                "REAL_FLOCK": real_flock,
+            }
+        )
+        deploy = subprocess.Popen(
+            ["bash", str(DEPLOY_SCRIPT), str(paths["app"]), exact_sha],
+            cwd=ROOT,
+            env=deploy_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        deadline = time.monotonic() + 5
+        while not flock_attempt.exists() and time.monotonic() < deadline:
+            if deploy.poll() is not None:
+                break
+            time.sleep(0.01)
+        assert flock_attempt.exists(), "deployment did not reach the lock wait"
+        assert deploy.poll() is None
+
+        rotated_env = "BOT_MODE=polling\nPOSTGRES_PASSWORD=rotated-secret\n"
+        env_file = paths["app"] / ".env"
+        if replacement_kind == "inode":
+            replacement = tmp_path / "replacement.env"
+            replacement.write_text(rotated_env, encoding="utf-8")
+            replacement.chmod(0o600)
+            os.replace(replacement, env_file)
+        else:
+            env_file.write_text(rotated_env, encoding="utf-8")
+            env_file.chmod(0o600)
+
+        with release_fifo.open("w", encoding="utf-8") as release:
+            release.write("release\n")
+        holder_released = True
+        stdout, stderr = deploy.communicate(timeout=10)
+    finally:
+        if deploy is not None and deploy.poll() is None:
+            deploy.kill()
+            deploy.communicate(timeout=5)
+        if not holder_released and holder.poll() is None:
+            with release_fifo.open("w", encoding="utf-8") as release:
+                release.write("release\n")
+        holder.wait(timeout=5)
+
+    assert deploy is not None
+    assert deploy.returncode != 0
+    assert "production .env changed during deployment" in stderr
+    assert "rotated-secret" not in stdout + stderr
+    assert not paths["calls"].exists()
+    assert not paths["backup"].exists()
+    assert not paths["state"].exists()
 
 
 @pytest.mark.skipif(
