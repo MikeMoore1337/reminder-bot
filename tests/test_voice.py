@@ -1286,6 +1286,8 @@ def test_voice_transcript_rendering_escapes_and_bounds_html(monkeypatch, tmp_pat
             assert "&amp;" in preview
             assert "&quot;quotes&quot;" in preview
             assert "<b>test</b>" not in preview
+            assert "<b>Повтор:</b> нет" in preview
+            assert "<b>Повтор:</b> none" not in preview
             assert "&lt;i&gt;parser &amp; instruction&lt;/i&gt;" in prompt
             assert "<i>parser" not in prompt
             assert len(preview) < 4096
