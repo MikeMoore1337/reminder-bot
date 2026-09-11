@@ -219,6 +219,93 @@ def test_voice_transcript_parses_spoken_relative_number_words(
 
 
 @pytest.mark.parametrize(
+    ("transcript", "expected_candidate", "expected_text"),
+    [
+        (
+            "Напомню, через три минута открыть окно.",
+            "напомни через три минуты открыть окно.",
+            "открыть окно.",
+        ),
+        (
+            "Напомни через 3 минута проверить сервер",
+            "напомни через 3 минуты проверить сервер",
+            "проверить сервер",
+        ),
+        (
+            "Напомни через три минуты открыть окно",
+            "напомни через три минуты открыть окно",
+            "открыть окно",
+        ),
+    ],
+)
+def test_voice_transcript_normalizes_only_bounded_minute_artifact(
+    transcript: str,
+    expected_candidate: str,
+    expected_text: str,
+) -> None:
+    now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
+
+    candidate, parsed = voice_service.parse_voice_transcript(
+        transcript,
+        now_local=now_local,
+    )
+
+    assert candidate == expected_candidate
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.local_dt == now_local + timedelta(minutes=3)
+    assert parsed.text == expected_text
+
+
+def test_voice_transcript_minute_artifact_does_not_normalize_body() -> None:
+    transcript = "Напомни через три минута сказать слово минута"
+    now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
+
+    candidate, parsed = voice_service.parse_voice_transcript(
+        transcript,
+        now_local=now_local,
+    )
+
+    assert candidate == "напомни через три минуты сказать слово минута"
+    assert isinstance(parsed, ParsedReminder)
+    assert parsed.local_dt == now_local + timedelta(minutes=3)
+    assert parsed.text == "сказать слово минута"
+
+
+def test_voice_transcript_oversized_digit_minute_artifact_fails_closed() -> None:
+    oversized = "9" * 100
+    transcript = f"Напомни через {oversized} минута открыть окно"
+    now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
+
+    candidate, parsed = voice_service.parse_voice_transcript(
+        transcript,
+        now_local=now_local,
+    )
+
+    assert candidate == f"напомни через {oversized} минута открыть окно"
+    assert isinstance(parsed, ClarificationRequest)
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Напомни купить молоко",
+        "Напомни через минута открыть окно",
+    ],
+)
+def test_voice_transcript_minute_artifact_requires_number_and_schedule(
+    transcript: str,
+) -> None:
+    now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
+
+    _, parsed = voice_service.parse_voice_transcript(
+        transcript,
+        now_local=now_local,
+    )
+
+    assert isinstance(parsed, ClarificationRequest)
+
+
+@pytest.mark.parametrize(
     "transcript",
     [
         "Я напомню через 2 минуты проверить тест",
@@ -353,15 +440,22 @@ def test_voice_process_creates_persistent_preview_draft_and_cleans_media(monkeyp
 
 
 @pytest.mark.parametrize(
-    ("transcript", "expected_text"),
+    ("transcript", "expected_text", "expected_minutes"),
     [
         (
             "Напомню, через две минуты проверить голосовое напоминание.",
             "проверить голосовое напоминание.",
+            2,
+        ),
+        (
+            "Напомню, через три минута открыть окно.",
+            "открыть окно.",
+            3,
         ),
         (
             "Напомню, через 2 минуты проверить голосовое напоминание.",
             "проверить голосовое напоминание.",
+            2,
         ),
     ],
 )
@@ -370,6 +464,7 @@ def test_spoken_relative_voice_handler_keeps_confirmation_gate(
     tmp_path,
     transcript,
     expected_text,
+    expected_minutes,
 ):
     async def scenario() -> None:
         engine, connection, session_factory = await _open_sqlite(monkeypatch)
@@ -439,7 +534,9 @@ def test_spoken_relative_voice_handler_keeps_confirmation_gate(
                 assert draft is not None
                 assert draft.transcript == transcript
                 assert draft.reminder_text == expected_text
-                assert draft.remind_at_utc.replace(tzinfo=UTC) == now + timedelta(minutes=2)
+                assert draft.remind_at_utc.replace(tzinfo=UTC) == now + timedelta(
+                    minutes=expected_minutes
+                )
                 assert draft.datetime_semantics == "instant"
                 assert draft.recurrence_type == "none"
                 assert draft.mode == "normal"
