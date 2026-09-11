@@ -2575,6 +2575,8 @@ def format_recurrence(reminder: Reminder) -> str:
     suffix = f" до {until}" if until else ""
     if kind == "legacy":
         recurrence_type = str(rule["recurrence_type"])
+        if recurrence_type == RecurrenceType.NONE.value:
+            return "нет"
         interval = int(rule["interval"])
         if recurrence_type == RecurrenceType.MINUTES.value:
             label = "каждые 1 минуту" if interval == 1 else f"каждые {interval} минут"

@@ -1,12 +1,15 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.base import Base
-from app.db.models import RecurrenceType, Reminder, ReminderKind, User
+from app.db.models import RecurrenceType, Reminder, ReminderKind, ReminderMode, User
+from app.handlers import reminders as reminders_handler
 from app.services import reminder_service
+from app.services.recurrence import encode_rule, legacy_rule, yearly_rule
 from app.services.reminder_parser import parse_reminder_input
 from app.services.reminder_service import (
     advance_occurrence_until_future,
@@ -243,3 +246,82 @@ def test_deadline_display_uses_persisted_schedule_timezone() -> None:
     rendered = format_reminder_for_user(reminder, "Asia/Tokyo")
 
     assert "Дедлайн: 10.09.2026 18:00 (Europe/Moscow)" in rendered
+
+
+def test_format_recurrence_localizes_reconstructed_legacy_none() -> None:
+    reminder = Reminder(
+        recurrence_type=RecurrenceType.NONE.value,
+        recurrence_interval=1,
+        recurrence_rule=None,
+    )
+
+    assert reminder_service.format_recurrence(reminder) == "нет"
+
+
+def test_format_recurrence_localizes_explicit_legacy_none() -> None:
+    reminder = Reminder(
+        recurrence_type=RecurrenceType.NONE.value,
+        recurrence_interval=1,
+        recurrence_rule=encode_rule(legacy_rule(RecurrenceType.NONE.value, 1)),
+    )
+
+    assert reminder_service.format_recurrence(reminder) == "нет"
+
+
+def test_saved_reminder_response_does_not_expose_internal_none() -> None:
+    reminder = Reminder(
+        id=42,
+        text="проверить отчёт",
+        remind_at_utc=datetime(2026, 9, 11, 9, 0, tzinfo=UTC),
+        schedule_timezone="Europe/Moscow",
+        state="scheduled",
+        kind=ReminderKind.ORDINARY.value,
+        mode=ReminderMode.NORMAL.value,
+        recurrence_type=RecurrenceType.NONE.value,
+        recurrence_interval=1,
+        recurrence_rule=None,
+    )
+    user = User(timezone="Europe/Moscow")
+
+    response = reminders_handler._saved_reminder_response(
+        reminder,
+        user,
+        prefix="Напоминание сохранено.",
+    )
+
+    assert "Повтор: нет" in response
+    assert "Повтор: none" not in response
+
+
+@pytest.mark.parametrize(
+    ("recurrence_type", "interval", "expected"),
+    [
+        (RecurrenceType.MINUTES.value, 5, "каждые 5 минут"),
+        (RecurrenceType.HOURLY.value, 1, "каждый час"),
+        (RecurrenceType.DAILY.value, 1, "каждый день"),
+        (RecurrenceType.WEEKLY.value, 1, "каждую неделю"),
+        (RecurrenceType.MONTHLY.value, 1, "каждый месяц"),
+    ],
+)
+def test_format_recurrence_keeps_legacy_labels(
+    recurrence_type: str,
+    interval: int,
+    expected: str,
+) -> None:
+    reminder = Reminder(
+        recurrence_type=recurrence_type,
+        recurrence_interval=interval,
+        recurrence_rule=None,
+    )
+
+    assert reminder_service.format_recurrence(reminder) == expected
+
+
+def test_format_recurrence_keeps_advanced_until_label() -> None:
+    reminder = Reminder(
+        recurrence_type=RecurrenceType.ADVANCED.value,
+        recurrence_interval=1,
+        recurrence_rule=encode_rule(yearly_rule(3, 15, time(9), until=date(2026, 12, 31))),
+    )
+
+    assert reminder_service.format_recurrence(reminder) == "ежегодно 15.03 в 09:00 до 2026-12-31"
