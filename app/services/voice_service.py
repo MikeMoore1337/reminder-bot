@@ -38,6 +38,7 @@ from app.services.reminder_service import (
     MAX_REMINDER_TEXT_LENGTH,
     calculate_next_occurrence,
     create_reminder_in_session,
+    format_recurrence_rule,
     validate_recurrence,
 )
 from app.services.speech_to_text import (
@@ -802,16 +803,18 @@ async def cleanup_expired_voice_drafts(*, now_utc: datetime | None = None) -> in
 
 def format_voice_draft_preview(draft: VoiceReminderDraft) -> str:
     local_dt = from_utc_to_user(draft.remind_at_utc, draft.schedule_timezone)
-    if draft.recurrence_type == RecurrenceType.NONE.value:
-        recurrence = "нет"
-    elif draft.recurrence_rule:
-        try:
+    try:
+        if draft.recurrence_rule is not None:
             rule = decode_rule(draft.recurrence_rule)
-            recurrence = str(rule.get("kind", draft.recurrence_type)) if rule else "неизвестно"
-        except ValueError:
-            recurrence = "неизвестно"
-    else:
-        recurrence = f"{draft.recurrence_type}, интервал {draft.recurrence_interval}"
+        else:
+            rule = legacy_rule(
+                draft.recurrence_type,
+                draft.recurrence_interval,
+                draft.recurrence_day_of_month,
+            )
+        recurrence = format_recurrence_rule(rule) if rule is not None else "неизвестно"
+    except (KeyError, TypeError, ValueError):
+        recurrence = "неизвестно"
     return (
         "🎙 <b>Проверь голосовое напоминание</b>\n\n"
         f"<b>Распознано голосом:</b> {_escape_bounded(draft.transcript, max_encoded_length=VOICE_PREVIEW_TRANSCRIPT_LIMIT)}\n"

@@ -2565,8 +2565,41 @@ async def get_failed_reminders(limit: int = 20) -> list[Reminder]:
         return list(result.scalars().all())
 
 
-def format_recurrence(reminder: Reminder) -> str:
-    rule = get_recurrence_rule(reminder)
+_RECURRENCE_WEEKDAY_NAMES = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
+_RECURRENCE_WEEKDAY_ORDINAL_SUFFIXES = ("й", "й", "я", "й", "я", "я", "е")
+_RECURRENCE_WEEKDAY_LAST_FORMS = (
+    "последний",
+    "последний",
+    "последняя",
+    "последний",
+    "последняя",
+    "последняя",
+    "последнее",
+)
+
+
+def _format_ordinal_weekday(ordinal: int, weekday: int) -> str:
+    return (
+        f"{ordinal}-{_RECURRENCE_WEEKDAY_ORDINAL_SUFFIXES[weekday]} "
+        f"{_RECURRENCE_WEEKDAY_NAMES[weekday]}"
+    )
+
+
+def _format_last_weekday(weekday: int) -> str:
+    return f"{_RECURRENCE_WEEKDAY_LAST_FORMS[weekday]} {_RECURRENCE_WEEKDAY_NAMES[weekday]}"
+
+
+def format_recurrence_rule(rule: Mapping[str, Any]) -> str:
+    """Format a canonical recurrence rule for user-facing Russian text."""
+
     kind = rule["kind"]
     if kind == "none":
         return "нет"
@@ -2592,32 +2625,31 @@ def format_recurrence(reminder: Reminder) -> str:
             return recurrence_type
         return f"{label}{suffix}"
 
-    weekday_names = (
-        "понедельник",
-        "вторник",
-        "среду",
-        "четверг",
-        "пятницу",
-        "субботу",
-        "воскресенье",
-    )
     if kind in {"weekly_days", "weekdays"}:
-        names = ", ".join(weekday_names[int(day)] for day in rule["weekdays"])
+        names = ", ".join(_RECURRENCE_WEEKDAY_NAMES[int(day)] for day in rule["weekdays"])
         interval = int(rule["interval"])
         every = "каждую неделю" if interval == 1 else f"каждые {interval} недель"
         return f"{every}: {names} в {rule['time']}{suffix}"
     if kind == "monthly_nth":
+        weekday = int(rule["weekday"])
         return (
-            f"{rule['ordinal']}-й {weekday_names[int(rule['weekday'])]} месяца в "
+            f"{_format_ordinal_weekday(int(rule['ordinal']), weekday)} месяца в "
             f"{rule['time']}{suffix}"
         )
     if kind == "monthly_last":
-        return f"последний {weekday_names[int(rule['weekday'])]} месяца в {rule['time']}{suffix}"
+        weekday = int(rule["weekday"])
+        return f"{_format_last_weekday(weekday)} месяца в {rule['time']}{suffix}"
     if kind == "yearly":
         return f"ежегодно {int(rule['day']):02d}.{int(rule['month']):02d} в {rule['time']}{suffix}"
     if kind == "completion_relative":
         return f"через {rule['after_days']} дн. после выполнения{suffix}"
-    return str(reminder.recurrence_type)
+    return "неизвестно"
+
+
+def format_recurrence(reminder: Reminder) -> str:
+    """Format a reminder recurrence without exposing its internal rule kind."""
+
+    return format_recurrence_rule(get_recurrence_rule(reminder))
 
 
 def format_state(state: str) -> str:
