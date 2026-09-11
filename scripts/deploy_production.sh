@@ -37,25 +37,59 @@ marker_tmp=""
 [[ "${lock_wait_seconds}" =~ ^[0-9]+$ ]] || fail "lock wait must be an integer"
 (( lock_wait_seconds >= 1 && lock_wait_seconds <= 300 )) || fail "lock wait is out of bounds"
 
-for tool in awk chmod date docker find flock git mkdir mktemp mv rm sleep stat; do
+for tool in awk chmod date docker find flock git id mkdir mktemp mv rm sleep stat; do
   command -v "${tool}" >/dev/null 2>&1 || fail "${tool} is required"
 done
 
 [[ -d "${repo_dir}/.git" ]] || fail "repository is not initialized at ${repo_dir}"
-[[ -f "${repo_dir}/.env" ]] || fail "production .env is missing"
-env_mode="$(stat -c '%a' -- "${repo_dir}/.env" 2>/dev/null)" || fail "cannot inspect production .env permissions"
-[[ "${env_mode}" == "600" ]] || fail "production .env must have mode 0600"
+
+validate_production_env() {
+  local env_file="${repo_dir}/.env"
+  local env_metadata env_file_uid env_file_gid env_mode
+  local effective_uid effective_gid
+
+  if [[ ! -e "${env_file}" && ! -L "${env_file}" ]]; then
+    fail "production .env is missing"
+  fi
+  [[ ! -L "${env_file}" ]] || fail "production .env must be a regular file; symlinks are not allowed"
+  [[ -f "${env_file}" ]] || fail "production .env must be a regular file"
+
+  env_metadata="$(stat -c '%u %g %a' -- "${env_file}" 2>/dev/null)" \
+    || fail "cannot inspect production .env metadata"
+  read -r env_file_uid env_file_gid env_mode <<<"${env_metadata}"
+  [[ "${env_file_uid}" =~ ^[0-9]+$ && "${env_file_gid}" =~ ^[0-9]+$ && "${env_mode}" =~ ^[0-9]+$ ]] \
+    || fail "cannot inspect production .env metadata"
+
+  effective_uid="$(id -u 2>/dev/null)" || fail "cannot determine deployment account uid"
+  effective_gid="$(id -g 2>/dev/null)" || fail "cannot determine deployment account gid"
+  [[ "${effective_uid}" =~ ^[0-9]+$ && "${effective_gid}" =~ ^[0-9]+$ ]] \
+    || fail "cannot determine deployment account identity"
+  if [[ "${env_file_uid}" != "${effective_uid}" || "${env_file_gid}" != "${effective_gid}" ]]; then
+    fail "production .env owner/group must match deployment account"
+  fi
+
+  [[ "${env_mode}" == "600" ]] || fail "production .env must have mode 0600"
+
+  if ! (exec {env_read_fd}<"${env_file}") 2>/dev/null; then
+    fail "production .env is not readable by deployment account"
+  fi
+}
+
+validate_production_env
 
 # Polling production must have one bot owner. The HTTP probe remains available
 # on loopback, while the production host publish binding is forced below.
-if ! awk -F= '
+if ! bot_mode_value="$(awk -F= '
   function trim(value) {
     gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
     return value
   }
   $1 == "BOT_MODE" { mode = trim($2) }
-  END { exit(mode == "polling" ? 0 : 1) }
-' "${repo_dir}/.env"; then
+  END { if (mode == "polling") print "polling" }
+' "${repo_dir}/.env" 2>/dev/null)"; then
+  fail "production .env could not be read while validating BOT_MODE"
+fi
+if [[ "${bot_mode_value}" != "polling" ]]; then
   fail "production BOT_MODE must be polling"
 fi
 

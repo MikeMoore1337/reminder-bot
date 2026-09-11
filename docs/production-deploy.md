@@ -24,6 +24,23 @@ production `.env`. It is not used as the deployment checkout and must not be
 deleted, renamed, or converted in place. The canonical clean Git checkout is
 `/opt/reminder-bot`.
 
+## Production `.env` invariant
+
+The canonical production file `/opt/reminder-bot/.env` must be a regular,
+non-symlink file with:
+
+- owner `reminder-deploy`;
+- group `reminder-deploy`;
+- mode `0600`.
+
+The deploy script compares the file's numeric uid/gid with the effective uid/gid
+of the deployment process, so the check does not depend on name resolution. It
+then checks the exact mode and opens the file for reading as the deployment
+account. Only after this metadata/readability preflight passes does it parse
+`BOT_MODE`, and only later does it acquire the deployment lock. Every failure
+stops the deploy; the script never prints `.env` contents and never performs
+automatic `chown`/`chmod` on `.env`, ACL changes, `sudo`, or file replacement.
+
 ## Immutable image transport
 
 The GitHub runner checks out the exact 40-character protected `master` SHA and
@@ -277,34 +294,57 @@ The known-host entry must be constructed from the owner-verified VPS host key
 fingerprint, not from runtime `ssh-keyscan`. Do not create or change these
 GitHub values as part of this repository task.
 
+## Restoring production `.env` safely
+
+If `/opt/reminder-bot/.env` is restored from a backup or rollback, the owner
+must verify all of the following before enabling a deploy:
+
+- it is a regular file and not a symlink;
+- owner and group are both `reminder-deploy`;
+- mode is exactly `0600`;
+- `reminder-deploy` can open it for reading.
+
+The repair is an owner-controlled operation, outside the deploy script:
+
+```bash
+sudo chown reminder-deploy:reminder-deploy /opt/reminder-bot/.env
+sudo chmod 0600 /opt/reminder-bot/.env
+```
+
+Restoring mode `0600` alone is insufficient if ownership has become
+`root:root`. Do not print the file contents, automate these root actions in the
+deploy, or touch the legacy `/root/reminder_bot`.
+
 ## Deployment sequence and safety gates
 
 For an enabled, correctly bootstrapped deployment, the workflow and remote
 script perform this bounded sequence:
 
 1. validate the exact 40-character SHA and the successful `master` CI run;
-2. acquire the Reminder Bot-specific server lock
+2. validate the production `.env` invariant, readability, and then
+   `BOT_MODE=polling` before any deployment lock is acquired;
+3. acquire the Reminder Bot-specific server lock
    `/opt/reminder-bot/locks/deploy.lock` with a bounded `flock` wait;
-3. check out and load `reminder-bot:<FULL_SHA>`, verifying OCI labels;
-4. validate project `reminder_bot`, the exact named volume, labels, PG17, and
+4. check out and load `reminder-bot:<FULL_SHA>`, verifying OCI labels;
+5. validate project `reminder_bot`, the exact named volume, labels, PG17, and
    the polling invariant before live service changes;
-5. re-fetch `origin/master` and require the requested SHA;
-6. start/check PostgreSQL with `docker compose -p reminder_bot up -d --no-build db`;
-7. create a private custom-format `pg_dump` under
+6. re-fetch `origin/master` and require the requested SHA;
+7. start/check PostgreSQL with `docker compose -p reminder_bot up -d --no-build db`;
+8. create a private custom-format `pg_dump` under
    `/opt/reminder-bot/backups/<UTC>_pre-deploy_<FULL_SHA>.dump`, require success
    and a non-empty file, then retain only the latest ten deploy-created dumps;
-8. re-fetch `origin/master`, then run the `migrate` service with
+9. re-fetch `origin/master`, then run the `migrate` service with
    `--no-build`; backup failure or migration failure stops before bot/worker
    replacement;
-9. re-fetch `origin/master` before application rollout, then replace only the
+10. re-fetch `origin/master` before application rollout, then replace only the
    single `bot` and `worker` services with
    `docker compose -p reminder_bot up -d --no-build --no-deps --force-recreate bot worker`;
-10. require bot existence, running state, exact image, configured healthcheck
+11. require bot existence, running state, exact image, configured healthcheck
     health, and local `/healthz` plus `/readyz` HTTP 200 responses;
-11. require the worker to have the exact image and running state, record its
+12. require the worker to have the exact image and running state, record its
     restart count, observe it for ten seconds, and require the same container
     and restart count at the end;
-12. re-fetch `origin/master`, atomically write the full SHA to
+13. re-fetch `origin/master`, atomically write the full SHA to
     `/opt/reminder-bot/state/deployed-sha`, and emit
     `Deployment verdict: ACTIVE <FULL_SHA>`. GitHub Actions captures the remote
     output and fails closed unless that exact line matches the requested SHA.
