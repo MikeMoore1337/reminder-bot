@@ -7,11 +7,19 @@ from app.services.reminder_parser import (
     ClarificationRequest,
     DeadlineRequest,
     ParsedReminder,
+    _parse_russian_number_words,
     parse_reminder_input,
 )
 
 _VOICE_COMMAND_PREFIX_RE = re.compile(
     r"^(?:напомни|напомню|напомнить)(?:(?:\s*[,.:;—-]\s+|\s+)(.*))?$",
+    re.IGNORECASE,
+)
+_VOICE_RELATIVE_BODY_SEPARATOR = r"(?:\s*[,.:;—-]\s+|\s+)"
+_WHISPER_MINUTE_ARTIFACT_RE = re.compile(
+    r"^напомни\s+через\s+"
+    r"(?P<number>\d+|[а-яё]+(?:\s+[а-яё]+)?)\s+минута"
+    rf"(?P<separator>{_VOICE_RELATIVE_BODY_SEPARATOR})(?P<body>.+)$",
     re.IGNORECASE,
 )
 
@@ -24,11 +32,29 @@ def _canonicalize_voice_command_prefix(transcript: str) -> str | None:
     return f"напомни {remainder}" if remainder else "напомни"
 
 
+def _normalize_whisper_minute_artifact(candidate: str) -> str:
+    """Normalize one bounded Whisper artifact without touching the transcript/body."""
+
+    match = _WHISPER_MINUTE_ARTIFACT_RE.fullmatch(candidate)
+    if match is None:
+        return candidate
+
+    number = match.group("number")
+    if not number.isdecimal() and _parse_russian_number_words(number) is None:
+        return candidate
+
+    body = match.group("body")
+    if not body.strip():
+        return candidate
+
+    return f"напомни через {number} минуты{match.group('separator')}{body}"
+
+
 def _voice_parse_candidates(transcript: str) -> list[str]:
     normalized = transcript.strip()
     canonical = _canonicalize_voice_command_prefix(normalized)
     if canonical is not None:
-        return [canonical]
+        return [_normalize_whisper_minute_artifact(canonical)]
     if normalized.lower().startswith("/remind"):
         return [normalized]
     return [f"напомни {normalized}"]
