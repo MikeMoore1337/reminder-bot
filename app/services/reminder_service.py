@@ -2565,8 +2565,9 @@ async def get_failed_reminders(limit: int = 20) -> list[Reminder]:
         return list(result.scalars().all())
 
 
-def format_recurrence(reminder: Reminder) -> str:
-    rule = get_recurrence_rule(reminder)
+def format_recurrence_rule(rule: Mapping[str, Any]) -> str:
+    """Format a canonical recurrence rule for user-facing Russian text."""
+
     kind = rule["kind"]
     if kind == "none":
         return "нет"
@@ -2617,7 +2618,13 @@ def format_recurrence(reminder: Reminder) -> str:
         return f"ежегодно {int(rule['day']):02d}.{int(rule['month']):02d} в {rule['time']}{suffix}"
     if kind == "completion_relative":
         return f"через {rule['after_days']} дн. после выполнения{suffix}"
-    return str(reminder.recurrence_type)
+    return "неизвестно"
+
+
+def format_recurrence(reminder: Reminder) -> str:
+    """Format a reminder recurrence without exposing its internal rule kind."""
+
+    return format_recurrence_rule(get_recurrence_rule(reminder))
 
 
 def format_state(state: str) -> str:

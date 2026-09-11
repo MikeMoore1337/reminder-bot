@@ -9,7 +9,15 @@ from app.db.base import Base
 from app.db.models import RecurrenceType, Reminder, ReminderKind, ReminderMode, User
 from app.handlers import reminders as reminders_handler
 from app.services import reminder_service
-from app.services.recurrence import encode_rule, legacy_rule, yearly_rule
+from app.services.recurrence import (
+    completion_relative_rule,
+    encode_rule,
+    legacy_rule,
+    monthly_last_rule,
+    monthly_nth_rule,
+    weekly_rule,
+    yearly_rule,
+)
 from app.services.reminder_parser import parse_reminder_input
 from app.services.reminder_service import (
     advance_occurrence_until_future,
@@ -325,3 +333,38 @@ def test_format_recurrence_keeps_advanced_until_label() -> None:
     )
 
     assert reminder_service.format_recurrence(reminder) == "ежегодно 15.03 в 09:00 до 2026-12-31"
+
+
+@pytest.mark.parametrize(
+    ("rule", "expected"),
+    [
+        (
+            weekly_rule([0, 2], time(9), anchor_week=date(2026, 9, 7)),
+            "каждую неделю: понедельник, среду в 09:00",
+        ),
+        (
+            monthly_nth_rule(0, 2, time(9)),
+            "2-й понедельник месяца в 09:00",
+        ),
+        (
+            monthly_last_rule(4, time(18)),
+            "последний пятницу месяца в 18:00",
+        ),
+        (
+            yearly_rule(3, 15, time(9)),
+            "ежегодно 15.03 в 09:00",
+        ),
+        (
+            completion_relative_rule(3),
+            "через 3 дн. после выполнения",
+        ),
+    ],
+)
+def test_format_recurrence_keeps_advanced_labels(rule: dict, expected: str) -> None:
+    reminder = Reminder(
+        recurrence_type=RecurrenceType.ADVANCED.value,
+        recurrence_interval=1,
+        recurrence_rule=encode_rule(rule),
+    )
+
+    assert reminder_service.format_recurrence(reminder) == expected

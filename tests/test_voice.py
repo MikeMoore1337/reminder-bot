@@ -3,7 +3,8 @@ import logging
 import os
 import sys
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,10 +22,25 @@ from app.callbacks import (
     parse_callback,
 )
 from app.db.base import Base
-from app.db.models import ActionDraft, Reminder, ReminderClarification, User, VoiceReminderDraft
+from app.db.models import (
+    ActionDraft,
+    RecurrenceType,
+    Reminder,
+    ReminderClarification,
+    User,
+    VoiceReminderDraft,
+)
 from app.handlers import reminders as reminders_handler
 from app.keyboards.voice import voice_draft_kb
 from app.services import clarification_service, reminder_service, voice_service
+from app.services.recurrence import (
+    completion_relative_rule,
+    encode_rule,
+    monthly_last_rule,
+    monthly_nth_rule,
+    weekly_rule,
+    yearly_rule,
+)
 from app.services.reminder_parser import ClarificationRequest, ParsedReminder, parse_reminder_input
 from app.services.speech_to_text import (
     SpeechToTextError,
@@ -51,6 +67,134 @@ def _voice(
         mime_type=mime_type,
         file_size=file_size,
     )
+
+
+def _preview_draft(**overrides) -> VoiceReminderDraft:
+    values = {
+        "transcript": "напомни проверить отчёт",
+        "reminder_text": "проверить отчёт",
+        "remind_at_utc": datetime(2026, 9, 11, 9, 0, tzinfo=UTC),
+        "schedule_timezone": "Europe/Moscow",
+        "datetime_semantics": "instant",
+        "recurrence_type": "none",
+        "recurrence_interval": 1,
+        "recurrence_day_of_month": None,
+        "recurrence_rule": None,
+        "mode": "normal",
+        "expires_at": datetime(2026, 9, 11, 10, 0, tzinfo=UTC),
+    }
+    values.update(overrides)
+    return VoiceReminderDraft(**values)
+
+
+def test_voice_preview_localizes_no_recurrence() -> None:
+    preview = voice_service.format_voice_draft_preview(_preview_draft())
+
+    assert "<b>Повтор:</b> нет" in preview
+
+
+def test_voice_preview_localizes_legacy_daily_without_internal_kind() -> None:
+    preview = voice_service.format_voice_draft_preview(
+        _preview_draft(
+            recurrence_type=RecurrenceType.DAILY.value,
+            recurrence_interval=1,
+        )
+    )
+
+    assert "<b>Повтор:</b> каждый день" in preview
+    assert "legacy" not in preview
+
+
+def test_voice_preview_localizes_legacy_minutes_without_internal_kind() -> None:
+    preview = voice_service.format_voice_draft_preview(
+        _preview_draft(
+            recurrence_type=RecurrenceType.MINUTES.value,
+            recurrence_interval=5,
+        )
+    )
+
+    assert "<b>Повтор:</b> каждые 5 минут" in preview
+    assert "legacy" not in preview
+
+
+@pytest.mark.parametrize(
+    ("rule", "expected", "internal_kind"),
+    [
+        (
+            weekly_rule([0, 2], dt_time(9), anchor_week=date(2026, 9, 7)),
+            "каждую неделю: понедельник, среду в 09:00",
+            "weekly_days",
+        ),
+        (
+            monthly_nth_rule(0, 2, dt_time(9)),
+            "2-й понедельник месяца в 09:00",
+            "monthly_nth",
+        ),
+        (
+            monthly_last_rule(4, dt_time(18)),
+            "последний пятницу месяца в 18:00",
+            "monthly_last",
+        ),
+        (
+            yearly_rule(3, 15, dt_time(9)),
+            "ежегодно 15.03 в 09:00",
+            "yearly",
+        ),
+        (
+            completion_relative_rule(3),
+            "через 3 дн. после выполнения",
+            "completion_relative",
+        ),
+    ],
+)
+def test_voice_preview_localizes_advanced_recurrence(
+    rule: dict, expected: str, internal_kind: str
+) -> None:
+    preview = voice_service.format_voice_draft_preview(
+        _preview_draft(
+            recurrence_type=RecurrenceType.ADVANCED.value,
+            recurrence_rule=encode_rule(rule),
+        )
+    )
+
+    assert f"<b>Повтор:</b> {expected}" in preview
+    assert internal_kind not in preview
+    assert "advanced" not in preview
+    assert "weekdays" not in preview
+
+
+def test_voice_preview_preserves_recurrence_until_label() -> None:
+    rule = yearly_rule(3, 15, dt_time(9), until=date(2026, 12, 31))
+    preview = voice_service.format_voice_draft_preview(
+        _preview_draft(
+            recurrence_type=RecurrenceType.ADVANCED.value,
+            recurrence_rule=encode_rule(rule),
+        )
+    )
+
+    assert "<b>Повтор:</b> ежегодно 15.03 в 09:00 до 2026-12-31" in preview
+
+
+def test_voice_preview_uses_safe_fallback_for_malformed_recurrence() -> None:
+    malformed_rule = '{"kind":"weekly_days","weekdays":"not-a-list"}'
+    preview = voice_service.format_voice_draft_preview(
+        _preview_draft(
+            recurrence_type=RecurrenceType.ADVANCED.value,
+            recurrence_rule=malformed_rule,
+        )
+    )
+
+    assert "<b>Повтор:</b> неизвестно" in preview
+    assert malformed_rule not in preview
+    for internal_token in (
+        "weekly_days",
+        "weekdays",
+        "monthly_nth",
+        "monthly_last",
+        "completion_relative",
+        "advanced",
+    ):
+        assert internal_token not in preview
 
 
 def _settings(temp_dir: Path, **overrides):
