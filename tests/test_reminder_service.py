@@ -340,7 +340,16 @@ def test_format_recurrence_keeps_advanced_until_label() -> None:
     [
         (
             weekly_rule([0, 2], time(9), anchor_week=date(2026, 9, 7)),
-            "каждую неделю: понедельник, среду в 09:00",
+            "каждую неделю: понедельник, среда в 09:00",
+        ),
+        (
+            weekly_rule(
+                [0, 2],
+                time(9),
+                anchor_week=date(2026, 9, 7),
+                kind="weekdays",
+            ),
+            "каждую неделю: понедельник, среда в 09:00",
         ),
         (
             monthly_nth_rule(0, 2, time(9)),
@@ -348,7 +357,7 @@ def test_format_recurrence_keeps_advanced_until_label() -> None:
         ),
         (
             monthly_last_rule(4, time(18)),
-            "последний пятницу месяца в 18:00",
+            "последняя пятница месяца в 18:00",
         ),
         (
             yearly_rule(3, 15, time(9)),
@@ -368,3 +377,70 @@ def test_format_recurrence_keeps_advanced_labels(rule: dict, expected: str) -> N
     )
 
     assert reminder_service.format_recurrence(reminder) == expected
+
+
+@pytest.mark.parametrize(
+    ("weekday", "expected"),
+    [
+        (0, "2-й понедельник"),
+        (1, "2-й вторник"),
+        (2, "2-я среда"),
+        (3, "2-й четверг"),
+        (4, "2-я пятница"),
+        (5, "2-я суббота"),
+        (6, "2-е воскресенье"),
+    ],
+)
+def test_format_recurrence_localizes_monthly_nth_weekday_gender(
+    weekday: int, expected: str
+) -> None:
+    reminder = Reminder(
+        recurrence_type=RecurrenceType.ADVANCED.value,
+        recurrence_interval=1,
+        recurrence_rule=encode_rule(monthly_nth_rule(weekday, 2, time(9))),
+    )
+
+    assert reminder_service.format_recurrence(reminder) == f"{expected} месяца в 09:00"
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "weekday", "expected"),
+    [
+        (1, 2, "1-я среда"),
+        (5, 6, "5-е воскресенье"),
+    ],
+)
+def test_format_recurrence_localizes_monthly_nth_ordinal_form(
+    ordinal: int, weekday: int, expected: str
+) -> None:
+    reminder = Reminder(
+        recurrence_type=RecurrenceType.ADVANCED.value,
+        recurrence_interval=1,
+        recurrence_rule=encode_rule(monthly_nth_rule(weekday, ordinal, time(9))),
+    )
+
+    assert reminder_service.format_recurrence(reminder) == f"{expected} месяца в 09:00"
+
+
+@pytest.mark.parametrize(
+    ("weekday", "expected"),
+    [
+        (0, "последний понедельник"),
+        (1, "последний вторник"),
+        (2, "последняя среда"),
+        (3, "последний четверг"),
+        (4, "последняя пятница"),
+        (5, "последняя суббота"),
+        (6, "последнее воскресенье"),
+    ],
+)
+def test_format_recurrence_localizes_monthly_last_weekday_gender(
+    weekday: int, expected: str
+) -> None:
+    reminder = Reminder(
+        recurrence_type=RecurrenceType.ADVANCED.value,
+        recurrence_interval=1,
+        recurrence_rule=encode_rule(monthly_last_rule(weekday, time(18))),
+    )
+
+    assert reminder_service.format_recurrence(reminder) == f"{expected} месяца в 18:00"

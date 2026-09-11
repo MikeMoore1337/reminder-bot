@@ -122,7 +122,7 @@ def test_voice_preview_localizes_legacy_minutes_without_internal_kind() -> None:
     [
         (
             weekly_rule([0, 2], dt_time(9), anchor_week=date(2026, 9, 7)),
-            "каждую неделю: понедельник, среду в 09:00",
+            "каждую неделю: понедельник, среда в 09:00",
             "weekly_days",
         ),
         (
@@ -132,7 +132,7 @@ def test_voice_preview_localizes_legacy_minutes_without_internal_kind() -> None:
         ),
         (
             monthly_last_rule(4, dt_time(18)),
-            "последний пятницу месяца в 18:00",
+            "последняя пятница месяца в 18:00",
             "monthly_last",
         ),
         (
@@ -161,6 +161,34 @@ def test_voice_preview_localizes_advanced_recurrence(
     assert internal_kind not in preview
     assert "advanced" not in preview
     assert "weekdays" not in preview
+
+
+@pytest.mark.parametrize(
+    ("rule", "expected"),
+    [
+        (
+            monthly_nth_rule(2, 2, dt_time(9)),
+            "2-я среда месяца в 09:00",
+        ),
+        (
+            monthly_last_rule(4, dt_time(18)),
+            "последняя пятница месяца в 18:00",
+        ),
+        (
+            monthly_last_rule(6, dt_time(18)),
+            "последнее воскресенье месяца в 18:00",
+        ),
+    ],
+)
+def test_voice_preview_uses_gendered_monthly_weekday_labels(rule: dict, expected: str) -> None:
+    preview = voice_service.format_voice_draft_preview(
+        _preview_draft(
+            recurrence_type=RecurrenceType.ADVANCED.value,
+            recurrence_rule=encode_rule(rule),
+        )
+    )
+
+    assert f"<b>Повтор:</b> {expected}" in preview
 
 
 def test_voice_preview_preserves_recurrence_until_label() -> None:
