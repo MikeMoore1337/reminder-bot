@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from app.services.reminder_parser import (
     ClarificationRequest,
@@ -32,7 +32,19 @@ def _canonicalize_voice_command_prefix(transcript: str) -> str | None:
     return f"напомни {remainder}" if remainder else "напомни"
 
 
-def _normalize_whisper_minute_artifact(candidate: str) -> str:
+def _numeric_minute_value_is_safe(number: str, now_local: datetime) -> bool:
+    try:
+        interval = timedelta(minutes=int(number))
+        if now_local.tzinfo is None:
+            now_local + interval
+        else:
+            (now_local.astimezone(UTC) + interval).astimezone(now_local.tzinfo)
+    except (OverflowError, ValueError):
+        return False
+    return True
+
+
+def _normalize_whisper_minute_artifact(candidate: str, *, now_local: datetime) -> str:
     """Normalize one bounded Whisper artifact without touching the transcript/body."""
 
     match = _WHISPER_MINUTE_ARTIFACT_RE.fullmatch(candidate)
@@ -40,7 +52,10 @@ def _normalize_whisper_minute_artifact(candidate: str) -> str:
         return candidate
 
     number = match.group("number")
-    if not number.isdecimal() and _parse_russian_number_words(number) is None:
+    if number.isdecimal():
+        if not _numeric_minute_value_is_safe(number, now_local):
+            return candidate
+    elif _parse_russian_number_words(number) is None:
         return candidate
 
     body = match.group("body")
@@ -50,11 +65,11 @@ def _normalize_whisper_minute_artifact(candidate: str) -> str:
     return f"напомни через {number} минуты{match.group('separator')}{body}"
 
 
-def _voice_parse_candidates(transcript: str) -> list[str]:
+def _voice_parse_candidates(transcript: str, *, now_local: datetime) -> list[str]:
     normalized = transcript.strip()
     canonical = _canonicalize_voice_command_prefix(normalized)
     if canonical is not None:
-        return [_normalize_whisper_minute_artifact(canonical)]
+        return [_normalize_whisper_minute_artifact(canonical, now_local=now_local)]
     if normalized.lower().startswith("/remind"):
         return [normalized]
     return [f"напомни {normalized}"]
@@ -67,7 +82,7 @@ def parse_voice_transcript(
 ) -> tuple[str, ParsedReminder | DeadlineRequest | ClarificationRequest | None]:
     """Use the deterministic parser; adding the command prefix is explicit and bounded."""
 
-    for candidate in _voice_parse_candidates(transcript):
+    for candidate in _voice_parse_candidates(transcript, now_local=now_local):
         parsed = parse_reminder_input(candidate, now_local=now_local)
         if parsed is not None:
             return candidate, parsed

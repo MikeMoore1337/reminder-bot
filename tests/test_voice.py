@@ -271,6 +271,20 @@ def test_voice_transcript_minute_artifact_does_not_normalize_body() -> None:
     assert parsed.text == "сказать слово минута"
 
 
+def test_voice_transcript_oversized_digit_minute_artifact_fails_closed() -> None:
+    oversized = "9" * 100
+    transcript = f"Напомни через {oversized} минута открыть окно"
+    now_local = datetime(2026, 9, 8, 13, 0, 45, 123456)
+
+    candidate, parsed = voice_service.parse_voice_transcript(
+        transcript,
+        now_local=now_local,
+    )
+
+    assert candidate == f"напомни через {oversized} минута открыть окно"
+    assert isinstance(parsed, ClarificationRequest)
+
+
 @pytest.mark.parametrize(
     "transcript",
     [
