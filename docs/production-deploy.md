@@ -41,6 +41,15 @@ account. Only after this metadata/readability preflight passes does it parse
 stops the deploy; the script never prints `.env` contents and never performs
 automatic `chown`/`chmod` on `.env`, ACL changes, `sudo`, or file replacement.
 
+This is the fail-fast phase. Immediately after the deployment lock is acquired,
+the script repeats the regular-file, ownership, mode, readability, and
+`BOT_MODE=polling` checks as the authoritative phase. It then pins a private
+shell-only fingerprint containing device/inode, uid/gid, mode, and a SHA-256
+content digest. The fingerprint is checked before and after every subsequent
+Docker Compose phase, so pathname replacement, inode/metadata changes, or
+content changes fail closed with `production .env changed during deployment`.
+The digest is never printed and no digest temporary file is created.
+
 ## Immutable image transport
 
 The GitHub runner checks out the exact 40-character protected `master` SHA and
@@ -313,7 +322,8 @@ sudo chmod 0600 /opt/reminder-bot/.env
 
 Restoring mode `0600` alone is insufficient if ownership has become
 `root:root`. Do not print the file contents, automate these root actions in the
-deploy, or touch the legacy `/root/reminder_bot`.
+deploy, touch the legacy `/root/reminder_bot`, or restore the canonical `.env`
+while another deployment is active or waiting for its lock.
 
 ## Deployment sequence and safety gates
 
@@ -321,10 +331,11 @@ For an enabled, correctly bootstrapped deployment, the workflow and remote
 script perform this bounded sequence:
 
 1. validate the exact 40-character SHA and the successful `master` CI run;
-2. validate the production `.env` invariant, readability, and then
-   `BOT_MODE=polling` before any deployment lock is acquired;
+2. run the fail-fast production `.env` invariant/readability checks and
+   `BOT_MODE=polling` validation before any deployment lock is acquired;
 3. acquire the Reminder Bot-specific server lock
-   `/opt/reminder-bot/locks/deploy.lock` with a bounded `flock` wait;
+   `/opt/reminder-bot/locks/deploy.lock` with a bounded `flock` wait, then
+   repeat the `.env` validation and pin its identity/content fingerprint;
 4. check out and load `reminder-bot:<FULL_SHA>`, verifying OCI labels;
 5. validate project `reminder_bot`, the exact named volume, labels, PG17, and
    the polling invariant before live service changes;
