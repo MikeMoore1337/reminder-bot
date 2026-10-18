@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">Reminder Bot - социальная обложка GitHub</title>
+  <desc id="desc">Reminder Bot. Пиши. Говори. Не забывай. Умные напоминания в Telegram - текст, голос, повторы и дедлайны.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#08162C"/>
+      <stop offset=".6" stop-color="#133457"/>
+      <stop offset="1" stop-color="#19577E"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#92EBFF"/>
+      <stop offset="1" stop-color="#60B8FF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <circle cx="1150" cy="120" r="345" fill="none" stroke="#9CDBFF" stroke-opacity=".12" stroke-width="2"/>
+  <circle cx="1150" cy="120" r="270" fill="none" stroke="#9CDBFF" stroke-opacity=".12" stroke-width="2"/>
+  <circle cx="1150" cy="120" r="195" fill="none" stroke="#9CDBFF" stroke-opacity=".09" stroke-width="2"/>
+  <circle cx="30" cy="650" r="300" fill="none" stroke="#A6E9FF" stroke-opacity=".11" stroke-width="2"/>
+  <g transform="translate(95 98)">
+    <rect width="79" height="79" rx="23" fill="#3275C4"/>
+    <circle cx="39.5" cy="39.5" r="25" fill="none" stroke="#F9FDFF" stroke-width="5"/>
+    <path d="M39.5 22 V39.5 L53 31" fill="none" stroke="#F9FDFF" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="39.5" cy="39.5" r="3.5" fill="#87EFFF"/>
+  </g>
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <text x="193" y="154" fill="#F9FCFF" font-size="49" font-weight="750">Reminder <tspan fill="#85E6FF">Bot</tspan></text>
+    <text x="94" y="291" fill="#FFFFFF" font-size="60" font-weight="750" letter-spacing="-1">Пиши. Говори.</text>
+    <text x="94" y="365" fill="url(#accent)" font-size="60" font-weight="750" letter-spacing="-1">Не забывай.</text>
+    <text x="96" y="424" fill="#C7DFF2" font-size="27">Умные напоминания в Telegram</text>
+    <text x="96" y="466" fill="#C7DFF2" font-size="22">Без сложных форм и лишних действий</text>
+  </g>
+  <g font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="650">
+    <rect x="94" y="521" width="130" height="42" rx="21" fill="#285478" stroke="#447DA2"/>
+    <text x="159" y="548" text-anchor="middle" fill="#EAF9FF">Текст</text>
+    <rect x="237" y="521" width="130" height="42" rx="21" fill="#285478" stroke="#447DA2"/>
+    <text x="302" y="548" text-anchor="middle" fill="#EAF9FF">Голос</text>
+    <rect x="380" y="521" width="149" height="42" rx="21" fill="#285478" stroke="#447DA2"/>
+    <text x="454.5" y="548" text-anchor="middle" fill="#EAF9FF">Повторы</text>
+  </g>
+  <g transform="translate(772 205)" font-family="Segoe UI, Arial, sans-serif">
+    <rect width="420" height="243" rx="26" fill="#142D4B" stroke="#5B93B8" stroke-opacity=".85" stroke-width="2"/>
+    <rect x="40" y="37" width="343" height="76" rx="18" fill="#2B81DB"/>
+    <text x="62" y="69" fill="#FFFFFF" font-size="19" font-weight="650">Напомни завтра в 9</text>
+    <text x="62" y="97" fill="#FFFFFF" font-size="19" font-weight="650">позвонить маме</text>
+    <rect x="27" y="132" width="363" height="83" rx="17" fill="#204262"/>
+    <circle cx="58" cy="159" r="14" fill="#249A87"/>
+    <path d="M51 159 L56 164 L65 154" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" fill="none"/>
+    <text x="83" y="165" fill="#FAFDFF" font-size="19" font-weight="700">Напоминание создано</text>
+    <text x="50" y="196" fill="#C0D8E9" font-size="18">Завтра, 09:00</text>
+  </g>
+</svg>

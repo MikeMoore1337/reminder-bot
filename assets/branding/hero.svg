@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+  <title id="title">Reminder Bot - умные напоминания в Telegram</title>
+  <desc id="desc">Синяя обложка с логотипом-часами, слоганом «Пиши. Говори. Не забывай.» и примером напоминания на завтра в 09:00.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#09162D"/>
+      <stop offset=".55" stop-color="#102849"/>
+      <stop offset="1" stop-color="#143C61"/>
+    </linearGradient>
+    <linearGradient id="highlight" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8AE9FF"/>
+      <stop offset="1" stop-color="#4EACFF"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3089E8"/>
+      <stop offset="1" stop-color="#2365C5"/>
+    </linearGradient>
+    <radialGradient id="halo">
+      <stop offset="0" stop-color="#4EA4F9" stop-opacity=".26"/>
+      <stop offset="1" stop-color="#4EA4F9" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="17" stdDeviation="20" flood-color="#020A1B" flood-opacity=".44"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="440" rx="24" fill="url(#background)"/>
+  <circle cx="990" cy="100" r="310" fill="url(#halo)"/>
+  <circle cx="1180" cy="405" r="260" fill="none" stroke="#7ACFFE" stroke-opacity=".12" stroke-width="2"/>
+  <circle cx="1180" cy="405" r="205" fill="none" stroke="#7ACFFE" stroke-opacity=".10" stroke-width="2"/>
+  <circle cx="72" cy="401" r="170" fill="none" stroke="#8AD3FB" stroke-opacity=".07" stroke-width="2"/>
+  <path d="M0 395 H1200 M0 360 H1200" stroke="#B8E9FF" stroke-opacity=".035"/>
+  <g transform="translate(72 65)">
+    <rect x="0" y="0" width="58" height="58" rx="17" fill="#2869B7"/>
+    <circle cx="29" cy="29" r="18.5" fill="none" stroke="#FFFFFF" stroke-width="4"/>
+    <path d="M29 16.5 V29 L39 23" fill="none" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="29" cy="29" r="3" fill="#80E8FF"/>
+    <text x="77" y="38" fill="#F1F8FF" font-family="Segoe UI, Arial, sans-serif" font-size="29" font-weight="750" letter-spacing="-.6">Reminder <tspan fill="#8AE9FF">Bot</tspan></text>
+  </g>
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <text x="72" y="195" fill="#F9FCFF" font-size="43" font-weight="750" letter-spacing="-.9">Пиши. Говори.</text>
+    <text x="72" y="248" fill="url(#highlight)" font-size="43" font-weight="750" letter-spacing="-.9">Не забывай.</text>
+    <text x="74" y="295" fill="#C9DBEE" font-size="19">Умные напоминания в Telegram</text>
+    <text x="74" y="326" fill="#C9DBEE" font-size="17">Без сложных форм и лишних действий</text>
+  </g>
+  <g font-family="Segoe UI, Arial, sans-serif" font-weight="600" font-size="15">
+    <rect x="72" y="362" width="110" height="34" rx="17" fill="#22466B" stroke="#407197" stroke-opacity=".65"/>
+    <text x="127" y="384" text-anchor="middle" fill="#E4F4FF">Текст</text>
+    <rect x="193" y="362" width="110" height="34" rx="17" fill="#22466B" stroke="#407197" stroke-opacity=".65"/>
+    <text x="248" y="384" text-anchor="middle" fill="#E4F4FF">Голос</text>
+    <rect x="314" y="362" width="127" height="34" rx="17" fill="#22466B" stroke="#407197" stroke-opacity=".65"/>
+    <text x="377.5" y="384" text-anchor="middle" fill="#E4F4FF">Повторы</text>
+  </g>
+  <g filter="url(#shadow)" font-family="Segoe UI, Arial, sans-serif">
+    <rect x="678" y="52" width="448" height="335" rx="25" fill="#10243F" stroke="#47759E" stroke-opacity=".8" stroke-width="1.5"/>
+    <circle cx="714" cy="84" r="5" fill="#5E86A6"/>
+    <circle cx="732" cy="84" r="5" fill="#5E86A6"/>
+    <circle cx="750" cy="84" r="5" fill="#5E86A6"/>
+    <text x="1085" y="90" text-anchor="end" fill="#A7CBE7" font-size="12" font-weight="700" letter-spacing="1.4">ПРИМЕР ДИАЛОГА</text>
+    <rect x="745" y="123" width="337" height="82" rx="19" fill="url(#bubble)"/>
+    <path d="M1067 196 L1087 207 L1081 187" fill="#256CCB"/>
+    <text x="766" y="153" fill="#FFFFFF" font-size="18" font-weight="650">Напомни завтра в 9</text>
+    <text x="766" y="180" fill="#FFFFFF" font-size="18" font-weight="650">позвонить маме</text>
+    <rect x="718" y="226" width="372" height="127" rx="18" fill="#1B3858" stroke="#47779F" stroke-opacity=".8"/>
+    <circle cx="750" cy="263" r="15" fill="#1F927E"/>
+    <path d="M743 263 L748 268 L758 257" fill="none" stroke="#FFFFFF" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="776" y="268" fill="#F3FBFF" font-size="17" font-weight="700">Напоминание создано</text>
+    <text x="747" y="301" fill="#BCD6E9" font-size="16">Завтра, 09:00</text>
+    <rect x="746" y="315" width="135" height="23" rx="11.5" fill="#275075"/>
+    <text x="813.5" y="331" text-anchor="middle" fill="#AEE9FF" font-size="12" font-weight="650">По местному времени</text>
+  </g>
+</svg>

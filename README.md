@@ -1,336 +1,181 @@
-# ⏱ Reminder Bot
+<p align="center">
+  <img src="assets/branding/hero.svg" width="100%" alt="Reminder Bot: пиши, говори, не забывай. Умные напоминания в Telegram." />
+</p>
 
-Умная напоминалка без сложных форм: напиши или скажи обычной фразой, что и
-когда напомнить, а бот разберёт время и покажет понятное подтверждение.
+<p align="center">
+  <a href="https://github.com/MikeMoore1337/reminder-bot/actions/workflows/ci.yml"><img src="https://github.com/MikeMoore1337/reminder-bot/actions/workflows/ci.yml/badge.svg" alt="Статус CI" /></a>
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/Telegram-aiogram%203-229ED9?logo=telegram&logoColor=white" alt="Telegram aiogram 3" />
+  <img src="https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 17 (Docker Compose)" />
+</p>
 
----
+<p align="center">
+  <strong>Напоминания обычными словами - без заполнения форм.</strong><br />
+  Одноразовые задачи, повторы, важные уведомления и дедлайны прямо в Telegram.
+</p>
 
-## 🚀 Возможности
-
-### 🕒 Напоминания
-- по дате и времени  
-- через промежуток времени  
-- повторяющиеся по дням недели, рабочим дням, календарным правилам и после выполнения
-
-### 📌 Примеры
-напомни завтра в 9 созвон  
-напомни через 30 минут выключить духовку  
-напомни каждый день в 10 выпить витамины  
-напомни каждые 2 часа пить воду  
-напомни каждые 10 минут проверить сервер  
-напомни 31.03.2026 18:30 купить молоко  
-напомни каждый понедельник и четверг в 9 отправить отчёт
-напомни по будням в 18 проверить задачи
-напомни каждый второй вторник месяца в 10 оплатить счёт
-напомни каждый год 15 марта в 9 годовщина
-напомни завтра в 9 отчёт, через 3 дня после выполнения
+<p align="center">
+  <a href="#как-это-работает">Примеры</a> ·
+  <a href="#возможности">Возможности</a> ·
+  <a href="#запуск-проекта">Запуск проекта</a> ·
+  <a href="#документация">Документация</a>
+</p>
 
 ---
 
-### 🔁 Повторения
+## Как это работает
 
-Поддерживается:
+Напиши боту, **что** нужно сделать и **когда**. Если запрос однозначен, напоминание сохраняется сразу; если времени не хватает или оно неоднозначно, бот попросит уточнить. Для голосовых сообщений и планов дедлайна предусмотрено отдельное подтверждение перед созданием.
 
-- каждые X минут (минимум 5)
-- каждый час / каждые X часов
-- каждый день / каждые X дней
-- каждую неделю
-- каждый месяц
-- выбранные дни недели и рабочие дни
-- каждые N недель
-- N-й или последний день недели в месяце
-- ежегодные даты
-- повторять до указанной даты
-- N дней после фактического выполнения
+| Сообщение боту | Результат |
+| --- | --- |
+| `Напомни завтра в 9 созвон` | Одно напоминание на завтра, 09:00 |
+| `Напомни через 30 минут выключить духовку` | Напоминание через полчаса |
+| `Напомни по будням в 18 проверить задачи` | Повтор с понедельника по пятницу |
+| `Напомни каждый второй вторник месяца в 10 оплатить счёт` | Календарное повторение |
+| `Напомни важное завтра в 9 позвонить` | Повторные уведомления в пределах заданных ограничений |
+| `/deadline 2030-09-10 18:00 оплатить счёт` | Предпросмотр плана напоминаний до дедлайна |
 
-### 🔔 Важный режим
+> **Не нужно угадывать часовой пояс.** Бот хранит его для каждого пользователя отдельно. При создании и показе напоминания используется локальное время, а в базе сохраняются UTC-моменты.
 
-Добавь `важное`, `important` или `persistent` после команды `напомни`, либо
-поставь `[важное]` в конце строки. Бот повторяет доставку до явного действия
-пользователя, но всегда соблюдает сохранённые лимиты, тихие часы и cooldown на
-сообщения одного пользователя. Кнопка «Выключить повторы» переводит текущий
-reminder обратно в обычный режим; «Готово», «Отложить» и «Удалить» также
-останавливают текущий persistent-цикл.
+## Возможности
 
-Пример:
+| | Функция | Что умеет |
+| :---: | --- | --- |
+| 🗣️ | **Понятный текст** | Разбирает обычные фразы; уточняет неоднозначное время вместо создания ошибочной задачи. |
+| 🎙️ | **Голосовые сообщения** | Локальное распознавание через `whisper.cpp` с предпросмотром и кнопкой «Создать». Требует отдельной настройки модели. |
+| 🔁 | **Гибкие повторения** | Интервалы, дни недели, рабочие дни, месяцы, годы и повтор после выполнения. |
+| 🔔 | **Важные напоминания** | Ограниченные повторные доставки с учётом тихих часов и возможности остановить цикл. |
+| 📅 | **Защита дедлайна** | Контрольные точки «за день», «за час», «в срок» и другие - с подтверждением плана. |
+| 📎 | **Контекст Telegram** | Напоминания в ответ на сообщения, ссылки и вложения с ограниченным сроком хранения контекста. |
+| 👥 | **Общие напоминания** | Приглашение по одноразовой ссылке; участники могут подтвердить или отложить доставку. |
+| 💡 | **Подсказки и дайджесты** | Необязательные рекомендации и утренние/вечерние обзоры. Выключены по умолчанию. |
 
-```text
-напомни важное завтра в 9 позвонить
-напомни завтра в 18 проверить отчёт [важное]
+<details>
+<summary><strong>Подробнее о повторениях и действиях</strong></summary>
+
+Поддерживаются интервалы от 5 минут, ежедневные и еженедельные правила, каждые N недель, выбранные дни недели, N-й/последний день недели месяца, ежегодные даты и ограничение «до даты». Можно задать повтор спустя N дней после фактического выполнения.
+
+Карточки напоминаний позволяют отметить «Готово», отложить, изменить или удалить задачу. Повторы можно приостановить и продолжить, а важные уведомления - отключить отдельно.
+
+</details>
+
+**Важно о доступности:** это возможности кодовой базы. Голосовое распознавание включается только после установки локальной модели; подсказки и дайджесты требуют согласия пользователя. Наличие функции в коде не означает, что она уже включена в конкретном развёрнутом боте.
+
+## Команды Telegram
+
+| Команда | Назначение |
+| --- | --- |
+| `/start`, `/help` | Первый экран и справка |
+| `/remind`, `/list` | Создание и список напоминаний |
+| `/deadline` | План защиты дедлайна |
+| `/timezone`, `/mytimezone` | Установка и просмотр часового пояса |
+| `/suggestions on\|off`, `/digest on\|off` | Необязательные подсказки и дайджесты |
+| `/share`, `/shared` | Приглашения и общие напоминания |
+| `/cancel` | Отмена текущего действия |
+
+Администраторские `/stats` и `/failed` доступны только при соответствующих правах. Канонический каталог команд - [`app/telegram_metadata.py`](app/telegram_metadata.py).
+
+---
+
+## Запуск проекта
+
+Нужны **Docker + Docker Compose**, токен собственного Telegram-бота и доступ к терминалу. Это инструкции для самостоятельного размещения, не ссылка на публичный бот.
+
+```bash
+git clone https://github.com/MikeMoore1337/reminder-bot.git
+cd reminder-bot
+cp .env.example .env
 ```
 
-Политика и DST-safe правила описаны в
-[docs/persistent_reminders.md](docs/persistent_reminders.md).
+В `.env` обязательно укажи действительный `BOT_TOKEN`, задай собственный `POSTGRES_PASSWORD` и обнови пароль в `DATABASE_URL`. Остальные параметры можно начать с примера. **Не коммить `.env` и секреты в Git.**
 
-### 💡 Подсказки и дайджесты
+```bash
+docker compose build
+docker compose --profile tools run --rm migrate
+docker compose up -d db bot worker
+```
 
-Функции включаются отдельно и выключены по умолчанию:
+Проверка запущенных процессов и логи:
 
-- `/suggestions on|off` — детерминированная подсказка, если повторяющееся
-  напоминание несколько раз переносили примерно на одно и то же время;
-- `/digest on|off` — утренний и вечерний список незавершённых напоминаний в
-  часовом поясе пользователя;
-- подсказка никогда не меняет расписание без явного «Перенести»;
-- дайджест ограничен по размеру, учитывает тихие часы и не исключает важные
-  напоминания.
+```bash
+docker compose ps
+docker compose logs -f bot worker
+```
 
-Подробный контракт persistence, идемпотентности и retention описан в
-[docs/adaptive_reminders.md](docs/adaptive_reminders.md).
+Бот работает в `polling` или `webhook` режиме. Пример конфигурации использует polling. Для голосовых запросов отдельно установи локальные `whisper.cpp` и multilingual-модель по [инструкции](docs/voice_reminders.md): по умолчанию распознавание выключено.
 
-### ⏳ Защита дедлайна
+> Перед размещением в открытом интернете настрой сеть, секреты и ограничения в соответствии с [инструкцией production-deploy](docs/production-deploy.md). `/healthz` проверяет доступность процесса, а `/readyz` - подключение к PostgreSQL.
 
-Для задачи с конечным сроком используй `/deadline`: бот построит ограниченный
-план напоминаний, покажет preview и сохранит его только после подтверждения.
-Можно написать и естественно: `Оплатить VPS до 10 сентября`; без времени будет
-использовано 23:59 в часовом поясе пользователя.
-Точки можно настроить после `|`, например `за день, за час, в срок` или
-`просрочено через час`. Детали persistence, DST и действий описаны в
-[docs/deadline_protection.md](docs/deadline_protection.md).
+## Архитектура
 
-Примеры:
-каждые 5 минут  
-каждый час  
-каждые 2 часа  
-каждый день  
-каждую неделю  
-каждый месяц  
+```text
+                    ┌──────────────────┐
+                    │     Telegram     │
+                    └───┬──────────▲───┘
+                        │          │ сообщения
+                        ▼          │
+                    ┌──────────────┴───┐
+                    │ Bot · aiogram    │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │    PostgreSQL    │
+                    │ напоминания,     │
+                    │ состояния,       │
+                    │ расписания       │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │ Reminder Worker  │───► Telegram
+                    └──────────────────┘
+```
 
-Правила календаря хранятся в каноническом виде и пересчитываются в сохранённом
-часовом поясе пользователя. Если формулировка неоднозначна (`в пятницу в 8`,
-`завтра вечером`, `после обеда`), бот задаёт уточняющий вопрос и хранит его 15 минут;
-неоднозначный текст не создаёт напоминание. `/cancel` отменяет уточнение.
+**PostgreSQL - источник истины.** Бот обрабатывает ввод и действия, отдельный worker управляет наступившими напоминаниями и доставкой. Расписания сохраняются с часовым поясом пользователя и правилами перехода на летнее/зимнее время. Состояние и повторные попытки доставки переживают обычные перезапуски; внешняя доставка через Telegram не объявляется строго exactly-once.
 
----
+### Технологии
 
-### 🌍 Часовые пояса
-- индивидуально для каждого пользователя  
-- формат IANA (Europe/Moscow, Europe/Helsinki и т.д.)  
-- хранение времени в UTC  
+**Python 3.12 · aiogram 3 · SQLAlchemy · asyncpg · PostgreSQL · Alembic · Docker Compose · pytest · Ruff · mypy**
 
-### 🎙 Голосовые напоминания
-- Telegram voice в OGG/Opus проходит bounded download и локальную конвертацию;
-- `whisper.cpp` запускается on-demand, только с multilingual/local model;
-- транскрипт проходит тот же детерминированный parser;
-- reminder сохраняется только после явного подтверждения «Создать»;
-- аудио удаляется после обработки, draft хранится в PostgreSQL ограниченное время;
-- настройка модели и CPU-only bootstrap описаны в [docs/voice_reminders.md](docs/voice_reminders.md),
-  а правила контекстных reminders — в [docs/message_context.md](docs/message_context.md).
+Без обязательного облачного распознавания речи, GPU, Redis и отдельных очередей сообщений.
 
-### 📎 Контекст Telegram
-- reply, forward, пост канала, ссылка, фото и документ сохраняются как bounded snapshot/reference;
-- медиа не скачивается: при наличии `file_id` worker отправляет его через Telegram, иначе использует text fallback;
-- обычный reminder без Telegram-контекста остаётся без дополнительных данных;
-- контекст хранится 30 дней, не логируется raw и удаляется worker-ом по TTL.
+## Разработка и CI
 
----
-
-## 🧠 UX / UI
-
-### `/start`
-- branded welcome visual с текстовым fallback
-- короткое позиционирование и три быстрых примера
-- текущий часовой пояс
-- кнопки управления
-
-### Reply-клавиатура
-- ➕ Создать напоминание  
-- 📋 Мои напоминания  
-- 🌍 Часовой пояс  
-- ❓ Помощь  
-
-### `/help`
-структурированная инструкция: быстрый старт, повторы, важные reminders и
-дедлайны, голос, Telegram-контекст, общие reminders, настройки и команды
-
-Профиль, canonical copy, команды и owner checkpoint для Telegram собраны в
-[docs/telegram-branding.md](docs/telegram-branding.md).
-
-### Action cards
-- доставленные напоминания имеют кнопки «Готово», «Отложить», «Изменить» и «Удалить»;
-- важные напоминания дополнительно показывают «Выключить повторы»;
-- для повторяющихся напоминаний доступны «Пауза» и «Продолжить»;
-- «Вечером» означает ближайшие 20:00, а «Завтра» — 09:00 в сохранённом часовом поясе пользователя;
-- `/list` показывает по одной карточке на активное напоминание с локальным временем и действиями.
-
----
-
-## ⚙️ Команды
-
-Публичные:
-- /start  
-- /help  
-- /timezone  
-- /mytimezone  
-- /suggestions on|off
-- /digest on|off
-- /remind  
-- /deadline
-- /list  
-- /share
-- /shared
-- /cancel  
-
-Админ:
-- /stats  
-- /failed  
-
----
-
-## 🏗 Архитектура
-
-Telegram → Bot (aiogram) → PostgreSQL → Worker
-
-Почему так:
-- нет потери задач при рестарте
-- масштабируемость
-- устойчивость
-
-Доставленные occurrence и многошаговые Edit/Custom Snooze хранятся в PostgreSQL.
-Recurring Snooze создаёт связанную one-off child-запись и не меняет canonical series.
-
----
-
-## ⚙️ Установка
-
-### 1. Клонирование
-git clone <repo>
-cd reminder_bot
-
----
-
-### 2. Настройка .env
-
-BOT_TOKEN=your_token  
-POSTGRES_DB=reminder_bot  
-POSTGRES_USER=postgres  
-POSTGRES_PASSWORD=postgres  
-BOT_MODE=polling  
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/reminder_bot  
-LOG_LEVEL=INFO  
-DEFAULT_TIMEZONE=Europe/Moscow  
-POLLING_ALLOWED_UPDATES=message,edited_message,callback_query  
-ADMIN_IDS=123456789  
-
-Для локальной разработки установи dev lock без production-секретов:
+Для локальной разработки используй **Python 3.12** и закреплённые зависимости:
 
 ```bash
 python -m venv .venv
+# Активируй окружение командой своей ОС
 python -m pip install -r requirements-dev.txt
+ruff check app tests alembic
+ruff format --check app tests alembic
+mypy app --ignore-missing-imports
+python -m pytest -q
 ```
 
-Production Docker image устанавливает только `requirements.txt`.
+GitHub Actions запускает три проверки на PR и `master`: **`quality`** (стиль, типизация, зависимости), **`tests-postgres`** (тесты и миграции с PostgreSQL) и **`docker-smoke`** (сборка и проверки образа/Compose). Подробности - [`ci.yml`](.github/workflows/ci.yml).
+
+## Документация
+
+| Раздел | Где читать |
+| --- | --- |
+| Начисление времени, повторы и DST | [Расписания](docs/scheduling.md) |
+| Надёжность доставки и повторные попытки | [Worker delivery](docs/worker_delivery.md) |
+| Важные уведомления | [Persistent reminders](docs/persistent_reminders.md) |
+| Защита дедлайна | [Deadline protection](docs/deadline_protection.md) |
+| Голос и локальное распознавание | [Voice reminders](docs/voice_reminders.md) |
+| Контекст сообщений и вложений | [Message context](docs/message_context.md) |
+| Общие напоминания и приватность | [Shared reminders](docs/shared_reminders.md) |
+| Подсказки и дайджесты | [Adaptive reminders](docs/adaptive_reminders.md) |
+| Условные провайдеры (отдельный, по умолчанию выключенный компонент) | [Condition providers](docs/condition_providers.md) |
+| Профиль и визуальные материалы Telegram | [Telegram branding](docs/telegram-branding.md) |
+| Развёртывание | [Production deploy](docs/production-deploy.md) |
 
 ---
 
-### 3. Запуск
-
-docker compose build  
-docker compose --profile tools run --rm migrate  
-docker compose up -d db bot worker  
-
----
-
-### 4. Логи
-
-docker compose logs -f bot  
-docker compose logs -f worker  
-
----
-
-## 🔁 Управление
-
-Перезапуск:
-docker compose restart  
-
-Остановка:
-docker compose down  
-
-Обновление:
-git pull  
-docker compose build  
-docker compose up -d  
-
----
-
-## ⚠️ Важно
-
-- все даты хранятся в UTC  
-- пользователю показывается локальное время  
-- canonical-правило повторения хранится вместе со следующим UTC-вхождением
-- повторения обновляются без создания новых записей (кроме независимого snooze child)
-- worker обрабатывает задачи через БД  
-- `/healthz` — liveness процесса и не зависит от PostgreSQL
-- `/readyz` — bounded PostgreSQL readiness: `200` при `SELECT 1`, `503` при недоступной БД
-
-Bot process слушает `APP_HOST:APP_PORT` в обоих режимах. В polling mode HTTP app содержит только
-`/healthz` и `/readyz`; в webhook mode к этим probe routes добавляется Telegram webhook route.
-
-## 🔒 Зависимости и lockfiles
-
-`pyproject.toml` — canonical source прямых runtime-зависимостей и `dev` extra. Для обновления
-lockfiles используется `pip-tools`; `requirements.in` не нужен и не дублирует `pyproject.toml`.
-Lockfiles генерируются под Linux/Python 3.12 — это target CI и production Docker; на Windows
-запускай команды в WSL или Linux-контейнере, чтобы не добавить Windows-only зависимости вроде
-`colorama`:
-
-```bash
-python -m pip install --upgrade pip-tools
-pip-compile --index-url https://pypi.org/simple --no-emit-index-url --strip-extras --output-file requirements.txt pyproject.toml
-pip-compile --index-url https://pypi.org/simple --no-emit-index-url --strip-extras --extra dev --output-file requirements-dev.txt pyproject.toml
-```
-
-В рамках этого baseline оставлен `pip-tools`, а не `uv`: текущий pip/Docker workflow уже работает,
-и compiled runtime/dev lockfiles дают воспроизводимость с меньшим migration risk. Переход на uv
-возможен отдельной задачей только при измеримой выгоде.
-
-## ✅ Проверки и CI
-
-GitHub Actions запускается для PR в `master` и push в `master` и содержит стабильные jobs:
-
-- `quality` — Python 3.12, dev lock, Ruff check/format и mypy;
-- `tests-postgres` — Python 3.12, PostgreSQL 16 service, полный pytest, миграционный upgrade/
-  downgrade/re-upgrade и PostgreSQL concurrency tests;
-- `docker-smoke` — production image build, Compose config/migration validation,
-  synthetic OGG/Opus -> mono 16 kHz PCM WAV voice preflight и проверка отсутствия
-  dev tools в runtime image без Telegram API.
-
-Lock freshness проверяется пересборкой обоих lockfiles и `git diff --exit-code`. CI не использует
-production secrets или production database.
-
-## 🗃️ Миграции и merge policy
-
-Проверить цепочку локально:
-
-```bash
-alembic heads
-alembic history
-alembic upgrade head
-```
-
-После Issue #13 self-merge допускается только для внешне одобренного exact head при зелёных
-`quality`, `tests-postgres` и `docker-smoke`, mergeable PR и отсутствии blocking review. Auto-merge
-предпочтителен, если branch rules и exact-head guards сохранены.
-
----
-
-## 📈 Возможности для развития
-
-- cron-подобные расписания  
-- rate limiting  
-- уведомления о сбоях  
-- webhook + HTTPS  
-
----
-
-## 🧠 Концепция
-
-- БД = источник истины  
-- worker = обработка  
-- bot = интерфейс  
-
-Это даёт:
-- стабильность  
-- масштабируемость  
-- предсказуемость  
-
----
+<p align="center">
+  <strong>Меньше настроек. Больше выполненных дел.</strong><br />
+  <sub>Reminder Bot · Python · aiogram · PostgreSQL</sub>
+</p>
