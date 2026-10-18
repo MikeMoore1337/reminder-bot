@@ -177,5 +177,5 @@ GitHub Actions запускает три проверки на PR и `master`: *
 
 <p align="center">
   <strong>Меньше настроек. Больше выполненных дел.</strong><br />
-  <sub>Reminder Bot · Telegram · Open-source repository</sub>
+  <sub>Reminder Bot · Python · aiogram · PostgreSQL</sub>
 </p>
