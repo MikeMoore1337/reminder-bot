@@ -121,7 +121,9 @@ def classify_review_request(
         raise ConditionProviderError("github_response_invalid")
     if state == "closed":
         normalized = "resolved"
-    elif draft or (reviewer_login.casefold() not in reviewers and "owner-action-required" not in label_names):
+    elif draft or (
+        reviewer_login.casefold() not in reviewers and "owner-action-required" not in label_names
+    ):
         normalized = "inactive"
     else:
         normalized = "action_required"
@@ -141,7 +143,11 @@ class _GitHubHttpClient(HttpConditionProvider):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if not allowed_repositories or not reviewer_login or _REVIEWER.fullmatch(reviewer_login) is None:
+        if (
+            not allowed_repositories
+            or not reviewer_login
+            or _REVIEWER.fullmatch(reviewer_login) is None
+        ):
             raise ConditionProviderError("github_provider_unconfigured")
         self.allowed_repositories = frozenset(allowed_repositories)
         self.reviewer_login = reviewer_login
@@ -161,9 +167,7 @@ class _GitHubHttpClient(HttpConditionProvider):
     def validate_config_for_target(
         self, target: str, *, config: Mapping[str, Any] | None = None
     ) -> dict[str, str]:
-        normalized = super().validate_config_for_target(
-            self._api_url(target), config=config
-        )
+        normalized = super().validate_config_for_target(self._api_url(target), config=config)
         if "authorization_env_var" not in normalized:
             raise ConditionProviderError("github_authorization_required")
         return normalized
