@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-from typing import Any, Callable
+from datetime import datetime, timedelta
+from typing import Any
 
 from aiogram.exceptions import (
     TelegramBadRequest,
@@ -194,7 +196,5 @@ async def github_action_delivery_loop(bot: Any, stop_event: asyncio.Event) -> No
             logger.error("Condition delivery loop failed", extra={
                 "extra_data": "error_type=" + type(exc).__name__[:64],
             })
-        try:
+        with suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
-        except TimeoutError:
-            pass
