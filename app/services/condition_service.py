@@ -489,24 +489,27 @@ class ConditionService:
                 )
                 session.add(transition)
                 await session.flush()
-                session.add(
-                    ConditionDelivery(
-                        subscription_id=subscription.id,
-                        transition_id=transition.id,
-                        transition_sequence=transition_sequence,
-                        chat_id=subscription.chat_id,
-                        previous_state=previous_state,
-                        current_state=observation.state,
-                        message_text=render_condition_message(
-                            subscription.message_template,
+                # GitHub reviewer actions notify only when entering action_required;
+                # withdrawing a review request must not enqueue a second alert.
+                if claim.provider_type != "github_review" or observation.state == "action_required":
+                    session.add(
+                        ConditionDelivery(
+                            subscription_id=subscription.id,
+                            transition_id=transition.id,
+                            transition_sequence=transition_sequence,
+                            chat_id=subscription.chat_id,
                             previous_state=previous_state,
                             current_state=observation.state,
-                            provider_type=subscription.provider_type,
-                        ),
-                        state=ConditionDeliveryState.PENDING.value,
-                        attempt_count=0,
+                            message_text=render_condition_message(
+                                subscription.message_template,
+                                previous_state=previous_state,
+                                current_state=observation.state,
+                                provider_type=subscription.provider_type,
+                            ),
+                            state=ConditionDeliveryState.PENDING.value,
+                            attempt_count=0,
+                        )
                     )
-                )
                 subscription.transition_sequence = transition_sequence
 
             session.add(

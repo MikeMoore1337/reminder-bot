@@ -752,4 +752,26 @@ def build_default_condition_provider_registry(
         authorization_env_allowlist=getattr(settings, "condition_authorization_env_allowlist", ()),
         authorization_env_bindings=getattr(settings, "condition_authorization_env_bindings", {}),
     )
-    return ConditionProviderRegistry({"http_json": provider, "http": provider})
+    providers: dict[str, ConditionProvider] = {"http_json": provider, "http": provider}
+    if getattr(settings, "condition_github_review_enabled", False):
+        # Imported lazily: this provider is inert unless deployment explicitly opts in.
+        from app.services.github_review_event import GitHubReviewProvider
+
+        allowlist = frozenset(
+            name.strip()
+            for name in settings.condition_github_allowed_repositories_raw.split(",")
+            if name.strip()
+        )
+        providers["github_review"] = GitHubReviewProvider(
+            allowed_repositories=allowlist,
+            reviewer_login=settings.condition_github_reviewer_login,
+            timeout_seconds=settings.condition_request_timeout_seconds,
+            max_response_bytes=settings.condition_max_response_bytes,
+            authorization_env_allowlist=getattr(
+                settings, "condition_authorization_env_allowlist", ()
+            ),
+            authorization_env_bindings=getattr(
+                settings, "condition_authorization_env_bindings", {}
+            ),
+        )
+    return ConditionProviderRegistry(providers)

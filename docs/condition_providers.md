@@ -74,12 +74,13 @@ configuration must extend this boundary deliberately rather than becoming an
 arbitrary header or secret store.
 
 The implementation does not fetch arbitrary HTML, follow redirects, execute
-local helpers, or accept live credentials in tests. Generic webhooks and
-GitHub PR/Actions providers remain candidates for future Issues: they must
-implement the same normalized contract and bounded failure semantics. A
-webhook adapter should authenticate and verify a request before writing a
-normalized observation; a GitHub adapter should use an allowlisted API origin
-and a dedicated token reference, never a user-supplied URL.
+local helpers, or accept live credentials in tests. Generic webhooks and GitHub Actions-specific green-CI verdicts remain
+candidates for future Issues. The separately gated `github_review` provider
+supports only PR review-request / explicit owner-action-label observations,
+**not** CI success. It reuses the hardened HTTP transport, demands a dedicated
+origin-bound credential and can create Telegram deliveries only when all
+opt-in switches and an owner-scoped subscription are configured.
+See [GitHub owner-action integration](github_review_condition.md).
 
 ## Bounds and operations
 

@@ -31,9 +31,21 @@ async def main() -> None:
     bot = create_bot()
     stop_event = asyncio.Event()
     _install_shutdown_handlers(stop_event)
+    background: list[asyncio.Task[None]] = []
+    if settings.condition_worker_enabled:
+        from app.workers.condition_worker import condition_loop
+
+        background.append(asyncio.create_task(condition_loop(stop_event)))
+        if settings.condition_github_review_enabled and settings.condition_github_delivery_enabled:
+            from app.workers.condition_delivery_worker import github_action_delivery_loop
+
+            background.append(asyncio.create_task(github_action_delivery_loop(bot, stop_event)))
     try:
         await reminder_loop(bot, stop_event=stop_event)
     finally:
+        stop_event.set()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
         await bot.session.close()
         logger.info("Reminder worker application stopped")
 
