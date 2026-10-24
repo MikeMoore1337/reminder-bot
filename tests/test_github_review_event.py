@@ -156,8 +156,16 @@ def test_fingerprint_and_state_are_only_safe_labels() -> None:
 class _Resolver(AbstractResolver):
     async def resolve(self, host: str, port: int, family: int = socket.AF_INET):
         assert host == "api.github.com"
-        return [{"hostname": host, "host": "93.184.216.34", "port": port,
-                 "family": socket.AF_INET, "proto": 0, "flags": 0}]
+        return [
+            {
+                "hostname": host,
+                "host": "93.184.216.34",
+                "port": port,
+                "family": socket.AF_INET,
+                "proto": 0,
+                "flags": 0,
+            }
+        ]
 
     async def close(self):
         return None
@@ -171,7 +179,10 @@ class _Response:
         self.content = self
 
     async def read(self, count: int = -1):
-        data, self._body = self._body[:count] if count >= 0 else self._body, self._body[count:] if count >= 0 else b""
+        data, self._body = (
+            self._body[:count] if count >= 0 else self._body,
+            self._body[count:] if count >= 0 else b"",
+        )
         return data
 
 
@@ -239,7 +250,9 @@ async def test_github_provider_requires_bound_secret_and_repo() -> None:
     with pytest.raises(ConditionProviderError, match="github_authorization_required"):
         await provider.observe(REPOSITORY + "#559")
     with pytest.raises(ConditionProviderError, match="github_repo_not_allowed"):
-        await provider.observe("SomeoneElse/private#1", config={"authorization_env_var": "CONDITION_TEST_GITHUB"})
+        await provider.observe(
+            "SomeoneElse/private#1", config={"authorization_env_var": "CONDITION_TEST_GITHUB"}
+        )
     with pytest.raises(ConditionProviderError, match="authorization_not_allowed"):
         await provider.observe(REPOSITORY + "#559", config={"authorization_env_var": "BOT_TOKEN"})
     assert captured == {}
@@ -255,7 +268,9 @@ async def test_github_provider_fails_closed_on_untrusted_response() -> None:
         status = 401 if "message" in payload else 200
         provider, _ = _github_provider(payload, status=status)
         with pytest.raises(ConditionProviderError, match=code):
-            await provider.observe(REPOSITORY + "#559", config={"authorization_env_var": "CONDITION_TEST_GITHUB"})
+            await provider.observe(
+                REPOSITORY + "#559", config={"authorization_env_var": "CONDITION_TEST_GITHUB"}
+            )
 
 
 def test_registry_disabled_without_explicit_opt_in() -> None:
