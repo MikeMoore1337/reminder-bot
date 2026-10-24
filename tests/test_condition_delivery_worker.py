@@ -108,7 +108,8 @@ async def test_owner_action_delivered_once_and_repeat_poll_has_no_duplicate():
         async with factory() as session:
             delivery = await session.scalar(select(ConditionDelivery))
             assert delivery.state == "sent"
-            assert delivery.sent_at_utc == NOW
+            assert delivery.sent_at_utc is not None
+            assert delivery.sent_at_utc.replace(tzinfo=UTC) == NOW
             assert delivery.attempt_count == 1
     finally:
         await engine.dispose()
