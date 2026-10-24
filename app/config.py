@@ -143,6 +143,17 @@ class Settings(BaseSettings):
                 "digest_lease_duration_seconds must be greater than "
                 "worker_send_timeout_seconds plus worker_lease_safety_margin_seconds"
             )
+        if self.condition_github_delivery_enabled and (
+            not self.condition_github_review_enabled or not self.condition_worker_enabled
+        ):
+            raise ValueError(
+                "condition_github_delivery_enabled requires condition worker and GitHub provider"
+            )
+        if self.condition_github_review_enabled and (
+            not self.condition_github_allowed_repositories_raw.strip()
+            or not self.condition_github_reviewer_login.strip()
+        ):
+            raise ValueError("condition_github_review_enabled requires repo allowlist and reviewer")
         if self.condition_retry_max_seconds < self.condition_retry_base_seconds:
             raise ValueError(
                 "condition_retry_max_seconds must be greater than or equal to "
