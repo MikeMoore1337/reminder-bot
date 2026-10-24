@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Collection, Mapping
+from typing import Collection
 
 from app.services.condition_provider import ConditionObservation, ConditionProviderError
 
-_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}\\Z")
-_REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\\Z")
-_PULL_TARGET = re.compile(r"([^/#\\s]+/[^/#\\s]+)#([1-9][0-9]{0,8})\\Z")
+_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
+_REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+_PULL_TARGET = re.compile(r"([^/#]+/[^/#]+)#([1-9][0-9]{0,8})")
 MAX_REVIEWERS = 100
 
 
