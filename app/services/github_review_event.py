@@ -7,11 +7,22 @@ Never treat this parser as a source-authentication or CI verification layer.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+from typing import Any
 
-from app.services.condition_provider import ConditionObservation, ConditionProviderError
+import aiohttp
+
+from app.services.condition_provider import (
+    ConditionObservation,
+    ConditionProviderError,
+    HttpConditionProvider,
+    _read_bounded_response,
+    validate_https_target,
+)
 
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
@@ -104,3 +115,106 @@ def classify_review_request(
     else:
         normalized = "action_required"
     return ConditionObservation(state=normalized)
+
+
+class GitHubReviewProvider(HttpConditionProvider):
+    """Opt-in GitHub API reader; no arbitrary target URL, no posting or delivery."""
+
+    provider_type = "github_review"
+
+    def __init__(
+        self,
+        *,
+        allowed_repositories: Collection[str],
+        reviewer_login: str,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        if not allowed_repositories or not reviewer_login or _REVIEWER.fullmatch(reviewer_login) is None:
+            raise ConditionProviderError("github_provider_unconfigured")
+        self.allowed_repositories = frozenset(allowed_repositories)
+        self.reviewer_login = reviewer_login
+
+    def validate_target(self, target: str) -> GitHubReviewTarget:
+        return parse_review_target(target, allowed_repositories=self.allowed_repositories)
+
+    def _api_url(self, target: str) -> str:
+        parsed = self.validate_target(target)
+        return (
+            "https://api.github.com/repos/"
+            + parsed.repository
+            + "/pulls/"
+            + str(parsed.pull_number)
+        )
+
+    def validate_config_for_target(
+        self, target: str, *, config: Mapping[str, Any] | None = None
+    ) -> dict[str, str]:
+        normalized = super().validate_config_for_target(
+            self._api_url(target), config=config
+        )
+        if "authorization_env_var" not in normalized:
+            raise ConditionProviderError("github_authorization_required")
+        return normalized
+
+    async def _request_with_session(
+        self, session: Any, target: str, headers: Mapping[str, str]
+    ) -> ConditionObservation:
+        # _request_once() already pins public DNS, enforces TLS/timeout and forbids redirects.
+        async with session.get(target, headers=dict(headers), allow_redirects=False) as response:
+            code = int(response.status)
+            if code == 429 or (code == 403 and response.headers.get("Retry-After")):
+                raise ConditionProviderError("rate_limited", status_code=code)
+            if code != 200:
+                raise ConditionProviderError("github_http_error", status_code=code)
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            if content_type != "application/json" and not content_type.endswith("+json"):
+                raise ConditionProviderError("github_content_type_invalid")
+            length = response.headers.get("Content-Length")
+            if length is not None:
+                try:
+                    if int(length) < 0 or int(length) > self.max_response_bytes:
+                        raise ConditionProviderError("response_too_large")
+                except ValueError:
+                    raise ConditionProviderError("github_content_length_invalid") from None
+            raw = await _read_bounded_response(response, self.max_response_bytes)
+            try:
+                body = json.loads(raw)
+            except (ValueError, UnicodeError, RecursionError):
+                raise ConditionProviderError("github_response_invalid") from None
+            path = target.removeprefix("https://api.github.com/repos/")
+            parts = path.split("/")
+            if len(parts) != 4 or parts[2] != "pulls":
+                raise ConditionProviderError("github_target_invalid")
+            selected = self.validate_target(parts[0] + "/" + parts[1] + "#" + parts[3])
+            return classify_review_request(
+                body, target=selected, reviewer_login=self.reviewer_login
+            )
+
+    async def observe(
+        self, target: str, *, config: Mapping[str, Any] | None = None
+    ) -> ConditionObservation:
+        url = self._api_url(target)
+        normalized = self.validate_config_for_target(target, config=config)
+        env_name = normalized["authorization_env_var"]
+        secret = self.environment.get(env_name)
+        if not secret or len(secret) > 4096:
+            raise ConditionProviderError("authorization_unavailable")
+        validated = validate_https_target(url)
+        if validated.hostname != "api.github.com" or validated.port != 443:
+            raise ConditionProviderError("github_origin_invalid")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "reminder-bot-condition-provider",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": "Bearer " + secret,
+        }
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                return await self._request_once(validated, headers)
+        except ConditionProviderError:
+            raise
+        except TimeoutError:
+            raise ConditionProviderError("timeout") from None
+        except (aiohttp.ClientError, OSError):
+            raise ConditionProviderError("network_error") from None
