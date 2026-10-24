@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     condition_worker_enabled: bool = False
     # One opt-in authenticated GitHub review-condition provider; not active by default.
     condition_github_review_enabled: bool = False
+    condition_github_delivery_enabled: bool = False
     condition_github_allowed_repositories_raw: str = ""
     condition_github_reviewer_login: str = ""
     condition_poll_batch_size: int = Field(default=10, ge=1, le=100)
