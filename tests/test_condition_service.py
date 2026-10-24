@@ -490,7 +490,9 @@ async def test_github_review_outbox_only_contains_action_entry() -> None:
     engine, connection, session_factory = await _open_sqlite()
     try:
         clock = _MutableClock(NOW)
-        provider = _SequenceProvider("action_required", "inactive", "action_required", "action_required")
+        provider = _SequenceProvider(
+            "action_required", "inactive", "action_required", "action_required"
+        )
         service = ConditionService(
             session_factory=session_factory,
             registry=ConditionProviderRegistry({"github_review": provider}),
