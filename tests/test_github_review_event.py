@@ -9,6 +9,7 @@ import socket
 import pytest
 from aiohttp.abc import AbstractResolver
 
+from app.config import Settings
 from app.services.condition_provider import (
     ConditionObservation,
     ConditionProviderError,
@@ -288,3 +289,11 @@ def test_registry_disabled_without_explicit_opt_in() -> None:
     settings.condition_github_allowed_repositories_raw = REPOSITORY
     settings.condition_github_reviewer_login = OWNER
     assert build_default_condition_provider_registry(settings).contains("github_review")
+
+
+def test_half_enabled_github_configuration_fails_at_startup() -> None:
+    values = {"bot_token": "test-token", "database_url": "sqlite+aiosqlite:///:memory:"}
+    with pytest.raises(ValueError, match="requires condition worker"):
+        Settings(**values, condition_github_delivery_enabled=True)
+    with pytest.raises(ValueError, match="requires repo allowlist"):
+        Settings(**values, condition_github_review_enabled=True)
