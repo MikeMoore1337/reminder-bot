@@ -4,6 +4,7 @@ Does not fetch GitHub, enable subscriptions, or deliver Telegram messages.
 Only a future trusted, allowlisted GitHub API adapter may supply its inputs.
 Never treat this parser as a source-authentication or CI verification layer.
 """
+
 from __future__ import annotations
 
 import re
@@ -24,7 +25,9 @@ class GitHubReviewTarget:
     pull_number: int
 
 
-def parse_review_target(target: str, *, allowed_repositories: Collection[str]) -> GitHubReviewTarget:
+def parse_review_target(
+    target: str, *, allowed_repositories: Collection[str]
+) -> GitHubReviewTarget:
     """Authorize a named repository and one PR, without accepting URLs or credentials."""
     if type(target) is not str or len(target) > 160:
         raise ConditionProviderError("github_target_invalid")
