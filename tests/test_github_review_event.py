@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import copy
+import json
+import socket
+from collections.abc import Mapping
+
+from aiohttp.abc import AbstractResolver
 
 import pytest
 
-from app.services.condition_provider import ConditionObservation, ConditionProviderError
+from app.services.condition_provider import (
+    ConditionObservation,
+    ConditionProviderError,
+    build_default_condition_provider_registry,
+)
 from app.services.github_review_event import (
+    GitHubReviewProvider,
     GitHubReviewTarget,
     classify_review_request,
     parse_review_target,
@@ -131,3 +141,125 @@ def test_fingerprint_and_state_are_only_safe_labels() -> None:
     assert observation.state == "action_required"
     assert observation.fingerprint is None
     assert not hasattr(observation, "url")
+
+
+class _Resolver(AbstractResolver):
+    async def resolve(self, host: str, port: int, family: int = socket.AF_INET):
+        assert host == "api.github.com"
+        return [{"hostname": host, "host": "93.184.216.34", "port": port,
+                 "family": socket.AF_INET, "proto": 0, "flags": 0}]
+
+    async def close(self):
+        return None
+
+
+class _Response:
+    def __init__(self, status: int, payload: object):
+        self.status = status
+        self.headers = {"Content-Type": "application/json"}
+        self._body = json.dumps(payload).encode()
+        self.content = self
+
+    async def read(self, count: int = -1):
+        data, self._body = self._body[:count] if count >= 0 else self._body, self._body[count:] if count >= 0 else b""
+        return data
+
+
+class _Context:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _Session:
+    def __init__(self, response, collected):
+        self.response = response
+        self.collected = collected
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def get(self, url, **kwargs):
+        self.collected["url"] = url
+        self.collected["headers"] = kwargs["headers"]
+        self.collected["allow_redirects"] = kwargs["allow_redirects"]
+        return _Context(self.response)
+
+
+def _github_provider(payload, *, status=200, token="local-fixture"):
+    collected = {}
+    response = _Response(status, payload)
+    provider = GitHubReviewProvider(
+        allowed_repositories=ALLOWED,
+        reviewer_login=OWNER,
+        authorization_env_allowlist={"CONDITION_TEST_GITHUB"},
+        authorization_env_bindings={"CONDITION_TEST_GITHUB": "https://api.github.com"},
+        environment={"CONDITION_TEST_GITHUB": token},
+        resolver=_Resolver(),
+        session_factory=lambda **kwargs: _Session(response, collected),
+    )
+    return provider, collected
+
+
+@pytest.mark.asyncio
+async def test_authenticated_bounded_github_api_fetch() -> None:
+    provider, captured = _github_provider(snapshot())
+    observation = await provider.observe(
+        REPOSITORY + "#559",
+        config={"authorization_env_var": "CONDITION_TEST_GITHUB"},
+    )
+    assert observation.state == "action_required"
+    assert captured["url"] == "https://api.github.com/repos/MikeMoore1337/hermes/pulls/559"
+    assert captured["allow_redirects"] is False
+    assert captured["headers"]["Authorization"] == "Bearer local-fixture"
+    assert captured["headers"]["X-GitHub-Api-Version"] == "2022-11-28"
+
+
+@pytest.mark.asyncio
+async def test_github_provider_requires_bound_secret_and_repo() -> None:
+    provider, captured = _github_provider(snapshot())
+    with pytest.raises(ConditionProviderError, match="github_authorization_required"):
+        await provider.observe(REPOSITORY + "#559")
+    with pytest.raises(ConditionProviderError, match="github_repo_not_allowed"):
+        await provider.observe("SomeoneElse/private#1", config={"authorization_env_var": "CONDITION_TEST_GITHUB"})
+    with pytest.raises(ConditionProviderError, match="authorization_not_allowed"):
+        await provider.observe(REPOSITORY + "#559", config={"authorization_env_var": "BOT_TOKEN"})
+    assert captured == {}
+
+
+@pytest.mark.asyncio
+async def test_github_provider_fails_closed_on_untrusted_response() -> None:
+    for payload, code in (
+        ({"message": "Needs authentication"}, "github_http_error"),
+        ({"some": "secret"}, "github_response_invalid"),
+        ({**snapshot(), "number": 999}, "github_identity_mismatch"),
+    ):
+        status = 401 if "message" in payload else 200
+        provider, _ = _github_provider(payload, status=status)
+        with pytest.raises(ConditionProviderError, match=code):
+            await provider.observe(REPOSITORY + "#559", config={"authorization_env_var": "CONDITION_TEST_GITHUB"})
+
+
+def test_registry_disabled_without_explicit_opt_in() -> None:
+    from types import SimpleNamespace
+
+    settings = SimpleNamespace(
+        condition_request_timeout_seconds=10,
+        condition_max_response_bytes=65536,
+        condition_authorization_env_allowlist=(),
+        condition_authorization_env_bindings={},
+        condition_github_review_enabled=False,
+    )
+    assert not build_default_condition_provider_registry(settings).contains("github_review")
+    settings.condition_github_review_enabled = True
+    settings.condition_github_allowed_repositories_raw = REPOSITORY
+    settings.condition_github_reviewer_login = OWNER
+    assert build_default_condition_provider_registry(settings).contains("github_review")
