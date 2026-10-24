@@ -21,6 +21,7 @@ from aiogram.exceptions import (
 )
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.db.models import ConditionDelivery, ConditionDeliveryState, ConditionSubscription
 from app.db.session import SessionLocal
@@ -51,6 +52,7 @@ async def claim_action_delivery(
         item = await session.scalar(
             select(ConditionDelivery)
             .join(ConditionSubscription)
+            .options(selectinload(ConditionDelivery.subscription))
             .where(
                 ConditionSubscription.provider_type == "github_review",
                 or_(
