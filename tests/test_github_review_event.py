@@ -37,6 +37,7 @@ def snapshot(*, requested: bool = True) -> dict[str, object]:
         "draft": False,
         "merged_at": None,
         "requested_reviewers": [{"login": OWNER}] if requested else [],
+        "labels": [],
     }
 
 
@@ -110,6 +111,8 @@ def test_not_requested_draft_or_closed_not_actionable() -> None:
         (lambda p: p.update(draft=1), "github_response_invalid"),
         (lambda p: p.pop("requested_reviewers"), "github_response_invalid"),
         (lambda p: p.update(requested_reviewers="OwnerLogin"), "github_response_invalid"),
+        (lambda p: p.pop("labels"), "github_response_invalid"),
+        (lambda p: p.update(labels=[{"name": 123}]), "github_response_invalid"),
         (lambda p: p.update(requested_reviewers=[{"other": OWNER}]), "github_response_invalid"),
         (lambda p: p.update(requested_reviewers=[{"login": "!"}]), "github_response_invalid"),
         (
@@ -125,6 +128,15 @@ def test_untrusted_shape_or_identity_fails_closed(mutation, reason: str) -> None
     mutation(candidate)
     with pytest.raises(ConditionProviderError, match=reason):
         classify_review_request(candidate, target=TARGET, reviewer_login=OWNER)
+
+
+def test_owner_action_label_works_even_for_pr_author_who_cannot_self_review() -> None:
+    candidate = snapshot(requested=False)
+    candidate["labels"] = [{"name": "owner-action-required"}]
+    assert (
+        classify_review_request(candidate, target=TARGET, reviewer_login=OWNER).state
+        == "action_required"
+    )
 
 
 def test_invalid_reviewer_and_payload_does_not_leak_content() -> None:
