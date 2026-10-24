@@ -1,4 +1,5 @@
 """I4 GitHub review alerts: outbox, crash recovery and no false notifications."""
+
 from __future__ import annotations
 
 import os
@@ -154,9 +155,10 @@ async def test_processing_lease_recovery_and_fencing():
     try:
         first = await claim_action_delivery(session_factory=factory, now=NOW)
         assert first is not None
-        assert await claim_action_delivery(
-            session_factory=factory, now=NOW + timedelta(seconds=60)
-        ) is None
+        assert (
+            await claim_action_delivery(session_factory=factory, now=NOW + timedelta(seconds=60))
+            is None
+        )
         second = await claim_action_delivery(
             session_factory=factory, now=NOW + timedelta(seconds=91)
         )
