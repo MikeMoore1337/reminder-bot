@@ -767,7 +767,11 @@ def build_default_condition_provider_registry(
             reviewer_login=settings.condition_github_reviewer_login,
             timeout_seconds=settings.condition_request_timeout_seconds,
             max_response_bytes=settings.condition_max_response_bytes,
-            authorization_env_allowlist=getattr(settings, "condition_authorization_env_allowlist", ()),
-            authorization_env_bindings=getattr(settings, "condition_authorization_env_bindings", {}),
+            authorization_env_allowlist=getattr(
+                settings, "condition_authorization_env_allowlist", ()
+            ),
+            authorization_env_bindings=getattr(
+                settings, "condition_authorization_env_bindings", {}
+            ),
         )
     return ConditionProviderRegistry(providers)
