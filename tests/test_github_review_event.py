@@ -5,11 +5,9 @@ from __future__ import annotations
 import copy
 import json
 import socket
-from collections.abc import Mapping
-
-from aiohttp.abc import AbstractResolver
 
 import pytest
+from aiohttp.abc import AbstractResolver
 
 from app.services.condition_provider import (
     ConditionObservation,
