@@ -7,8 +7,8 @@ Never treat this parser as a source-authentication or CI verification layer.
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
-from typing import Collection
 
 from app.services.condition_provider import ConditionObservation, ConditionProviderError
 
