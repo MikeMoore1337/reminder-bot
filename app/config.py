@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # extension point and must never change the existing time-reminder worker
     # when it is not explicitly enabled.
     condition_worker_enabled: bool = False
+    # One opt-in authenticated GitHub review-condition provider; not active by default.
+    condition_github_review_enabled: bool = False
+    condition_github_allowed_repositories_raw: str = ""
+    condition_github_reviewer_login: str = ""
     condition_poll_batch_size: int = Field(default=10, ge=1, le=100)
     condition_poll_interval_seconds: int = Field(default=300, ge=30, le=86400)
     condition_drain_max_batches: int = Field(default=10, ge=1, le=100)
