@@ -82,6 +82,7 @@ def classify_review_request(
         state = payload["state"]
         draft = payload["draft"]
         requested = payload["requested_reviewers"]
+        labels = payload["labels"]
     except (KeyError, TypeError, AttributeError):
         raise ConditionProviderError("github_response_invalid") from None
     if (
@@ -105,12 +106,22 @@ def classify_review_request(
             raise ConditionProviderError("github_response_invalid")
         reviewers.add(login.casefold())
 
+    if type(labels) is not list or len(labels) > MAX_REVIEWERS:
+        raise ConditionProviderError("github_response_invalid")
+    label_names: set[str] = set()
+    for label in labels:
+        if type(label) is not dict or type(label.get("name")) is not str:
+            raise ConditionProviderError("github_response_invalid")
+        if len(label["name"]) > 64:
+            raise ConditionProviderError("github_response_invalid")
+        label_names.add(label["name"].casefold())
+
     merged = payload.get("merged_at")
     if merged is not None and (type(merged) is not str or state != "closed"):
         raise ConditionProviderError("github_response_invalid")
     if state == "closed":
         normalized = "resolved"
-    elif draft or reviewer_login.casefold() not in reviewers:
+    elif draft or (reviewer_login.casefold() not in reviewers and "owner-action-required" not in label_names):
         normalized = "inactive"
     else:
         normalized = "action_required"
