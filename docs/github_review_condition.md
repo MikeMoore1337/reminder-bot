@@ -1,34 +1,82 @@
-# I4 - GitHub review-request observations (offline groundwork)
+# GitHub owner-action notifications (I4, #63)
 
-Tracking: [reminder-bot #63](https://github.com/MikeMoore1337/reminder-bot/issues/63), [Hermes integration #555](https://github.com/MikeMoore1337/hermes/issues/555).
+## What is implemented
 
-## One actionable event
+This is an **opt-in** GitHub pull-request condition provider and a Telegram sender
+for its durable existing `condition_deliveries` outbox. It runs under the
+**existing reminder worker**, with no new service, scheduler, table, LLM or paid API.
 
-Selected event: a specific approved GitHub pull request **explicitly requests review from the configured account**. A review request is a factual GitHub PR field, **not** proof that CI passed or that the application reached production.
+A selected, allowlisted PR becomes `action_required` only if it is open, not
+a draft and either (1) explicitly requests a review from the configured
+GitHub account or (2) contains the `owner-action-required` label. The label
+is useful for PR authors, who cannot review their own GitHub PR. **This state
+is not a claim that CI has passed**. A closed PR is `resolved`. Missing,
+invalid, inaccessible, or mismatched GitHub data is an error with retry,
+not a fabricated ready status.
 
-A future trusted GitHub API adapter may read a pinned HTTPS API endpoint for exactly one repository/pull request. `classify_review_request` only transforms an already obtained response:
+The provider builds one fixed GitHub API resource from `owner/repo#PR`.
+No arbitrary target URL or query parameters are accepted. Only the configured
+repository allowlist is allowed. The existing hardened HTTPS provider enforces
+public DNS, pinned resolved IPs, TLS, no redirects, time/response limits,
+and non-sensitive error reporting. GitHub API access **requires** a separate
+deployment-owned `Authorization` env reference bound to
+`https://api.github.com`. No credential is stored in the DB.
 
-- `action_required`: PR is open, not a draft, and the named account appears in `requested_reviewers`;
-- `inactive`: no matching request or PR is draft;
-- `resolved`: PR is closed;
-- invalid/missing source identity or partial response: refusal, **not** `inactive`.
+The existing condition service records transitions and a durable outbox.
+For the GitHub source it enqueues **only entries into `action_required`**,
+not a later removal/closure of the review requirement. The sender claims
+rows transactionally, fences attempts, reclaims expired processing leases,
+suppresses withdrawn actions, retries bounded transient errors and never
+touches `http_json` deliveries.
 
-A target is a repository and PR number, e.g. `MikeMoore1337/hermes#559`. `parse_review_target` refuses targets not in an explicit allowlist, arbitrary URLs, unexpected scopes and malformed numbers. It does not fetch the network or read secrets.
+## Disabled by default
 
-## Important limitations
+All switches default to false:
 
-The current addition is a **pure read-only classifier and tests**, not a registered provider, scheduled fetcher or Telegram delivery:
+- `CONDITION_WORKER_ENABLED`
+- `CONDITION_GITHUB_REVIEW_ENABLED`
+- `CONDITION_GITHUB_DELIVERY_ENABLED`
 
-1. No new provider is registered in `ConditionProviderRegistry`.
-2. Condition processing is still off by default (`CONDITION_WORKER_ENABLED=false`).
-3. Existing `ConditionService` persists transitions and queues `condition_deliveries`, but the queue does not itself send Telegram messages. Do not claim end-to-end notification until an authorized delivery adapter exists.
-4. Every transition creates a delivery record under generic semantics. For an owner-only action notification, a future provider/transition policy must emit **only** a transition into `action_required`, not a resolution/inactive event. Do not turn on this scenario before that filter exists.
-5. No account/repo authentication, authenticated GitHub HTTP polling, freshness or rate-limit policy, reviewer opt-in, destination control, or production subscriber is implemented here. An offline JSON fixture can be spoofed; trust must come from the network adapter rather than payload fields.
-6. The existing time-reminder worker remains independent. No bot token, user profile, Second Brain content, YFC fitness record, infrastructure credential or production environment was accessed.
+Provisioning requires deployment-owned repo allowlist, reviewer login,
+a dedicated read-only GitHub credential, the existing
+`CONDITION_AUTHORIZATION_ENV_ALLOWLIST` and
+`CONDITION_AUTHORIZATION_ENV_BINDINGS` with the approved origin.
+Do **not** copy real tokens into Issues, PRs, command output or logs.
 
-## Future implementation gates (same Issue)
+A separate authenticated, owner-approved subscription is still needed, for
+example through the existing internal `ConditionService.create_subscription`
+with `provider_type="github_review"`,
+`target="MikeMoore1337/hermes#559"`, nonsecret
+`config={"authorization_env_var": "DEPLOYMENT_MANAGED_GITHUB_TOKEN_NAME"}` and
+the actual owner DB identity/chat ID. New deployments do not create any
+subscriptions by themselves. Setting flags alone is **not an opt-in**.
 
-- An explicit opt-in subscription scoped to one approved repo, one PR, one user account and one Telegram destination.
-- HTTPS `api.github.com` fixed-origin read with safe authorization, bounded time/body/rate/backoff, exact repo/PR identity validation, no arbitrary URLs, and no stale/unknown interpreted as healthy.
-- Transition filtering (alert on **entry** to `action_required` only) and delivery adapter reusing existing `condition_deliveries`, with documented at-least-once Telegram semantics, retry, duplicate suppression and crash/restart tests.
-- Three mandatory CI jobs on exact PR head and owner-approved live verification. A PR merge alone is **not** permission to enable a worker, provision a token or send notifications.
+## Scope and caveats
+
+- Production activation, credentials, owner subscription, destination approval,
+  and live Telegram message are **NOT_VERIFIED** until authorized and observed.
+- The source is polled on the approved interval; no GitHub event webhook.
+  A review request that is added and removed before observation may be missed.
+- The outbound Telegram API **does not provide an idempotency key**. The
+  transactional outbox avoids duplicate rows and usual repeat sends, but an
+  ambiguous network acknowledgment or crash after remote acceptance can
+  create a duplicate. Exactly-once remote delivery is **not guaranteed**.
+- User quiet hours, notifications for other condition types, per-user Telegram
+  command setup, GitHub required-CI evaluation and a production smoke test
+  are **not part of this implementation**. No automated assertion of green CI.
+- No original folders, personal vault, YFC data, browser logins, bot
+  production secrets, paid AI or live environment was accessed while
+  implementing this PR.
+
+## Verification
+
+PR: Run all required `quality`, `tests-postgres`, `docker-smoke`
+checks on its exact head. Focused tests:
+
+- `python -m pytest -q tests/test_github_review_event.py`
+- `python -m pytest -q tests/test_condition_delivery_worker.py`
+- `python -m pytest -q tests/test_condition_service.py`
+
+The source-only merge must **not** enable any of the three flags. Real Telegram
+opt-in needs separate owner confirmation and an approved production dry-run and
+rollback plan.
