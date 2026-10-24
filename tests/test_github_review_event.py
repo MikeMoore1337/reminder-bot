@@ -1,4 +1,5 @@
 """Offline I4 policy: PR owner-review request classification, no network or Telegram."""
+
 from __future__ import annotations
 
 import copy
@@ -59,26 +60,30 @@ def test_request_for_exact_reviewer_is_actionable_without_ci_claims() -> None:
     observation = classify_review_request(snapshot(), target=TARGET, reviewer_login=OWNER)
     assert observation == ConditionObservation(state="action_required")
     assert observation.fingerprint is None
-    assert classify_review_request(
-        snapshot(), target=TARGET, reviewer_login="ownerlogin"
-    ).state == "action_required"
+    assert (
+        classify_review_request(snapshot(), target=TARGET, reviewer_login="ownerlogin").state
+        == "action_required"
+    )
 
 
 def test_not_requested_draft_or_closed_not_actionable() -> None:
-    assert classify_review_request(
-        snapshot(requested=False), target=TARGET, reviewer_login=OWNER
-    ).state == "inactive"
+    assert (
+        classify_review_request(
+            snapshot(requested=False), target=TARGET, reviewer_login=OWNER
+        ).state
+        == "inactive"
+    )
     candidate = snapshot()
     candidate["draft"] = True
-    assert classify_review_request(
-        candidate, target=TARGET, reviewer_login=OWNER
-    ).state == "inactive"
+    assert (
+        classify_review_request(candidate, target=TARGET, reviewer_login=OWNER).state == "inactive"
+    )
     candidate["draft"] = False
     candidate["state"] = "closed"
     candidate["merged_at"] = "2026-10-24T13:00:00Z"
-    assert classify_review_request(
-        candidate, target=TARGET, reviewer_login=OWNER
-    ).state == "resolved"
+    assert (
+        classify_review_request(candidate, target=TARGET, reviewer_login=OWNER).state == "resolved"
+    )
 
 
 @pytest.mark.parametrize(
