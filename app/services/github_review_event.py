@@ -128,7 +128,7 @@ def classify_review_request(
     return ConditionObservation(state=normalized)
 
 
-class GitHubReviewProvider(HttpConditionProvider):
+class _GitHubHttpClient(HttpConditionProvider):
     """Opt-in GitHub API reader; no arbitrary target URL, no posting or delivery."""
 
     provider_type = "github_review"
@@ -146,11 +146,11 @@ class GitHubReviewProvider(HttpConditionProvider):
         self.allowed_repositories = frozenset(allowed_repositories)
         self.reviewer_login = reviewer_login
 
-    def validate_target(self, target: str) -> GitHubReviewTarget:
+    def parse_target(self, target: str) -> GitHubReviewTarget:
         return parse_review_target(target, allowed_repositories=self.allowed_repositories)
 
     def _api_url(self, target: str) -> str:
-        parsed = self.validate_target(target)
+        parsed = self.parse_target(target)
         return (
             "https://api.github.com/repos/"
             + parsed.repository
@@ -197,7 +197,7 @@ class GitHubReviewProvider(HttpConditionProvider):
             parts = path.split("/")
             if len(parts) != 4 or parts[2] != "pulls":
                 raise ConditionProviderError("github_target_invalid")
-            selected = self.validate_target(parts[0] + "/" + parts[1] + "#" + parts[3])
+            selected = self.parse_target(parts[0] + "/" + parts[1] + "#" + parts[3])
             return classify_review_request(
                 body, target=selected, reviewer_login=self.reviewer_login
             )
@@ -229,3 +229,25 @@ class GitHubReviewProvider(HttpConditionProvider):
             raise ConditionProviderError("timeout") from None
         except (aiohttp.ClientError, OSError):
             raise ConditionProviderError("network_error") from None
+
+
+class GitHubReviewProvider:
+    """ConditionProvider protocol adapter around the fixed GitHub HTTP client."""
+
+    provider_type = "github_review"
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._client = _GitHubHttpClient(**kwargs)
+
+    def validate_target(self, target: str) -> GitHubReviewTarget:
+        return self._client.parse_target(target)
+
+    def validate_config_for_target(
+        self, target: str, *, config: Mapping[str, Any] | None = None
+    ) -> dict[str, str]:
+        return self._client.validate_config_for_target(target, config=config)
+
+    async def observe(
+        self, target: str, *, config: Mapping[str, Any] | None = None
+    ) -> ConditionObservation:
+        return await self._client.observe(target, config=config)
