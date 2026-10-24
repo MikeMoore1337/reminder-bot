@@ -4,6 +4,7 @@ No second poller; claims are database-serialized, with recoverable processing
 leases. Telegram has no idempotency key: ambiguous transport failures can
 still lead to repeated remote messages; never promise exactly-once delivery.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -46,7 +47,8 @@ class DeliveryClaim:
 
 
 async def claim_action_delivery(
-    *, session_factory: Callable[[], AsyncSession] = SessionLocal,
+    *,
+    session_factory: Callable[[], AsyncSession] = SessionLocal,
     now: datetime | None = None,
 ) -> DeliveryClaim | None:
     clock = now or utc_now()
@@ -160,26 +162,36 @@ async def deliver_one_action(
     except asyncio.CancelledError:
         raise  # the lease recovers this claim
     except (TelegramForbiddenError, TelegramBadRequest):
-        await finalize_action_delivery(claim, success=False, session_factory=session_factory, now=now)
+        await finalize_action_delivery(
+            claim, success=False, session_factory=session_factory, now=now
+        )
     except TelegramRetryAfter as exc:
         await finalize_action_delivery(
-            claim, success=False, retryable=True,
+            claim,
+            success=False,
+            retryable=True,
             retry_after=min(max(int(exc.retry_after), 1), 3600),
-            session_factory=session_factory, now=now,
+            session_factory=session_factory,
+            now=now,
         )
     except (TelegramNetworkError, TelegramServerError, TimeoutError):
         await finalize_action_delivery(
             claim, success=False, retryable=True, session_factory=session_factory, now=now
         )
     except Exception as exc:
-        logger.error("Condition outbox send error", extra={
-            "extra_data": "error_type=" + type(exc).__name__[:64],
-        })
+        logger.error(
+            "Condition outbox send error",
+            extra={
+                "extra_data": "error_type=" + type(exc).__name__[:64],
+            },
+        )
         await finalize_action_delivery(
             claim, success=False, retryable=True, session_factory=session_factory, now=now
         )
     else:
-        await finalize_action_delivery(claim, success=True, session_factory=session_factory, now=now)
+        await finalize_action_delivery(
+            claim, success=True, session_factory=session_factory, now=now
+        )
     return True
 
 
@@ -193,8 +205,11 @@ async def github_action_delivery_loop(bot: Any, stop_event: asyncio.Event) -> No
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("Condition delivery loop failed", extra={
-                "extra_data": "error_type=" + type(exc).__name__[:64],
-            })
+            logger.error(
+                "Condition delivery loop failed",
+                extra={
+                    "extra_data": "error_type=" + type(exc).__name__[:64],
+                },
+            )
         with suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
