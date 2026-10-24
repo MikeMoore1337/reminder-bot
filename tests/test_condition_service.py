@@ -483,3 +483,38 @@ async def test_history_cleanup_removes_old_observations_but_keeps_pending_outbox
     finally:
         await connection.close()
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_github_review_outbox_only_contains_action_entry() -> None:
+    engine, connection, session_factory = await _open_sqlite()
+    try:
+        clock = _MutableClock(NOW)
+        provider = _SequenceProvider("action_required", "inactive", "action_required", "action_required")
+        service = ConditionService(
+            session_factory=session_factory,
+            registry=ConditionProviderRegistry({"github_review": provider}),
+            settings_obj=_settings(),
+            now_fn=clock,
+        )
+        await service.create_subscription(
+            user_id=1,
+            chat_id=2001,
+            provider_type="github_review",
+            target="MikeMoore1337/hermes#559",
+            trigger_on_initial=True,
+            next_poll_at_utc=NOW,
+        )
+        for _ in range(4):
+            result = await service.poll_due_conditions(limit=1)
+            assert result.succeeded == 1
+            clock.value += timedelta(seconds=31)
+        async with session_factory() as session:
+            outbox = (await session.scalars(select(ConditionDelivery))).all()
+            transitions = (await session.scalars(select(ConditionTransition))).all()
+        assert len(transitions) == 3
+        assert len(outbox) == 2
+        assert [item.current_state for item in outbox] == ["action_required"] * 2
+    finally:
+        await connection.close()
+        await engine.dispose()
