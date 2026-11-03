@@ -86,5 +86,5 @@ typing-inspection==0.4.4
     #   pydantic-settings
 tzdata==2026.3
     # via reminder_bot (pyproject.toml)
-yarl==1.24.5
+yarl==1.25.1
     # via aiohttp
