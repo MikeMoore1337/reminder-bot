@@ -1,4 +1,5 @@
-FROM python:3.12-slim AS runtime-base
+# Python 3.12.16 (2026-10-25 security release); immutable multi-platform image.
+FROM python:3.12.16-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30 AS runtime-base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
